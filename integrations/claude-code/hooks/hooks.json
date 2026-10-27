@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/hooks/task_completed.py\"",
+            "timeout": 75
+          }
+        ]
+      }
+    ]
+  }
+}

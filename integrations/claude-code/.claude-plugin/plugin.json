@@ -1,0 +1,8 @@
+{
+  "name": "agent-gates",
+  "version": "0.1.0",
+  "description": "Inspect AgentGates configuration and verify compiler gate receipts through the standalone CLI.",
+  "author": {
+    "name": "AgentGates maintainers"
+  }
+}
