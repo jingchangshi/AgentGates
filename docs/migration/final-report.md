@@ -105,26 +105,25 @@ For `tilelang-hivm-npu`, add `--device-id ASSIGNED_ID`; without assignment, and 
 
 ## Using AgentGates from AscendNPU-IR and TileLang
 
-AgentGates is not installed into either compiler checkout; it runs beside them and reads them as data. From a developer shell on this machine:
+AgentGates is not installed into either compiler checkout; it runs beside them and reads them as data. Paths below are placeholders — the runs in this report used the workspace checkouts `<ascend-checkout>` (HEAD `bfefe180`) and `<tilelang-checkout>` (HEAD `6fe6f09`).
 
 ```bash
-cd /path/to/AgentGates && python3.11 -m venv .venv && .venv/bin/python -m pip install -e .
-export PATH="/path/to/AgentGates/.venv/bin:$PATH"
+cd <agent-gates-checkout> && python3.11 -m venv .venv && .venv/bin/python -m pip install -e .
+export PATH="<agent-gates-checkout>/.venv/bin:$PATH"
 
 # AscendNPU-IR (gate IDs: ascend-build, ascend-regression)
-agent-gates doctor --adapter ascendnpu-ir --source /home/s00653124/workspace/AscendNPU-IR-1 \
-  --env-file /absolute/machine/ascend.env --json
-agent-gates run --adapter ascendnpu-ir --source /home/s00653124/workspace/AscendNPU-IR-1 \
-  --env-file /absolute/machine/ascend.env --all --json
+agent-gates doctor --adapter ascendnpu-ir --source <ascend-checkout> \
+  --env-file <machine-dir>/ascend.env --json
+agent-gates run --adapter ascendnpu-ir --source <ascend-checkout> \
+  --env-file <machine-dir>/ascend.env --all --json
 
 # TileLang (gate IDs: tilelang-hivm-build, tilelang-hivm-regression)
-agent-gates run --adapter tilelang-hivm --source /home/s00653124/workspace/tilelang \
-  --env-file /home/s00653124/workspace/PiEngineeringHarness/adapters/tilelang-hivm/env.sh --all --json
+agent-gates run --adapter tilelang-hivm --source <tilelang-checkout> \
+  --env-file <machine-dir>/tilelang-hivm.env.sh --all --json
 
 # NPU sanity: only with a device an operator has assigned to you
-agent-gates run --adapter tilelang-hivm-npu --source /home/s00653124/workspace/tilelang \
-  --env-file /home/s00653124/workspace/PiEngineeringHarness/adapters/tilelang-hivm/env.sh \
-  --device-id ASSIGNED_ID --json
+agent-gates run --adapter tilelang-hivm-npu --source <tilelang-checkout> \
+  --env-file <machine-dir>/tilelang-hivm.env.sh --device-id ASSIGNED_ID --json
 ```
 
 Rules that follow from the implementation:
@@ -133,4 +132,4 @@ Rules that follow from the implementation:
 - `--env-file` must be an absolute path to a machine file outside the checkout. The adapters parse it as `NAME=value` data; it is never sourced. Keep the real file out of Git.
 - `--all` applies only to the chosen adapter and never pulls in the NPU gate.
 - Evidence lands in `~/.local/state/agent-gates` unless `--evidence-root` names a private directory. Pass the returned `runId` to `agent-gates report` / `verify` to revalidate; a receipt turns `STALE` once the source, adapter bytes or a bound artifact change.
-- From Claude Code, the same commands are available as `/agent-gates:doctor`, `/agent-gates:verify` and `/agent-gates:report` after loading the plugin with `claude --plugin-dir /path/to/AgentGates/integrations/claude-code`.
+- From Claude Code, the same commands are available as `/agent-gates:doctor`, `/agent-gates:verify` and `/agent-gates:report` after loading the plugin with `claude --plugin-dir <agent-gates-checkout>/integrations/claude-code`.
