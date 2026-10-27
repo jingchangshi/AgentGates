@@ -2,7 +2,7 @@
 
 Execution date: 2026-10-27. Goal: local P0–P2 extraction of deterministic compiler gates; no compiler analysis framework.
 
-**Status: P0–P2 delivered locally on branch `migration/p0-p2`; remote delivery is the last step and is reported at the end of this file.** The pause recorded below is historical; the resume found and fixed one behavioural defect (the NPU adapter had no device occupancy check), then completed the remaining validation. Current results are in [P1 equivalence](p1-equivalence.md), [P2 validation](p2-validation.md) and the [final report](final-report.md). The [pause checkpoint](resume-state.md) is retained as history only.
+**Status: P0–P2 delivered on branch `migration/p0-p2` and pushed; `main` was deliberately not advanced. See [Delivery](#delivery).** The pause recorded below is historical; the resume found and fixed one behavioural defect (the NPU adapter had no device occupancy check), then completed the remaining validation. Current results are in [P1 equivalence](p1-equivalence.md), [P2 validation](p2-validation.md) and the [final report](final-report.md). The [pause checkpoint](resume-state.md) is retained as history only.
 
 ## Team and ownership
 
