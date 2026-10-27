@@ -24,7 +24,7 @@ This compares the P0 original-recipe baseline with the migrated standalone CLI o
 
 Round 2 exists because the independent review found seven defects after round 1. Fixing them changed the adapter scripts, which correctly turned every round-1 receipt `STALE` (`ADAPTER_IDENTITY_CHANGED`); the round-1 receipts are retained unchanged under `.evidence/p1-runs` as history, and the current evidence is `.evidence/p1-runs-r2`. Round 2 re-ran the same argv against the same sources and machine files and reproduced every verdict.
 
-P1 wall-clock is shorter than P0 because the trees were warm after the baseline: `ascend-regression` took 3.12 s against 410.7 s and `tilelang-hivm-regression` 7.38 s against 8.73 s. Timings are therefore not comparable evidence of equivalence; the discovered/passed/unsupported counts and the observation values are.
+P1 wall-clock is shorter than P0 because the trees were warm after the baseline: `ascend-regression` took 3.12 s (round 1) and 3.23 s (round 2) against 410.7 s, and `tilelang-hivm-regression` 7.38 s and 8.03 s against 8.73 s. Timings are therefore not comparable evidence of equivalence; the discovered/passed/unsupported counts and the observation values are.
 
 `report` and `verify` were run for each adapter. `ascendnpu-ir` and `tilelang-hivm` both returned `status: PASS`, `valid: true`, no failures. `tilelang-hivm-npu` returned `status: BLOCKED_ENV`, `valid: false`, with the recorded reason "explicit TILELANG_HIVM_DEVICE_ID or --device-id authorization required" — a correct refusal, not a passing result.
 
