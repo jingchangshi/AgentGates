@@ -95,6 +95,45 @@ def test_five_gate_equivalence(tmp_path, adapter, gate, scenario):
     assert (new == 'PASS') == (old == 'PASS')
 
 
+# Migrated gates must keep their original rules, with one narrow exception: a
+# recipe whose timeout was measurably too short to ever finish. The suite records
+# each such deviation here by name instead of loosening the comparison, so a
+# future silent edit still fails and a deliberate one has to be written down.
+#
+# ascendnpu-ir.regression: the recipe allowed 1140s. The check-bishengir lit
+# suite on an LLVM/MLIR-scale tree was measured at 20-60 minutes, so the gate
+# could only ever report a timeout - a FAIL that says nothing about the tree.
+# Raised to 5340s inner / 5400s outer. Argv shape and the trailing target are
+# unchanged; only the bound moved.
+_TIMEOUT_DEVIATIONS = {
+    ('ascendnpu-ir', 'ascendnpu-ir.regression'): {
+        'old': ('1140', 1200),
+        'new': ('5340', 5400),
+    },
+}
+
+
+def _accounted_deviation(adapter, recipe_id, argv, old_argv, timeout, old_timeout):
+    """Return the argv/timeout to compare, substituting a declared deviation back."""
+    deviation = _TIMEOUT_DEVIATIONS.get((adapter, recipe_id))
+    if deviation is None:
+        return argv, timeout
+    old_value, old_bound = deviation['old']
+    new_value, new_bound = deviation['new']
+    # The deviation is legitimate only when it is EXACTLY the declared one. The
+    # recipe timeout is a separate field from the container-side value that sits
+    # in argv, so both are compared: a silent change to either fails here.
+    assert timeout == new_bound and old_bound != new_bound
+    assert argv != old_argv
+    # Everything except the bound itself must be untouched: same interpreter,
+    # same script, same target, same flags and their order.
+    assert len(argv) == len(old_argv)
+    differing = [index for index, (left, right) in enumerate(zip(argv, old_argv)) if left != right]
+    assert differing == [len(argv) - 2], "only the container timeout value may differ"
+    assert argv[-2] == new_value and old_argv[-2] == old_value
+    return old_argv, old_timeout
+
+
 @pytest.mark.parametrize('adapter,gate', CONTRACTS, ids=[gate['id'] for _, gate in CONTRACTS])
 def test_migrated_gate_retains_original_rules(adapter, gate):
     manifest = Registry().get(adapter)
@@ -105,9 +144,12 @@ def test_migrated_gate_retains_original_rules(adapter, gate):
     old_manifest = json.loads((FIXTURES / 'legacy' / (adapter + '.json')).read_text())
     old_recipe = next(item for item in old_manifest['recipes'] if item['id'] == gate['recipeId'])
     recipe = manifest.recipes[gate['recipeId']]
-    assert recipe['argv'] == old_recipe['argv']
+    argv, timeout = _accounted_deviation(adapter, gate['recipeId'],
+                                         recipe['argv'], old_recipe['argv'],
+                                         recipe.get('timeout', 60), old_recipe.get('timeout', 60))
+    assert argv == old_recipe['argv']
     assert recipe.get('cwd', 'pack') == old_recipe.get('cwd', 'pack')
-    assert recipe.get('timeout', 60) == old_recipe.get('timeout', 60)
+    assert timeout == old_recipe.get('timeout', 60)
     # Additive preflight on Ascend is allowed, but an existing check cannot disappear.
     if old_recipe.get('configCheck'):
         assert recipe['configCheck'] == old_recipe['configCheck']
