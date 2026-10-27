@@ -64,7 +64,7 @@ From the `system/init` event, the plugin was loaded as `agent-gates@inline` (pat
 | `agent-gates:verify` | `Bash, Read` | true |
 | `agent-gates:report` | `Bash` | true |
 
-The `TaskCompleted` hook was registered from `hooks/hooks.json`. No other AgentGates command or marketplace entry existed; `installed_plugins.json` lists only `pyright-lsp`, and `agent-gates@inline` appeared only under `pluginUsage`.
+`hooks/hooks.json` declares the `TaskCompleted` command hook (`python3 -I "${CLAUDE_PLUGIN_ROOT}/hooks/task_completed.py"`, 75 s), and the session read that file; the session's `init` event carries no hook list, so registration was not independently observed. No `TaskCompleted` event occurred, so the hook was never invoked in either session. No other AgentGates command or marketplace entry existed; `installed_plugins.json` lists only `pyright-lsp`, and `agent-gates@inline` appeared only under `pluginUsage`.
 
 `claude plugin validate ./integrations/claude-code` passes with no warnings.
 
