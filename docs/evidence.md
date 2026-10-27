@@ -6,6 +6,8 @@ The default store is `~/.local/state/agent-gates`; a command may choose `--evide
 
 Receipts use a local per-user HMAC key. This detects accidental corruption and receipt edits by a party that lacks that key. It cannot resist an agent or process with the same OS-user privileges: that process can read the key or modify the program. The trust label is `local-user-integrity`, not a sandboxed or externally signed attestation. Stronger isolation requires a separately controlled signer and execution boundary.
 
+The receipt also binds the adapter's own environment assignments and the inherited toolchain variables (`PATH`, `PYTHONPATH`, `PYTHONHOME`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `HOME`, `SHELL`) as two SHA-256 digests. Values are never stored. `verify` re-derives the adapter-prefix digest but deliberately does not re-derive the inherited one: the verifying shell's environment is not the running shell's, and a different `PATH` would otherwise mark every sound receipt `STALE`.
+
 Verification checks HMAC, current manifest/script identity, source snapshot, configuration files, recorded argv/CWD and gate dependencies, logs and terminal process records, executable and product references, and reevaluates PASS observations from stored stdout. Report uses this verification result as its current status and preserves the original recorded status separately. The tool does not use a previous PASS as the result of a new execution.
 
 | Status | Meaning |
