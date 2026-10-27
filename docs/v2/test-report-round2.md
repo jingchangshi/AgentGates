@@ -57,19 +57,34 @@ RESULT: PASS
 
 脚本现在会在缺凭据时**显式 SKIP 并说明原因**（exit 2），而不是中途崩溃。
 
-## 3. Ascend regression 超时上调 —— **已修改**
+## 3. Ascend regression —— **已实跑 PASS，且推翻了原估算**
 
-实测该 lit 全量套件在 LLVM/MLIR 规模代码树上需 20–60 分钟，而配方超时为 1140 s。
-一个只能产出超时 FAIL 的 Gate 比没有 Gate 更糟：它报告一个与代码树无关的失败，
-并训练读者忽略该结果。
+此前的"20–60 分钟"估算来自 P0 侦察阶段的间接推断，未经验证。本轮实际提交运行：
 
-| 项 | 原值 | 新值 |
-|---|---|---|
-| recipe timeout | 1200 s | **5400 s** |
-| container timeout | 1140 s | **5340 s** |
+```
+run     098aa6768c62fd92bd8b53a995e66ef8
+ascend-build      PASS  exit=0  elapsed=0.8s   (代码树已构建)
+ascend-regression PASS  exit=0  elapsed=2.7s
+  Total Discovered Tests: 1142
+  Passed     : 1009 (88.35%)
+  Unsupported:  133 (11.65%)
+  Failed     :    0
+verify_requirements  satisfied=true  matched=[ascend-build, ascend-regression]
+```
 
-保留内层/外层同样的余量。该修改需要真实运行才能产出 PASS 证据——本次未运行全量回归，
-因此 Ascend regression 的**结论仍为 BLOCKED（未执行）**，只是造成阻塞的原因（超时过短）已消除。
+**估算被实测推翻**：lit 用 256 个并发 worker 驱动 1142 个测试，测试时间 1.92 秒。
+原 1140 s 的超时对已构建的代码树其实绰绰有余。
+
+因此本轮做了两件事：
+
+1. **更正了所有引用该错误估算的注释与文档**（`test_adapters_ascend.py`、
+   `test_equivalence_gates.py`、`test-report.md`、`final-report.md`），
+   避免一条被证伪的数字继续作为依据流传。
+2. **保留了超时上调**（1200 → 5400 s），但重新说明其性质：它现在只是**未构建代码树时的
+   余量**，不是对某个已观测超时的修复。若希望收紧，回落到 1200 s 是一行改动。
+
+`Unsupported: 133` 在 lit 中是正常现象（平台不满足的测试既非通过也非失败），
+决定结论的是 `Failed: 0`。
 
 ## 4. 前置依赖显式报错 —— **已实现并双向验证**
 
@@ -123,7 +138,7 @@ verify: 0 failure(s)
 |---|---|---|
 | GUI 层 MCP 工具闭环 | 未测（需重启） | **PASS** |
 | 完整模型驱动 Team E2E | NOT_TESTED（无凭据） | **PASS 10/10** |
-| Ascend regression | BLOCKED（超时过短） | **BLOCKED（未执行）**，阻塞原因已消除 |
+| Ascend regression | BLOCKED（超时过短） | **PASS**（1142 测试，0 失败） |
 | 前置依赖缺失行为 | 静默通过 | **显式报错**（双向验证） |
 | `verify.sh` | 6/7 步（第 6 步 FAIL） | **6/6 全 PASS** |
 

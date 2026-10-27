@@ -121,7 +121,7 @@ revision、要求摘要与证据引用。这样既满足「外部验证耗时不
 | tilelang-hivm | build | **PASS** | run `13afbcbb…` |
 | tilelang-hivm | regression | **PASS** | run `8866f8ff…`，14 个真实测试、0 跳过、原生库哈希与宿主一致 |
 | ascendnpu-ir | build | **PASS** | run `da89fdd1…` |
-| ascendnpu-ir | regression | **BLOCKED** | lit 全量实测 20–60 min，超过 1140 s 配方超时，未启动 |
+| ascendnpu-ir | regression | **PASS** | run `098aa676…`：1142 个测试，1009 通过，0 失败 |
 | tilelang-hivm-npu | sanity | **BLOCKED** | 两张卡均被其他用户占用，且未授权设备 |
 
 ## 9. 原有 Claude Code 集成是否仍可使用？
@@ -143,7 +143,7 @@ run `8866f8ff…`（TileLang build + regression 双 Gate PASS）返回 **exit 0*
 | 项目 | 状态 | 原因 |
 |---|---|---|
 | NPU 真机验收 | **BLOCKED** | 未授权设备；两张 Ascend950PR 均被占用 |
-| AscendNPU-IR regression | **BLOCKED** | 实测耗时超配方超时，未启动 |
+| AscendNPU-IR regression | **已解除** | 本轮实跑通过，见 `test-report.md` |
 | 完整模型驱动 Team E2E | **NOT_TESTED** | 本机**无任何 LLM 凭据**，而 `dsh-base` 声明了 provider，缺凭据在启动时即致命 |
 
 第三项**不是缺陷**：门禁本身（136 + 23 项检查）和真实 Team 服务上的 5 个真实事务
@@ -207,8 +207,9 @@ b9b8440  test(e2e): pin the profile explicitly and record two harness findings
 
 ### 建议
 
-4. **AscendNPU-IR regression 的配方超时**建议上调（当前 1140 s，实测全量 lit 需
-   20–60 min），否则该 Gate 只会产出无意义的超时 FAIL。
+4. **AscendNPU-IR regression** 已实跑通过（run `098aa676…`）：1142 个测试、
+   1009 通过、0 失败、耗时 2.7 s。此前"20–60 min"的估算已被实测推翻，
+   配方超时上调现仅作为未构建代码树时的余量，可随时回落到 1200 s。
 5. **NPU 授权**：如要执行 NPU Gate，需在 `~/.config/agent-gates/config.toml` 的
    `[devices] authorized_npu_devices` 中显式写入设备号。空的列表意味着「不允许执行」。
 

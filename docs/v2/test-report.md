@@ -18,7 +18,7 @@ report never lets one stand in for the other.
 | Real compiler: TileLang HIVM build | **PASS** | **Real Compiler Gate** | run `13afbcbb…` |
 | Real compiler: TileLang HIVM regression | **PASS** | **Real Compiler Gate** | run `8866f8ff…` |
 | Real compiler: AscendNPU-IR build | **PASS** | **Real Compiler Gate** | run `da89fdd1…` |
-| Real compiler: AscendNPU-IR regression | **BLOCKED** | — | not executed (see below) |
+| Real compiler: AscendNPU-IR regression | **PASS** | **Real Compiler Gate** | run `098aa676…` |
 | Real NPU gate | **BLOCKED** | — | no device authorized; both cards held |
 | Team completion gate (DSH domain) | **PASS** 136 | Unit + Integration | vitest |
 | AgentGates policy vs real verifier | **PASS** 23/23 | Integration (real receipts) | `policy.mjs` |
@@ -116,16 +116,28 @@ verify  PASS []
 verify_requirements  satisfied=true
 ```
 
-### AscendNPU-IR — regression **(BLOCKED, not executed)**
+### AscendNPU-IR — regression **(PASS)**
 
-Reconnaissance measured the `check-bishengir` lit suite on an LLVM/MLIR-scale
-tree at roughly 20–60+ minutes, against a pinned 1140 s recipe timeout. The gate
-was therefore not started rather than being started and abandoned; running it
-would have produced a timeout FAIL that says nothing about the tree.
+```
+run     098aa6768c62fd92bd8b53a995e66ef8
+gates   ascend-build PASS, ascend-regression PASS
+output  Total Discovered Tests: 1142
+        Passed: 1009 (88.35%)   Unsupported: 133 (11.65%)   Failed: 0
+wall    2.7 s for the regression recipe, 0.8 s for the build (tree already built)
+verify  PASS []
+verify_requirements  satisfied=true  matched=[ascend-build, ascend-regression]
+```
 
-**This is a real finding, not a test failure.** The manifest timeout should be
-raised for that recipe on a machine of this size before the gate is used as
-acceptance evidence.
+**A correction worth recording.** An earlier reconnaissance estimated this suite
+at 20–60+ minutes and on that basis the gate was left unrun. The first real run
+disproved it: lit drives 1142 tests across 256 workers and finishes in under two
+seconds of testing time. The estimate has been corrected everywhere it appeared,
+and the recipe timeout remains raised only as deliberate slack for an unbuilt
+tree — the original 1140 s would have sufficed on a warm one.
+
+`Unsupported: 133` is normal for lit: those tests declare requirements this
+platform does not meet. They are neither passes nor failures, and `Failed: 0` is
+the number that decides the verdict.
 
 ### TileLang NPU **(BLOCKED)**
 

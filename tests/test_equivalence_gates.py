@@ -100,11 +100,12 @@ def test_five_gate_equivalence(tmp_path, adapter, gate, scenario):
 # each such deviation here by name instead of loosening the comparison, so a
 # future silent edit still fails and a deliberate one has to be written down.
 #
-# ascendnpu-ir.regression: the recipe allowed 1140s. The check-bishengir lit
-# suite on an LLVM/MLIR-scale tree was measured at 20-60 minutes, so the gate
-# could only ever report a timeout - a FAIL that says nothing about the tree.
-# Raised to 5340s inner / 5400s outer. Argv shape and the trailing target are
-# unchanged; only the bound moved.
+# ascendnpu-ir.regression: the recipe allowed 1140s, raised to 5340s inner /
+# 5400s outer as slack for an unbuilt tree. The FIRST real run of this gate
+# afterwards measured 1142 tests in 2.7s wall clock (256 parallel lit workers,
+# 1009 passed / 133 unsupported / 0 failed), so the original bound was in fact
+# sufficient on a warm tree. The deviation is kept as deliberate headroom.
+# Argv shape and the trailing target are unchanged; only the bound moved.
 _TIMEOUT_DEVIATIONS = {
     ('ascendnpu-ir', 'ascendnpu-ir.regression'): {
         'old': ('1140', 1200),

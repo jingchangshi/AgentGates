@@ -82,9 +82,10 @@ class ManifestCase(unittest.TestCase):
         # Outer Harness bound must exceed the container-side ceiling.
         self.assertEqual(build['timeout'], 900)
         self.assertEqual(int(build['argv'][4]) < build['timeout'], True)
-        # Measured, not assumed: the check-bishengir lit suite runs 20-60 minutes
-        # on this tree, so 1200s could only ever report a timeout rather than a
-        # result about the code.
+        # Raised from 1200 for headroom on an unbuilt tree. The first real run
+        # of this gate measured 1142 tests in 2.7s wall clock (256 lit workers),
+        # so the original bound was in fact sufficient for a warm tree; the larger
+        # value is deliberate slack, not a fix for an observed timeout.
         self.assertEqual(regression['timeout'], 5400)
         self.assertEqual(int(regression['argv'][4]) < regression['timeout'], True)
         self.assertEqual(build['argv'][5:], ['bishengir-opt', 'bishengir-compile',
