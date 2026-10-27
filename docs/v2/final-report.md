@@ -126,7 +126,16 @@ revision、要求摘要与证据引用。这样既满足「外部验证耗时不
 
 ## 9. 原有 Claude Code 集成是否仍可使用？
 
-**是。** 该集成通过 `agent-gates` CLI 的 `verify` / `report --json` 工作，两条路径的
+**是，已用真实 v2 receipt 实测。**
+
+hook `integrations/claude-code/hooks/task_completed.py` 在提供 `evidenceRoot` 时，对
+run `8866f8ff…`（TileLang build + regression 双 Gate PASS）返回 **exit 0**，即放行。
+
+一个使用注意：hook 默认读取**默认** evidence 根目录。V2 的部署把证据放在
+`state_root/evidence` 下，因此需要在 receipt 块里写 `evidenceRoot`，或让
+`evidence_root` 指向默认位置。这是配置问题，不是兼容性破坏——两者的 CLI 契约完全一致。
+
+该集成通过 `agent-gates` CLI 的 `verify` / `report --json` 工作，两条路径的
 行为与输出结构均未改变，相关测试全部通过。新增的异步动词与 MCP 表面是纯粹的增量。
 
 ## 10. 哪些测试缺乏真实环境或授权？
