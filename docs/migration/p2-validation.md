@@ -39,7 +39,7 @@ Same two detached worktrees, same uncommitted single-file edits, evidence root `
 | `ascend-dev` | `bishengir/test/Transforms/canonicalize-module.mlir:9`, whitespace only | `b2ef7ee46e15cfe90313f099de2a8afd` | FAIL: `ascend-build` `NONZERO_EXIT`, recipe exit 3 (`no build/build.ninja under …/ascend-dev; initialize the build directory first`); `ascend-regression` `NOT_RUN` `DEPENDENCY_NOT_PASSED` |
 | `tilelang-dev` | one assertion at `testing/ascend/target/test_tilelang_ascend_target.py:30` | `62eec6254852af279ace6b5651e365e1` | FAIL: `tilelang-hivm-build` `NONZERO_EXIT`, recipe exit 2 (`no build directory under …/tilelang-dev; configure the build directory first`, then `container produced no build report`); regression `NOT_RUN` |
 
-Both `verify` → exit 1, `valid: false`, the same three failures. Both worktrees have no `build/`, no `CMakeCache.txt`/`build.ninja`, and empty submodules (`third-party/llvm-project`, `torch-mirror`, `shmem`, `3rdparty/tvm`, `3rdparty/cutlass`). Neither run was redirected to the original checkouts, nothing was built elsewhere, no checkout was symlinked in, and both diffs remain uncommitted at their original HEADs.
+Both `verify` → exit 1, `valid: false`, the same three failures. Both worktrees have no `build/`, no `CMakeCache.txt`/`build.ninja`, and empty submodules (`third-party/llvm-project`, `third-party/torch-mlir`, `third-party/shmem`, `3rdparty/tvm`, `3rdparty/cutlass`). Neither run was redirected to the original checkouts, nothing was built elsewhere, no checkout was symlinked in, and both diffs remain uncommitted at their original HEADs.
 
 ## Round 1 (retained, now STALE)
 
@@ -70,7 +70,7 @@ From that session's `system/init` event, the plugin was loaded as `agent-gates@i
 
 ## Round-1 plugin-initiated runs (STALE)
 
-Source `<tilelang-checkout>`, HEAD `6fe6f09`, five pre-existing tracked modifications preserved. Evidence root `.evidence/p2-plugin-runs`. Both run IDs now verify as `STALE` / `ADAPTER_IDENTITY_CHANGED`; the round-2 table above is the current evidence for the same steps.
+Source `<tilelang-checkout>`, HEAD `6fe6f09`, five pre-existing tracked modifications preserved. Evidence root `.evidence/p2-plugin-runs`. The round-1 `run` ID `74e428e9…` now verifies as `STALE` / `ADAPTER_IDENTITY_CHANGED`; the round-1 `doctor` ID `1bab01b8…` publishes no receipt, so `verify` reports `INVALID_EVIDENCE` for it — the same "no receipt" answer that the round-2 doctor ID gives. The round-2 table above is the current evidence for the same steps.
 
 | Step | Exit | Run ID | Status |
 | --- | ---: | --- | --- |
