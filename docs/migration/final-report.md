@@ -32,7 +32,7 @@ Source HEADs: AscendNPU-IR `bfefe18011152cca671e7e6ddf03793afbacaa2a`; TileLang 
 
 An occupancy probe with explicit device ids (read-only host `npu-smi`; container `npu-smi` cannot load `libc_sec.so`) blocked both visible cards with `CONFIG_CHECK_FAILED`: device 0, run `a0c167250ab7c79a1e286ddf4e8cd7c2`, "already in use by 2 process(es) this Gate did not start"; device 1, run `a3428763b378f1b6a0297b4bf42c8c97`, 5 such processes. Both `verify` `valid: false`.
 
-Offline suite: **439 passed, 88 subtests passed, exit 0** (invocation recorded by the lead; `.pytest_cache/v/cache/nodeids` holds 439 node IDs and `lastfailed` is empty, but no JUnit file for this run is retained). Isolated wheel proof (`.evidence/check_wheel.py`): PASS — the wheel contains all manifest-pinned files, no `env.sh`, `__pycache__` or Docker configuration; installs into a fresh venv away from the checkout where `agent-gates list --json` works and `engineering`, `anthropic`, `claude_code` are not importable.
+Offline suite: **441 passed, 88 subtests passed, exit 0**, logged to ignored `.evidence/final-pytest.log`; the earlier 439 figure was the same suite before two packaging tests were added. Isolated wheel proof (`.evidence/check_wheel.py`): PASS — the wheel contains every manifest-pinned file and the adapter deployment files, and no `env.sh`, `config.env`, `__pycache__` or machine configuration; it installs into a fresh venv away from the checkout where `agent-gates list --json` works and `engineering`, `anthropic`, `claude_code` are not importable. A fresh clone of the branch also passes the suite (441 tests) and `claude plugin validate`.
 
 ### P2 — Claude Code plugin
 
@@ -60,7 +60,7 @@ Both `verify` results were `valid: false`. Neither run was redirected to the ori
 | Original recipes still pass | P0 baseline, four gates | Verified |
 | CLI reproduces gate outcomes | P1 runs, matching counts | Verified |
 | No Harness/Claude runtime dependency | Wheel install + import assertions | Verified |
-| Offline correctness | 439 tests, 88 subtests, exit 0 (node IDs on disk; no retained JUnit) | Verified, artifact gap |
+| Offline correctness | 441 tests, 88 subtests, exit 0 (`.evidence/final-pytest.log`) | Verified |
 | Plugin loads and runs gates | Real session, three plugin skills, run PASS | Verified |
 | Repository private | Auth `ls-remote` exit 0; nonexistent-repo control 128; anonymous API 404 vs public 200; 102-repo public listing omits it | Proven private |
 | NPU gate on hardware | None in any phase | Not measured |

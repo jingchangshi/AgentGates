@@ -55,7 +55,7 @@ The container's own `npu-smi` is unusable in the current image (`libc_sec.so` fa
 
 | Item | Result |
 | --- | --- |
-| Offline suite | 439 passed, 88 subtests passed, exit 0 |
+| Offline suite | 441 passed, 88 subtests passed, exit 0 (`.evidence/final-pytest.log`; 439 before the two packaging tests were added) |
 | Isolated wheel install | PASS (pinned files present, no machine config, no Harness/Claude/Anthropic import) |
 | P1 `ascendnpu-ir` | doctor + run PASS, `c1610b674026bc2156c1a3ccedb48ee0`, verify `valid: true` |
 | P1 `tilelang-hivm` | doctor + run PASS, `181cad5aa72c8893043f4a53f7b2e79b`, verify `valid: true` |

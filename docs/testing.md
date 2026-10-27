@@ -8,7 +8,7 @@ Two layers are tested separately: the offline suite (no Docker, compiler or devi
 python3 -m pytest -q tests/
 ```
 
-Current result: **439 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
+Current result: **441 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
 
 | File | Tests | Subtests | Covers |
 | --- | ---: | ---: | --- |
@@ -18,7 +18,7 @@ Current result: **439 passed, 88 subtests passed**, exit 0. No network, Docker, 
 | `test_adapters_ascend.py` | 90 | 3 | Ascend bridge: argv, timeouts, bind-mount mapping, host/container identity, preflight |
 | `test_adapters_tilelang.py` | 176 | 4 | TileLang and NPU bridges, statistics contract, JUnit handling, device authorization, occupancy probe |
 | `test_adapters_raw_reports.py` | 7 | 70 | Malformed container facts cannot become a PASS |
-| `test_adapters_packaging.py` | 3 | — | Adapter data layout and `--check-config` presence |
+| `test_adapters_packaging.py` | 5 | — | Adapter data layout, `--check-config` presence, shipped deployment files, template neutrality |
 | `test_equivalence_gates.py` | 54 | — | Frozen original contracts for all five gates versus the migrated evaluator |
 | `test_plugin_receipts.py` | 10 | 11 | Claude Code skills and the opt-in `TaskCompleted` receipt hook |
 

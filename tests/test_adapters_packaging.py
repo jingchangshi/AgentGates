@@ -57,6 +57,31 @@ class PackagingCase(unittest.TestCase):
                 self.assertEqual(check[-1], '--check-config')
                 self.assertIn(check[2].removeprefix('{pack}/'), manifest['files'])
 
+    def test_the_distribution_declares_the_deployment_files_it_ships(self):
+        # A wheel that omits `docker/` can run Gates but cannot create the
+        # container they address. The pattern must stay narrow enough to never
+        # match a real `config.env`, which is machine data.
+        data = (ROOT / 'pyproject.toml').read_text()
+        self.assertIn('adapters/*/docker/*', data)
+        for name in ('Dockerfile', 'entry.sh', 'create-container.sh', 'config.example.env'):
+            for adapter in ('ascendnpu-ir', 'tilelang-hivm'):
+                self.assertTrue((ADAPTERS / adapter / 'docker' / name).is_file(),
+                                f'{adapter}/docker/{name}')
+
+    def test_the_example_container_configuration_holds_no_machine_value(self):
+        # Both templates are committed, so neither may carry this machine's
+        # account, home or toolchain paths. Generic illustrative shapes such as
+        # `/home/<user>` or a `/home:/home` bind are fine; the real file beside
+        # each template is where actual values belong.
+        machine = ('s00653124', '/home/s00653124', 's00653124_tilelang', '/data/pri',
+                   '/data/miniconda3', 'AscendNPU-IR-1', 'hivm-poc-control')
+        for adapter in ('ascendnpu-ir', 'tilelang-hivm'):
+            template = ADAPTERS / adapter / 'docker' / 'config.example.env'
+            text = template.read_text()
+            for value in machine:
+                self.assertNotIn(value, text, f'{template}: {value}')
+            self.assertNotRegex(text, r'ASCEND_RT_VISIBLE_DEVICES=[0-9]')
+
 
 if __name__ == '__main__':
     unittest.main()
