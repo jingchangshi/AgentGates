@@ -314,7 +314,8 @@ def build_server():
                  description="Decide whether one explicit run id satisfies a set of required "
                              "gates for the current source state. This is what a completion gate calls.")
     async def verify_requirements_tool(workspace: str, adapter: str,
-                                        required_gates: list[str], run_id: str):
+                                        required_gates: list[str], run_id: str,
+                                        ) -> api.RequirementVerificationResult:
         payload = RequirementsInput(workspace=workspace, adapter=adapter,
                                     required_gates=required_gates, run_id=run_id)
         manager = _manager()
