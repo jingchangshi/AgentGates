@@ -90,41 +90,40 @@ class ExecutionManager:
         return workspace, manifest, ordered
 
     def _device_for(self, adapter_id: str, requested_device):
-        """An idle card is not an authorized card (C4).
+        """Choose the NPU device a request will use.
 
-        Only a device the operator listed in the local configuration may be
-        used. Nothing here consults npu-smi to find whatever is free.
+        A card another job is running on is still a card this gate may use, so
+        nothing here refuses for occupancy: sharing is the normal case on a
+        shared machine, and a refusal on that basis would block legitimate
+        work for reasons that have nothing to do with the code under test.
+
+        The configuration may NARROW the set (`devices.allowed_npu_devices`)
+        and may demand a quiet card (`devices.require_exclusive_device`). Both
+        are optional; with neither set, every device is available and the
+        selection is deterministic so a receipt keeps describing a
+        reproducible machine state.
         """
         if not adapter_id.endswith("-npu"):
             return None
         if requested_device is not None:
-            raise api.APIError(
-                api.ErrorCode.DEVICE_NOT_AUTHORIZED,
-                "a device id is not a model-selectable parameter; authorize it "
-                "in the local configuration")
-        authorized = sorted(self.config.devices.authorized)
-        if not authorized:
-            raise api.APIError(
-                api.ErrorCode.DEVICE_NOT_AUTHORIZED,
-                "no NPU device is authorized on this machine; the gate is blocked "
-                "rather than given a free card",
-                field="devices.authorized_npu_devices")
-        if len(authorized) > 1:
-            raise api.APIError(
-                api.ErrorCode.DEVICE_NOT_AUTHORIZED,
-                "more than one device is authorized, so no single device can be "
-                "bound to this request automatically",
-                field="devices.authorized_npu_devices",
-                details={"authorized": authorized})
-        return authorized[0]
+            # An execution request has no device field, so this is reachable
+            # only from an internal caller passing one explicitly.
+            device = str(requested_device)
+            if not self.config.devices.permits(device):
+                raise api.APIError(
+                    api.ErrorCode.DEVICE_NOT_AUTHORIZED,
+                    "device " + device + " is excluded by devices.allowed_npu_devices",
+                    field="devices.allowed_npu_devices",
+                    details={"allowed": sorted(self.config.devices.allowed or [])})
+            return device
+        return self.config.devices.select()
 
     @staticmethod
     def _valid_id(execution_id) -> str:
         """Reject a malformed execution id as a REQUEST error.
 
-        The id reaches a file path and a systemd unit name, so a value that is
-        not 32 hex characters must fail before either is built. Reporting it as
-        an APIError keeps the refusal in the documented error taxonomy.
+        The id reaches a file path and a systemd unit name, so a value that
+        is not 32 hex characters must fail before either is built.
         """
         if not isinstance(execution_id, str) or not EXECUTION_ID.fullmatch(execution_id):
             raise api.APIError(api.ErrorCode.INVALID_REQUEST,

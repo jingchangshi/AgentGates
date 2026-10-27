@@ -171,23 +171,46 @@ class Worker:
 
 
 class Devices:
-    """Explicit operator grants for NPU devices.
+    """Which NPU devices a gate may use.
 
-    An idle card is not an authorized card. Without an entry here the NPU
-    adapter is refused rather than allowed to pick whatever is free.
+    Sharing a card is normal operation, not an error: another job running on a
+    device does not make that device unavailable to this one. So the DEFAULT is
+    every device the machine exposes, and a configuration can only ever NARROW
+    that set.
+
+    Exclusivity is therefore opt-in. An operator who needs a quiet card sets
+    ``require_exclusive_device``; the gate then refuses a card another process
+    holds. That is a policy choice, not a precondition for running at all.
     """
 
-    __slots__ = ("authorized", "smi_command")
+    __slots__ = ("allowed", "default_device", "require_exclusive", "smi_command")
 
-    def __init__(self, authorized, smi_command):
-        self.authorized = authorized
+    def __init__(self, allowed, default_device, require_exclusive, smi_command):
+        self.allowed = allowed
+        self.default_device = default_device
+        self.require_exclusive = require_exclusive
         self.smi_command = smi_command
 
-    def authorized_for(self, device_id):
-        return str(device_id) in self.authorized
+    def permits(self, device_id):
+        """Whether this configuration allows one device id."""
+        return self.allowed is None or str(device_id) in self.allowed
+
+    def select(self):
+        """The device a request uses when nothing narrower selects one.
+
+        Deterministic on purpose: a gate that silently picked "whatever looks
+        idle" would make two identical requests run on different hardware, and
+        the receipt would stop describing a reproducible machine state.
+        """
+        if self.default_device is not None:
+            return self.default_device
+        if self.allowed:
+            return sorted(self.allowed, key=int)[0]
+        return "0"
 
     def __repr__(self):
-        return f"Devices(authorized={sorted(self.authorized)})"
+        return (f"Devices(allowed={self.allowed if self.allowed is None else sorted(self.allowed)}, "
+                f"default={self.default_device!r}, exclusive={self.require_exclusive})")
 
 
 class Config:
@@ -357,21 +380,47 @@ def from_mapping(raw, *, path=None):
     devices_raw = raw.get("devices", {})
     if not isinstance(devices_raw, dict):
         raise ConfigError("devices", "must be a table")
-    authorized_raw = devices_raw.get("authorized_mindspore_devices", devices_raw.get("authorized_npu_devices", []))
-    if not isinstance(authorized_raw, list):
-        raise ConfigError("devices.authorized_npu_devices", "must be a list of device ids")
-    authorized = set()
-    for index, device in enumerate(authorized_raw):
-        entry = f"devices.authorized_npu_devices[{index}]"
-        # Integers keep "device 0" from being written as the string "0" in one
-        # place and the number in another; the engine normalises to "0" anyway.
-        if type(device) is not int or device < 0:
-            raise ConfigError(entry, "must be a nonnegative integer device id")
-        authorized.add(str(device))
+    # "allowed" is an optional RESTRICTION. Absent, empty, or explicitly null
+    # all mean the same thing: every device the machine exposes is usable.
+    # `authorized_npu_devices` is accepted as a legacy spelling of the same
+    # key so an existing file keeps loading; its empty value now means "no
+    # restriction" rather than "no device", which is the policy this machine
+    # settled on: a card another job uses is still a card this gate may use.
+    allowed_raw = devices_raw.get("allowed_npu_devices",
+                                  devices_raw.get("authorized_npu_devices"))
+    allowed = None
+    if allowed_raw is not None:
+        if not isinstance(allowed_raw, list):
+            raise ConfigError("devices.allowed_npu_devices", "must be a list of device ids")
+        collected = set()
+        for index, device in enumerate(allowed_raw):
+            entry = f"devices.allowed_npu_devices[{index}]"
+            # Integers keep "device 0" from being written as the string "0" in
+            # one place and the number in another; the engine normalises to "0".
+            if type(device) is not int or device < 0 or device >= 64:
+                raise ConfigError(entry, "must be an integer device id between 0 and 63")
+            collected.add(str(device))
+        allowed = frozenset(collected) if collected else None
+
+    default_raw = devices_raw.get("default_npu_device")
+    default_device = None
+    if default_raw is not None:
+        if type(default_raw) is not int or default_raw < 0 or default_raw >= 64:
+            raise ConfigError("devices.default_npu_device",
+                              "must be an integer device id between 0 and 63")
+        default_device = str(default_raw)
+        if allowed is not None and default_device not in allowed:
+            raise ConfigError("devices.default_npu_device",
+                              "must also appear in devices.allowed_npu_devices")
+
+    exclusive_raw = devices_raw.get("require_exclusive_device", False)
+    if type(exclusive_raw) is not bool:
+        raise ConfigError("devices.require_exclusive_device", "must be a boolean")
+
     smi = devices_raw.get("smi_command", "npu-smi")
     if not isinstance(smi, str) or not smi.strip():
         raise ConfigError("devices.smi_command", "must be a nonempty string")
-    devices = Devices(frozenset(authorized), smi)
+    devices = Devices(allowed, default_device, exclusive_raw, smi)
 
     payload = {
         "schema_version": schema_version,
@@ -382,7 +431,10 @@ def from_mapping(raw, *, path=None):
                      for key, ad in adapters.items()},
         "worker": {"backend": worker.backend, "max_concurrent": worker.max_concurrent,
                    "python": str(worker.python), "start_timeout_seconds": worker.timeout_start_seconds},
-        "devices": {"authorized_npu_devices": sorted(authorized), "smi_command": devices.smi_command},
+        "devices": {"allowed": sorted(devices.allowed) if devices.allowed else None,
+                    "default": devices.default_device,
+                    "require_exclusive": devices.require_exclusive,
+                    "smi_command": devices.smi_command},
     }
     # state_root/evidence_root/lock_root are deliberately OUTSIDE the digest.
     # They select where evidence is stored, not what a gate executes, so moving

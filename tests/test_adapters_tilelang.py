@@ -1767,57 +1767,94 @@ class NpuRunCase(_FakeDockerCase):
 
 
 class NpuOccupancyCase(_FakeDockerCase):
-    """A card in use by another job must block the Gate before dispatch.
+    """A card another job is using is still a card this Gate may use.
 
-    The A5 cards are shared, and an idle card is not an assignment either. The
-    probe therefore only removes the case where the card is demonstrably busy;
-    it never selects a card, and it never reports another user's process ids.
+    Ascend NPUs on this machine are shared the way every GPU is shared: a
+    process holding a device does not reserve it. So occupancy is REPORTED, not
+    enforced. A Gate that refused merely because someone else was on the card
+    would be blocked for a reason unrelated to the code under test.
+
+    Exclusivity is opt-in through TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE, which
+    AgentGates forwards from devices.require_exclusive_device. Then a held card
+    is BLOCKED_ENV, because the test genuinely never ran.
     """
 
-    def test_a_busy_card_blocks_before_any_docker_call(self):
-        os.environ['TILELANG_HIVM_DEVICE_ID'] = '0'
+    def test_a_shared_card_is_used_by_default(self):
+        # The default policy: proceed, and share the device.
+        os.environ["TILELANG_HIVM_DEVICE_ID"] = "0"
+        os.environ.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
         calls = []
-        busy = [(4242, 'python3'), (4243, 'pytest')]
-        with patch('subprocess.run', side_effect=self.fake_npu(calls=calls, occupancy=busy)):
-            with self.assertRaises(npu.BridgeError) as error:
-                npu.main(['--timeout', '900'])
-        message = str(error.exception)
-        self.assertIn('already in use by 2 process', message)
-        # The holder identities are counted, never copied into the receipt.
-        self.assertNotIn('4242', message)
-        self.assertNotIn('4243', message)
-        self.assertFalse([call for call in calls if call[:2] == ['docker', 'exec']])
+        busy = [(4242, "python3"), (4243, "pytest")]
+        with patch("subprocess.run", side_effect=self.fake_npu(calls=calls, occupancy=busy)):
+            self.assertEqual(npu.main(["--timeout", "900"]), 0)
+        # It dispatched: a busy card is not a refusal.
+        self.assertTrue([call for call in calls if call[:2] == ["docker", "exec"]])
 
-    def test_a_card_that_became_busy_is_blocked_not_failed(self):
-        # The same condition caught at the configuration check is
-        # `BLOCKED_ENV`; caught at the pre-dispatch probe it must not become
-        # `FAIL`, because no test started. The distinct exit code is what
-        # carries that classification to the runner, so it has to be the
-        # declared one and not a code a failing test run could produce.
-        os.environ['TILELANG_HIVM_DEVICE_ID'] = '0'
-        with patch('subprocess.run', side_effect=self.fake_npu(occupancy=[(7, 'python')])):
-            with self.assertRaises(npu.OccupancyBlocked) as error:
-                npu.main(['--timeout', '900'])
+    def test_exclusivity_blocks_a_shared_card(self):
+        os.environ["TILELANG_HIVM_DEVICE_ID"] = "0"
+        os.environ["TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE"] = "1"
+        try:
+            calls = []
+            busy = [(4242, "python3"), (4243, "pytest")]
+            with patch("subprocess.run", side_effect=self.fake_npu(calls=calls, occupancy=busy)):
+                with self.assertRaises(npu.BridgeError) as error:
+                    npu.main(["--timeout", "900"])
+            message = str(error.exception)
+            self.assertIn("already in use by 2 process", message)
+            self.assertIn("exclusive", message)
+            # The holder identities are counted, never copied into the receipt.
+            self.assertNotIn("4242", message)
+            self.assertNotIn("4243", message)
+            self.assertFalse([call for call in calls if call[:2] == ["docker", "exec"]])
+        finally:
+            os.environ.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
+
+    def test_an_exclusivity_block_is_blocked_env_not_fail(self):
+        # A shared card caught under an exclusivity demand must be `BLOCKED_ENV`;
+        # no test started, so it must not become `FAIL`. The distinct exit code
+        # is what carries that classification to the runner.
+        os.environ["TILELANG_HIVM_DEVICE_ID"] = "0"
+        os.environ["TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE"] = "1"
+        try:
+            with patch("subprocess.run", side_effect=self.fake_npu(occupancy=[(7, "python")])):
+                with self.assertRaises(npu.OccupancyBlocked) as error:
+                    npu.main(["--timeout", "900"])
+        finally:
+            os.environ.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
         self.assertEqual(type(error.exception).EXIT, 75)
-        # pytest's own statuses are 0-5 and the container script uses 3, so 75
+        # pytest own statuses are 0-5 and the container script uses 3, so 75
         # cannot be a test failure that was mistaken for a blocked environment.
         self.assertNotIn(npu.OccupancyBlocked.EXIT, (0, 1, 2, 3, 4, 5))
-        manifest = load_manifest(NPU / 'manifest.json')
-        for recipe in manifest['recipes']:
-            self.assertEqual(recipe.get('blockedExitCodes'), [npu.OccupancyBlocked.EXIT], recipe['id'])
-        for recipe in load_manifest(BASE / 'manifest.json')['recipes']:
-            self.assertNotIn('blockedExitCodes', recipe,
-                             'the base Adapter has no blocked-environment exit code')
+        manifest = load_manifest(NPU / "manifest.json")
+        for recipe in manifest["recipes"]:
+            self.assertEqual(recipe.get("blockedExitCodes"), [npu.OccupancyBlocked.EXIT], recipe["id"])
+        for recipe in load_manifest(BASE / "manifest.json")["recipes"]:
+            self.assertNotIn("blockedExitCodes", recipe,
+                             "the base Adapter has no blocked-environment exit code")
 
-    def test_check_config_blocks_on_a_busy_card(self):
-        # Preflight is the first place the Host learns the machine is unusable;
-        # a busy card must stop there rather than after the Recipe starts.
-        os.environ['TILELANG_HIVM_DEVICE_ID'] = '0'
+    def test_check_config_reports_a_shared_card_without_blocking(self):
+        # Preflight must succeed on a shared card and SAY it is shared, so a
+        # reader can tell a quiet run from a contended one. A refusal here would
+        # make the mode unusable on any busy machine.
+        os.environ["TILELANG_HIVM_DEVICE_ID"] = "0"
+        os.environ.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
         calls = []
-        with patch('subprocess.run', side_effect=self.fake_npu(calls=calls, occupancy=[(7, 'python')])):
-            with self.assertRaises(npu.BridgeError):
-                npu.check_config()
-        self.assertFalse([call for call in calls if call[:2] == ['docker', 'exec']])
+        with patch("subprocess.run", side_effect=self.fake_npu(calls=calls, occupancy=[(7, "python")])):
+            with patch("sys.stderr") as stderr:
+                self.assertEqual(npu.check_config(), 0)
+        printed = "".join(str(call.args[0]) for call in stderr.write.call_args_list if call.args)
+        self.assertIn("occupancy=shared(1)", printed)
+        self.assertIn("exclusive=False", printed)
+        self.assertFalse([call for call in calls if call[:2] == ["docker", "exec"]])
+
+    def test_check_config_reports_a_free_card(self):
+        os.environ["TILELANG_HIVM_DEVICE_ID"] = "0"
+        os.environ.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
+        with patch("subprocess.run", side_effect=self.fake_npu(occupancy=[])):
+            with patch("sys.stderr") as stderr:
+                self.assertEqual(npu.check_config(), 0)
+        printed = "".join(str(call.args[0]) for call in stderr.write.call_args_list if call.args)
+        self.assertIn("occupancy=free", printed)
 
     def test_an_idle_card_is_probed_but_never_selected(self):
         # An idle card still needs the explicit variable: the probe answers a
@@ -1900,8 +1937,10 @@ class NpuOccupancyCase(_FakeDockerCase):
 
     def test_the_device_is_rechecked_immediately_before_dispatch(self):
         # Another job may take the card between the configuration check and the
-        # Recipe. The second probe must see it and stop before `docker exec`.
+        # Recipe. Under an exclusivity demand the second probe must see it and
+        # stop before `docker exec`.
         os.environ['TILELANG_HIVM_DEVICE_ID'] = '0'
+        os.environ['TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE'] = '1'
         calls = []
         state = {'holders': []}
 
@@ -1910,9 +1949,12 @@ class NpuOccupancyCase(_FakeDockerCase):
                 state['holders'] = [(99, 'python3')]
             return self.fake_npu(calls=calls, occupancy=state['holders'])(argv, **kwargs)
 
-        with patch('subprocess.run', side_effect=run):
-            with self.assertRaises(npu.BridgeError):
-                npu.main(['--timeout', '900'])
+        try:
+            with patch('subprocess.run', side_effect=run):
+                with self.assertRaises(npu.BridgeError):
+                    npu.main(['--timeout', '900'])
+        finally:
+            os.environ.pop('TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE', None)
         self.assertFalse([call for call in calls if call[:2] == ['docker', 'exec']])
 
     def test_an_unrecognised_process_table_is_unknown_occupancy_not_a_free_card(self):

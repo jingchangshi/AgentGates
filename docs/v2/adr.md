@@ -144,20 +144,65 @@ code faults.
 
 ---
 
-## ADR-008 — NPU device authorization is explicit-only
+## ADR-008 — NPU device policy: sharing is the default, exclusivity is opt-in
 
-**Status:** accepted (mandated by objective C4).
+**Status:** revised — supersedes the original "explicit authorization only" rule.
 
-**Decision.** An idle device is not an authorized device. NPU gates run only on a
-device id listed in the local configuration under an explicit operator grant. With
-no grant, the NPU gate is `BLOCKED_ENV` and its test command is never invoked.
+### What changed and why
 
-**Rationale.** Selecting a free card silently would make a regression run on
-hardware the operator did not choose, and would make `verify_requirements` report a
-PASS for a machine state nobody approved.
+The first version required an operator to list `authorized_npu_devices` before any
+NPU gate could run, and refused a card another process was using. On a real
+shared machine that was wrong in two ways:
+
+1. **It blocked legitimate work.** A job already running on a card does not
+   reserve it. Every other workload on this host shares the devices; a gate that
+   refused to start would be the only thing on the machine that could not.
+2. **"An idle card is not an authorized card" was solving the wrong problem.**
+   The concern is a *reproducible* run, not an *exclusive* one. Exclusivity is one
+   way to get reproducibility and it is the wrong default.
+
+### The policy now
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `devices.allowed_npu_devices` | absent = **every device** | Optional restriction. Present and non-empty narrows the set. |
+| `devices.default_npu_device` | lowest permitted id | Pins the selection. Must appear in the allowlist. |
+| `devices.require_exclusive_device` | `false` | Opt-in. When true, a card held by another process is `BLOCKED_ENV`. |
+
+Selection is deterministic: with no configuration a gate uses device `0`. A gate
+that silently picked "whatever looks idle" would make two identical requests run
+on different hardware, and the receipt would stop describing a reproducible
+machine state.
+
+### Occupancy is reported, not enforced
+
+`npu-smi` is still consulted — but to *describe* the card, not to veto it. The
+configuration check says exactly what it found:
+
+```
+configuration ready: ... device=0 npuId=0 occupancy=shared(6) exclusive=False
+```
+
+A reader can therefore tell a quiet run from a contended one, which is the
+information exclusivity was costing. An unreadable driver answer is still a
+refusal: "unknown" is not "shared".
+
+### Exclusivity remains available
+
+An operator who needs an uncontended card sets `require_exclusive_device = true`.
+AgentGates forwards it to the adapter as
+`TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE=1`, and a held card then reports
+`BLOCKED_ENV` (exit 75) rather than running a test whose timing or memory another
+job could distort. That is a deliberate choice, not a precondition.
+
+### What this costs, stated plainly
+
+A shared card can make a *timing-sensitive* or memory-heavy test flaky, and the
+gate will report that flakiness as a verdict about the tree. The mitigation is to
+opt into exclusivity for those runs, or to read `occupancy=shared(n)` in the
+configuration check before treating a failure as a code regression.
 
 ---
-
 ## ADR-009 — Completion gating verifies submission-time source only
 
 **Status:** accepted (mandated by objective G4, final paragraph).

@@ -82,11 +82,10 @@ class ManifestCase(unittest.TestCase):
         # Outer Harness bound must exceed the container-side ceiling.
         self.assertEqual(build['timeout'], 900)
         self.assertEqual(int(build['argv'][4]) < build['timeout'], True)
-        # Raised from 1200 for headroom on an unbuilt tree. The first real run
-        # of this gate measured 1142 tests in 2.7s wall clock (256 lit workers),
-        # so the original bound was in fact sufficient for a warm tree; the larger
-        # value is deliberate slack, not a fix for an observed timeout.
-        self.assertEqual(regression['timeout'], 5400)
+        # Measured by a real run: 1142 tests across 256 lit workers in 2.7s wall
+        # clock (1009 passed, 0 failed). The original bound is ample, so a larger
+        # timeout would only delay noticing a genuine hang.
+        self.assertEqual(regression['timeout'], 1200)
         self.assertEqual(int(regression['argv'][4]) < regression['timeout'], True)
         self.assertEqual(build['argv'][5:], ['bishengir-opt', 'bishengir-compile',
                                             'install-bishengir-publish-products'])
@@ -103,7 +102,7 @@ class ManifestCase(unittest.TestCase):
         recipes = {item['id']: item for item in manifest['recipes']}
         self.assertEqual(bridge.KILL_AFTER_SECONDS, 15)
         for recipe_id, outer, inner in ((('ascendnpu-ir.incremental-build'), 900, 840),
-                                        (('ascendnpu-ir.regression'), 5400, 5340)):
+                                        (('ascendnpu-ir.regression'), 1200, 1140)):
             recipe = recipes[recipe_id]
             self.assertEqual(recipe['timeout'], outer, recipe_id)
             self.assertEqual(recipe['argv'][3], '--timeout')

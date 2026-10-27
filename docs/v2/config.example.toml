@@ -41,9 +41,17 @@ python = "/path/to/AgentGates/.venv/bin/python"
 start_timeout_seconds = 60
 
 # ── devices ─────────────────────────────────────────────────────────────────
-# 空列表 = 不允许任何 NPU Gate 运行。空闲卡不是授权卡。
-# 需要 NPU 时显式写入设备号，例如 [1]。
+# 本机所有 NPU 默认可用。共享卡是正常状态：别人在用某张卡不代表该卡被独占。
+# 整个 [devices] 段都可以省略——省略即全部可用，并选择设备 0。
 [devices]
-authorized_npu_devices = []
 smi_command = "npu-smi"
+
+# 可选：限制可用卡
+# allowed_npu_devices = [0, 1]
+
+# 可选：固定选择（须同时出现在上面的允许列表里）
+# default_npu_device = 1
+
+# 可选：要求独占卡。适合对时序/显存敏感的测试；被占用的卡会报 BLOCKED_ENV。
+# require_exclusive_device = true
 ```

@@ -44,13 +44,13 @@
     {
       "id": "ascendnpu-ir.regression",
       "cwd": "source",
-      "timeout": 5400,
+      "timeout": 1200,
       "argv": [
         "python3",
         "-B",
         "{pack}/scripts/docker_gate.py",
         "--timeout",
-        "5340",
+        "1140",
         "check-bishengir"
       ],
       "configCheck": [

@@ -273,6 +273,60 @@ class RecoveryTests(ExecutionFixture):
             self.manager.status("../../etc/passwd")
 
 
+class DeviceSelectionTests(ExecutionFixture):
+    """The device a request uses, under the default permissive policy."""
+
+    def npu_config(self, **devices):
+        manifest = {
+            "schemaVersion": 1, "id": "test-npu", "version": "1",
+            "files": {},
+            "permissions": {"sourceWrite": False, "hostExecution": True},
+            "recipes": [{"id": "npu.run", "cwd": "source", "timeout": 60,
+                         "argv": [PYTHON, "-I", "-c", "print(1)"]}],
+            "gates": [{"id": "npu", "recipeId": "npu.run",
+                       "gateType": "deterministic-test",
+                       "observationChecks": {"exitCodeZero": True}}],
+        }
+        pack = self.root / "adapters/test-npu"
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / "manifest.json").write_text(json.dumps(manifest))
+        body = {
+            "schema_version": 1,
+            "state_root": str(self.root / "state"),
+            "evidence_root": str(self.root / "evidence"),
+            "adapters": {"test-npu": {}},
+            "workspaces": {"ws": {"source_root": str(self.source),
+                                  "adapters": ["test-npu"]}},
+            "worker": {"backend": "systemd", "max_concurrent": 2, "python": PYTHON},
+        }
+        if devices:
+            body["devices"] = devices
+        return from_mapping(body, path=self.root / "config.toml")
+
+    def test_a_non_npu_adapter_gets_no_device(self):
+        self.assertIsNone(self.manager._device_for("test-pack", None))
+
+    def test_an_npu_adapter_gets_a_device_with_no_configuration(self):
+        """The default policy: a device is available without being named first."""
+        manager = ExecutionManager(self.npu_config(),
+                                   registry=Registry(self.root / "adapters"),
+                                   systemd=self.systemd)
+        self.assertEqual(manager._device_for("test-npu", None), "0")
+
+    def test_a_narrowed_configuration_is_respected(self):
+        manager = ExecutionManager(self.npu_config(allowed_npu_devices=[4]),
+                                   registry=Registry(self.root / "adapters"),
+                                   systemd=self.systemd)
+        self.assertEqual(manager._device_for("test-npu", None), "4")
+
+    def test_an_excluded_device_is_refused(self):
+        manager = ExecutionManager(self.npu_config(allowed_npu_devices=[4]),
+                                   registry=Registry(self.root / "adapters"),
+                                   systemd=self.systemd)
+        with self.assertRaises(api.APIError) as caught:
+            manager._device_for("test-npu", "9")
+        self.assertIs(caught.exception.code, api.ErrorCode.DEVICE_NOT_AUTHORIZED)
+
 class WaitTests(ExecutionFixture):
     def test_wait_is_bounded(self):
         status = self.manager.submit(self.request())

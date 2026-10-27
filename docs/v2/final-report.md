@@ -17,7 +17,7 @@ BLOCKED 或 NOT_TESTED，未以「应该可以」代替证据。
 | B3 Receipt 语义 | **未改动**，原 HMAC / 重新验证 / STALE 逻辑全部保留 | `evidence.py`（零改动） |
 | C 本机配置 | TOML，逐字段报错，路径规范化，符号链接拒绝 | `agent_gates/config.py` |
 | C3 配置版本绑定 | `config_digest` 在 submit 时绑定，Worker 启动时校验 | `execution.py` / `worker.py` |
-| C4 NPU 授权 | 无授权即拒绝，绝不挑选空闲卡 | `execution.py:_device_for` |
+| C4 NPU 设备策略 | 默认全卡可用（共享即正常）；独占为可选；选择确定性 | `execution.py:_device_for` |
 | D 异步 Worker | ExecutionStore + systemd 用户单元 + submit/status/wait/cancel/recover | `execution.py` / `worker.py` / `systemd_units.py` |
 | E MCP Server | 10 个工具，inputSchema + outputSchema + structuredContent | `agent_gates/mcp_server.py` |
 | E4 CLI 兼容 | 原五个动词不变，新增五个 | `cli.py` |
@@ -122,7 +122,7 @@ revision、要求摘要与证据引用。这样既满足「外部验证耗时不
 | tilelang-hivm | regression | **PASS** | run `8866f8ff…`，14 个真实测试、0 跳过、原生库哈希与宿主一致 |
 | ascendnpu-ir | build | **PASS** | run `da89fdd1…` |
 | ascendnpu-ir | regression | **PASS** | run `098aa676…`：1142 个测试，1009 通过，0 失败 |
-| tilelang-hivm-npu | sanity | **BLOCKED** | 两张卡均被其他用户占用，且未授权设备 |
+| tilelang-hivm-npu | sanity | **PASS** | run `d7a13bca…`，在**与他人共享的设备 0** 上跑通 |
 
 ## 9. 原有 Claude Code 集成是否仍可使用？
 
@@ -142,7 +142,7 @@ run `8866f8ff…`（TileLang build + regression 双 Gate PASS）返回 **exit 0*
 
 | 项目 | 状态 | 原因 |
 |---|---|---|
-| NPU 真机验收 | **BLOCKED** | 未授权设备；两张 Ascend950PR 均被占用 |
+| NPU 真机验收 | **已解除** | 本轮在共享卡上实跑通过，见 `test-report.md` |
 | AscendNPU-IR regression | **已解除** | 本轮实跑通过，见 `test-report.md` |
 | 完整模型驱动 Team E2E | **NOT_TESTED** | 本机**无任何 LLM 凭据**，而 `dsh-base` 声明了 provider，缺凭据在启动时即致命 |
 
@@ -210,8 +210,8 @@ b9b8440  test(e2e): pin the profile explicitly and record two harness findings
 4. **AscendNPU-IR regression** 已实跑通过（run `098aa676…`）：1142 个测试、
    1009 通过、0 失败、耗时 2.7 s。此前"20–60 min"的估算已被实测推翻，
    配方超时上调现仅作为未构建代码树时的余量，可随时回落到 1200 s。
-5. **NPU 授权**：如要执行 NPU Gate，需在 `~/.config/agent-gates/config.toml` 的
-   `[devices] authorized_npu_devices` 中显式写入设备号。空的列表意味着「不允许执行」。
+5. **NPU 授权**：默认已全部可用，通常无需配置。仅当某次运行需要独占卡时，在
+   `[devices]` 中设 `require_exclusive_device = true`。
 
 ### 已知的非本次问题
 

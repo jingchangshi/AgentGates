@@ -17,23 +17,39 @@ this machine can build and run a real TileLang Ascend kernel on a real,
 authorized device with a real numerical comparison. It does **not** prove HIVM
 End-to-End CodeGen, and it must never be reported as such.
 
-Device authorization
---------------------
+Device selection
+-----------------
 
-`TILELANG_HIVM_DEVICE_ID` is mandatory and has no default. This Adapter never
-discovers, chooses or substitutes a device. A machine with several cards is
-shared, so silently picking another card would run someone else's work. The
-authorized id is mapped to the physical device id through the driver
+`TILELANG_HIVM_DEVICE_ID` must name the device; this Adapter never discovers,
+chooses or substitutes one. Silently picking a different card would run a test on
+hardware nobody asked for, so the id is explicit here and AgentGates supplies it
+from the local configuration.
+
+Sharing is normal. On this class of machine a card is shared by every user, and a
+process holding a device does not reserve it: refusing to run because someone
+else is on the card would block legitimate work for a reason unrelated to the
+code under test. Occupancy is therefore REPORTED (`occupancy=free` or
+`occupancy=shared(n)`) rather than enforced.
+
+An operator who needs an uncontended card sets
+`TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE=1` (AgentGates forwards
+`devices.require_exclusive_device`). A held card then stops the Gate as
+BLOCKED_ENV, which is honest: the test never ran.
+
+The requested id is mapped to the physical device id through the driver
 (`acl.rt.get_phy_dev_id_by_logic_dev_id`) both before and after the tests; the
-Gate fails when that mapping is not exactly the authorized id. A failure to
+Gate fails when that mapping is not exactly the requested id. A failure to
 synchronize the device is reported with its original message and fails the Gate.
 No device reset, no device substitution and no automatic retry is attempted.
 
 Environment variables (all read at run time):
 
-  TILELANG_HIVM_DEVICE_ID         required, the authorized NPU device id. Not in
-                                  the machine file: it authorizes one run, not a
-                                  machine.
+  TILELANG_HIVM_DEVICE_ID         required, the NPU device id to use. AgentGates
+                                  resolves it from the local configuration, so a
+                                  tool call never names a card.
+  TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE
+                                  optional; when truthy a card held by another
+                                  process is BLOCKED_ENV instead of shared.
   TILELANG_HIVM_CONTAINER_NAME    optional, name of a running build container.
                                   The machine file's TILELANG_HIVM_CONTAINER_NAME
                                   is the only source, exactly as in
@@ -511,21 +527,41 @@ def processes_on(npu_id: str) -> list[tuple[str, str]]:
     return rows
 
 
-def require_device_free(device: str) -> str:
-    """Refuse to dispatch onto a card another process is already using.
+def exclusive_requested() -> bool:
+    """Whether this run demands a card no other process is using."""
+    value = env_value('TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE', default='') or ''
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
 
-    A5 cards are shared by every user of the machine. An idle card is not an
-    assignment either, so this check only removes the case where the device is
-    demonstrably busy; authorization is still the explicit variable. Only the
-    count and the `npu-smi` identity are reported - other users' process ids
-    and command lines are not copied into the receipt.
-    """
+
+def device_occupancy(device: str) -> tuple[str, list]:
+    """The npu-smi id for a physical device, and the processes holding it."""
     npu_id = npu_id_of_physical(device)
-    holders = processes_on(npu_id)
-    if holders:
+    return npu_id, processes_on(npu_id)
+
+
+def require_device_free(device: str) -> str:
+    """Report the card's occupancy; refuse only when a quiet card was demanded.
+
+    Sharing an Ascend NPU is normal operation. Another job running on a device
+    does not make that device unusable for this Gate, and refusing on that
+    basis would block legitimate work for a reason that has nothing to do with
+    the code under test - the card this Gate gets is simply shared, exactly as
+    every other job on the machine treats it.
+
+    So the DEFAULT is to proceed, and the occupancy is reported so a reader can
+    tell a quiet run from a shared one. An operator who needs an uncontended
+    card sets TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE=1 (AgentGates forwards
+    devices.require_exclusive_device), and then a held card is BLOCKED_ENV -
+    the honest verdict, because the test never ran.
+
+    Only the count and the `npu-smi` identity are reported: other users'
+    process ids and command lines are not copied into the receipt.
+    """
+    npu_id, holders = device_occupancy(device)
+    if holders and exclusive_requested():
         raise OccupancyBlocked(f'NPU device {device} (npu-smi NPU ID {npu_id}) is already in use by '
-                               f'{len(holders)} process(es) this Gate did not start; refusing to share a '
-                               f'card that was not explicitly released to this task')
+                               f'{len(holders)} process(es) and this run requires an exclusive card '
+                               f'(TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE is set)')
     return npu_id
 
 
@@ -934,8 +970,13 @@ def check_config() -> int:
     # dispatched at all. The container's own `npu-smi` is not used: inside the
     # image it fails to load its libraries and would report nothing.
     npu_id = require_device_free(device)
+    # Say what the card actually looked like. A shared card is allowed,
+    # so reporting it as "free" would misdescribe the run.
+    _, holders = device_occupancy(device)
+    occupancy = 'free' if not holders else f'shared({len(holders)})'
     print(f'{PROG}: configuration ready: identity file {identity_file} container={container} '
-          f'home={home} device={device} npuId={npu_id} occupancy=free', file=sys.stderr)
+          f'home={home} device={device} npuId={npu_id} occupancy={occupancy} '
+          f'exclusive={exclusive_requested()}', file=sys.stderr)
     return 0
 
 
@@ -952,11 +993,12 @@ def main(argv: list[str]) -> int:
     if conda_env is not None and not SAFE_NAME.fullmatch(conda_env):
         raise BridgeError(f'TILELANG_HIVM_CONDA_ENV is not a plain environment name: {conda_env!r}')
 
-    # Occupancy is decided before anything touches Docker. The configuration
-    # check already probed the card, but that ran earlier and another job may
-    # have taken it since; this second read-only probe is the one that guards
-    # the dispatch. A busy or unreadable card stops the Gate with no `docker
-    # exec` at all, so no test process is ever started next to another user's.
+    # Occupancy is re-read before anything touches Docker: the configuration
+    # check ran earlier and another job may have taken the card since. A held
+    # card only stops the Gate when this run demanded exclusivity; otherwise the
+    # Gate shares the device, which is what every other job on this machine
+    # does. An unreadable card still stops it either way, because "unknown" is
+    # not "shared".
     require_device_free(device)
 
     mapped = map_host_to_container(host_root, container_mounts(container), container)

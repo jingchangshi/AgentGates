@@ -216,35 +216,86 @@ def test_missing_python_rejected(machine):
     assert caught.value.field == "worker.python"
 
 
-# ── NPU authorization (C4, ADR-008) ─────────────────────────────────────────
+# ── NPU device policy (ADR-008) ─────────────────────────────────────────────
 
-def test_no_devices_authorized_by_default(machine):
+def test_every_device_is_available_by_default(machine):
+    """No [devices] section at all means every card may be used.
+
+    Sharing an NPU is normal: a job already on a card does not reserve it. A
+    gate that could not run until an operator named a card would be blocked on
+    a shared machine for no technical reason.
+    """
     config = load_text(machine, minimal(machine))
-    assert config.devices.authorized == frozenset()
-    assert config.devices.authorized_for(0) is False
+    assert config.devices.allowed is None
+    assert config.devices.permits(0) and config.devices.permits(7)
+    assert config.devices.require_exclusive is False
 
 
-def test_explicit_authorization_parsed(machine):
-    text = minimal(machine) + '\n[devices]\nauthorized_npu_devices = [0, 3]\n'
+def test_empty_allowlist_also_means_every_device(machine):
+    """An existing file with an empty list keeps loading and stays permissive."""
+    text = minimal(machine) + "\n[devices]\nauthorized_npu_devices = []\n"
     config = load_text(machine, text)
-    assert config.devices.authorized == {"0", "3"}
-    assert config.devices.authorized_for(3) is True
-    assert config.devices.authorized_for(1) is False
+    assert config.devices.allowed is None
+    assert config.devices.permits(3)
+
+
+def test_allowlist_narrows_the_set(machine):
+    text = minimal(machine) + "\n[devices]\nallowed_npu_devices = [0, 3]\n"
+    config = load_text(machine, text)
+    assert config.devices.allowed == {"0", "3"}
+    assert config.devices.permits(3) is True
+    assert config.devices.permits(1) is False
+
+
+def test_selection_is_deterministic(machine):
+    """Two identical requests must not land on different hardware."""
+    default = load_text(machine, minimal(machine))
+    assert default.devices.select() == "0"
+    narrowed = load_text(machine, minimal(machine) + "\n[devices]\nallowed_npu_devices = [5, 2]\n")
+    assert narrowed.devices.select() == "2"
+    pinned = load_text(machine, minimal(machine) + "\n[devices]\ndefault_npu_device = 5\n")
+    assert pinned.devices.select() == "5"
+
+
+def test_default_device_must_be_allowed(machine):
+    text = (minimal(machine) + "\n[devices]\nallowed_npu_devices = [1]\n"
+            "default_npu_device = 2\n")
+    with pytest.raises(cfg.ConfigError) as caught:
+        load_text(machine, text)
+    assert caught.value.field == "devices.default_npu_device"
 
 
 def test_string_device_id_rejected(machine):
-    """A quoted id would compare unequal to the engine's normalised id."""
-    text = minimal(machine) + '\n[devices]\nauthorized_npu_devices = ["0"]\n'
+    """A quoted id would compare unequal to the engine normalised id."""
+    text = minimal(machine) + "\n[devices]\nallowed_npu_devices = ['0']\n"
     with pytest.raises(cfg.ConfigError) as caught:
         load_text(machine, text)
-    assert caught.value.field == "devices.authorized_npu_devices[0]"
+    assert caught.value.field == "devices.allowed_npu_devices[0]"
 
 
-def test_device_digest_changes_authorization(machine):
-    with_zero = load_text(machine, minimal(machine) + '\n[devices]\nauthorized_npu_devices = [0]\n')
-    without = load_text(machine, minimal(machine))
-    assert with_zero.config_digest != without.config_digest
+def test_exclusive_device_is_opt_in(machine):
+    default = load_text(machine, minimal(machine))
+    assert default.devices.require_exclusive is False
+    exclusive = load_text(machine, minimal(machine)
+                          + "\n[devices]\nrequire_exclusive_device = true\n")
+    assert exclusive.devices.require_exclusive is True
 
+
+def test_exclusive_flag_must_be_a_boolean(machine):
+    text = minimal(machine) + "\n[devices]\nrequire_exclusive_device = 'yes'\n"
+    with pytest.raises(cfg.ConfigError) as caught:
+        load_text(machine, text)
+    assert caught.value.field == "devices.require_exclusive_device"
+
+
+def test_device_policy_changes_the_digest(machine):
+    base = load_text(machine, minimal(machine))
+    narrowed = load_text(machine, minimal(machine)
+                         + "\n[devices]\nallowed_npu_devices = [0]\n")
+    exclusive = load_text(machine, minimal(machine)
+                          + "\n[devices]\nrequire_exclusive_device = true\n")
+    assert base.config_digest != narrowed.config_digest
+    assert base.config_digest != exclusive.config_digest
 
 # ── file loading ─────────────────────────────────────────────────────────────
 

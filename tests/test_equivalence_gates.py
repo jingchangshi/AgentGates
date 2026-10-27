@@ -95,6 +95,42 @@ def test_five_gate_equivalence(tmp_path, adapter, gate, scenario):
     assert (new == 'PASS') == (old == 'PASS')
 
 
+@pytest.mark.parametrize('adapter,gate', CONTRACTS, ids=[gate['id'] for _, gate in CONTRACTS])
+@pytest.mark.parametrize('scenario', ['pass', 'nonzero', 'timeout', 'interrupted', 'missing', 'false', 'malformed', 'nonobject', 'too-large'])
+def test_five_gate_equivalence(tmp_path, adapter, gate, scenario):
+    checks = gate['observationChecks']
+    observations = valid_observations(gate)
+    process = dict(exitCode=0, timedOut=False, interrupted=False)
+    stdout = json.dumps(observations)
+    if scenario == 'nonzero':
+        process['exitCode'] = 9
+    elif scenario == 'timeout':
+        process['timedOut'] = True
+    elif scenario == 'interrupted':
+        process['interrupted'] = True
+    elif scenario in {'missing', 'false'}:
+        if checks == {'exitCodeZero': True}:
+            # Exit-code gates deliberately ignore any stdout claims.
+            observations = {'exitCodeZero': False}
+        elif scenario == 'missing':
+            observations.pop(next(iter(checks)))
+        else:
+            observations[next(iter(checks))] = False
+        stdout = json.dumps(observations)
+    elif scenario == 'malformed':
+        stdout = '{invalid'
+    elif scenario == 'nonobject':
+        stdout = '[]'
+    elif scenario == 'too-large':
+        stdout = ' ' * 65537 + stdout
+    path = tmp_path / 'stdout.log'
+    path.write_text(stdout)
+    process['stdout'] = {'path': str(path)}
+    old = _oracle.legacy_decision(process, checks, stdout)
+    new = evaluate(process, checks)['status']
+    assert (new == 'PASS') == (old == 'PASS')
+
+
 # Migrated gates must keep their original rules, with one narrow exception: a
 # recipe whose timeout was measurably too short to ever finish. The suite records
 # each such deviation here by name instead of loosening the comparison, so a
@@ -145,12 +181,9 @@ def test_migrated_gate_retains_original_rules(adapter, gate):
     old_manifest = json.loads((FIXTURES / 'legacy' / (adapter + '.json')).read_text())
     old_recipe = next(item for item in old_manifest['recipes'] if item['id'] == gate['recipeId'])
     recipe = manifest.recipes[gate['recipeId']]
-    argv, timeout = _accounted_deviation(adapter, gate['recipeId'],
-                                         recipe['argv'], old_recipe['argv'],
-                                         recipe.get('timeout', 60), old_recipe.get('timeout', 60))
-    assert argv == old_recipe['argv']
+    assert recipe['argv'] == old_recipe['argv']
     assert recipe.get('cwd', 'pack') == old_recipe.get('cwd', 'pack')
-    assert timeout == old_recipe.get('timeout', 60)
+    assert recipe.get('timeout', 60) == old_recipe.get('timeout', 60)
     # Additive preflight on Ascend is allowed, but an existing check cannot disappear.
     if old_recipe.get('configCheck'):
         assert recipe['configCheck'] == old_recipe['configCheck']

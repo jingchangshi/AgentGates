@@ -102,7 +102,8 @@ def run_execution(execution_id: str, *, store: ExecutionStore, config, engine=No
     try:
         receipt = engine.run(adapter, source, gates,
                              env_file=adapter_entry.env_file,
-                             device_id=device_id)
+                             device_id=device_id,
+                             require_exclusive_device=config.devices.require_exclusive)
     except LockBusy as exc:
         # A competing AgentGates run holds the source or build lease. This is
         # a resource refusal, not an environment fault, and no gate ran.

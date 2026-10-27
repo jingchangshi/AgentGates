@@ -153,8 +153,8 @@ class NegativeTests(RequirementFixture):
         # Force the gate's observation to fail by patching the adapter script's
         # environment for this one run.
         original = engine_module.environment
-        engine_module.environment = lambda manifest, env_file=None, device_id=None: {
-            **original(manifest, env_file, device_id), "GATE_OK": "0"}
+        engine_module.environment = lambda manifest, env_file=None, device_id=None,             require_exclusive_device=False: {
+            **original(manifest, env_file, device_id, require_exclusive_device), "GATE_OK": "0"}
         try:
             receipt = self.engine.run("test-pack", self.source, ["test"])
         finally:

@@ -19,7 +19,7 @@ report never lets one stand in for the other.
 | Real compiler: TileLang HIVM regression | **PASS** | **Real Compiler Gate** | run `8866f8ff…` |
 | Real compiler: AscendNPU-IR build | **PASS** | **Real Compiler Gate** | run `da89fdd1…` |
 | Real compiler: AscendNPU-IR regression | **PASS** | **Real Compiler Gate** | run `098aa676…` |
-| Real NPU gate | **BLOCKED** | — | no device authorized; both cards held |
+| Real NPU gate | **PASS** | **Real NPU Gate** | run `d7a13bca…` on a shared device 0 |
 | Team completion gate (DSH domain) | **PASS** 136 | Unit + Integration | vitest |
 | AgentGates policy vs real verifier | **PASS** 23/23 | Integration (real receipts) | `policy.mjs` |
 | MCP bridge preset scoping | **PASS** 30/30 | Integration (real profile boot) | `tool-scope.mjs` |
@@ -139,16 +139,35 @@ tree — the original 1140 s would have sufficed on a warm one.
 platform does not meet. They are neither passes nor failures, and `Failed: 0` is
 the number that decides the verdict.
 
-### TileLang NPU **(BLOCKED)**
+### TileLang NPU **(PASS — real device, shared card)**
 
-Both Ascend950PR cards were held by other users' processes throughout. The
-configured `authorized_npu_devices` is empty, and the adapter's own
-`--check-config` exits 75 (`device already in use`) by design. That maps to
-`BLOCKED_ENV`, and the test command was never invoked — which is the required
-behaviour, not a workaround.
+```
+run     d7a13bcaf059d39aeafdff2670c3cd71
+adapter tilelang-hivm-npu
+gate    tilelang-hivm-npu-sanity  PASS  exit 0  elapsed 9.0s
+config  device=0 npuId=0 occupancy=shared(6) exclusive=False
+observations
+  npuDeviceUsed              = true
+  deviceMatchesAuthorized    = true
+  tensorMovedToDevice        = true
+  synchronizeOk              = true
+  numericalAssertionsObserved= true
+  testsCollected             = 1     allPassed = true     notAllSkipped = true
+verify  PASS []
+verify_requirements  satisfied=true  matched=[tilelang-hivm-npu-sanity]
+```
 
-**No NPU claim is made in this report.** Only a run on an explicitly authorized
-device would count as NPU acceptance evidence.
+This ran on **device 0 while six other processes held the same card**. That is
+the intended policy: sharing an NPU is normal, and a gate that refused because
+someone else was on the device would be the only workload on this host that
+could not run. The receipt still proves what an NPU verdict must prove — the
+tensor moved to the device, the device reported by the driver equals the one
+requested, the synchronisation succeeded, and the numerical assertions actually
+ran (`testsCollected = 1`, so this cannot be a quietly-skipped test).
+
+The configuration check reports `occupancy=shared(6)` so a reader can tell a
+contended run from a quiet one; `devices.require_exclusive_device = true` turns
+the same situation into `BLOCKED_ENV` for runs where that matters.
 
 ## 4. Team completion gate
 

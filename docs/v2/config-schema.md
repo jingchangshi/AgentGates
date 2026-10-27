@@ -46,7 +46,9 @@ python = "/home/agent/work/AgentGates/.venv/bin/python"
 start_timeout_seconds = 60
 
 [devices]
-authorized_npu_devices = [1]   # empty means: no NPU gate may run
+# every device is usable by default; this section only narrows it
+# allowed_npu_devices = [0, 1]
+# require_exclusive_device = false
 smi_command = "npu-smi"
 ```
 
@@ -67,7 +69,7 @@ smi_command = "npu-smi"
 | `worker.max_concurrent` | no | Integer 1–64, default 2. A boolean is refused. |
 | `worker.python` | no | Absolute, existing file. Defaults to the installing interpreter. |
 | `worker.start_timeout_seconds` | no | Integer 1–3600, default 60. |
-| `devices.authorized_npu_devices` | no | Integers only. A quoted `"0"` is refused, because it would compare unequal to the engine's normalised id. |
+| `devices.allowed_npu_devices` | no | Integers 0-63 only. Absent or empty means every device. A quoted `"0"` is refused, because it would compare unequal to the engine's id. |
 | `devices.smi_command` | no | Defaults to `npu-smi`. |
 
 ## Validation behaviour
@@ -78,7 +80,7 @@ file is the only one who can fix it:
 ```
 ConfigError: workspaces.tilelang.source_root: parent component is a symlink: /home/agent/links
 ConfigError: worker.max_concurrent: must be >= 1
-ConfigError: devices.authorized_npu_devices[0]: must be a nonnegative integer device id
+ConfigError: devices.allowed_npu_devices[0]: must be an integer device id between 0 and 63
 ```
 
 Paths are resolved to canonical absolute paths. Symlinked *components* are
@@ -98,15 +100,54 @@ An execution binds the digest at submit time. If the file changes before the
 worker starts, the worker refuses with `CONFIG_IDENTITY_CHANGED` rather than
 silently adopting a different machine contract (objective C3).
 
-## Device authorization (C4)
+## Device policy (ADR-008)
 
-An idle NPU is **not** an authorized NPU.
+**Every NPU on the machine is available by default.** Sharing a card is normal:
+a job already running on a device does not reserve it, and a gate that could not
+start until an operator named a card would be blocked on a shared machine for no
+technical reason.
 
-- `authorized_npu_devices = []` → any `-npu` adapter is refused with
-  `DEVICE_NOT_AUTHORIZED`, and the test command is never invoked.
-- Exactly one authorized id → that id is bound to the request.
-- More than one authorized id → refused, because the manager will not choose a
-  card on the operator's behalf.
+```toml
+# Optional. Omit the whole section and every device is usable, selecting 0.
+[devices]
+smi_command = "npu-smi"
 
-Granting a device is an explicit, recorded operator decision. `npu-smi` is used
-to *check* a device, never to *discover* a free one.
+# Optional restriction. Present and non-empty: only these may be used.
+# allowed_npu_devices = [0, 1]
+
+# Optional pin. Must appear in the allowlist when one is given.
+# default_npu_device = 1
+
+# Optional. true = refuse a card another process holds (BLOCKED_ENV).
+# Use it for timing-sensitive or memory-heavy runs, not as a default.
+# require_exclusive_device = false
+```
+
+| Field | Required | Rule |
+|---|---|---|
+| `allowed_npu_devices` | no | Integers 0–63. Absent or empty = every device. `authorized_npu_devices` is accepted as a legacy spelling. |
+| `default_npu_device` | no | Integer 0–63; must also be allowed when an allowlist is present. |
+| `require_exclusive_device` | no | Boolean, default false. |
+| `smi_command` | no | Defaults to `npu-smi`. |
+
+Selection is deterministic so two identical requests describe the same machine
+state: `default_npu_device` if set, else the lowest allowed id, else `0`.
+
+### Occupancy is reported, not enforced
+
+The adapter still probes `npu-smi`, but to *describe* the card:
+
+```
+configuration ready: ... device=0 npuId=0 occupancy=shared(6) exclusive=False
+```
+
+A shared card runs. With `require_exclusive_device = true` the same situation
+becomes `BLOCKED_ENV` (exit 75) instead. An unreadable driver answer is a refusal
+in both cases, because "unknown" is not "shared".
+
+**The tradeoff, stated plainly:** a shared card can make a timing-sensitive test
+flaky, and that flakiness arrives as a verdict about the code. Read
+`occupancy=shared(n)` before treating a failure as a regression, or opt into
+exclusivity for those runs.
+
+---

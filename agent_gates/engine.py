@@ -43,7 +43,8 @@ def config_reason(check):
     return lines[-1][:REASON_LIMIT]
 
 
-def environment(manifest: Manifest, env_file: Path | None = None, device_id: str | None = None):
+def environment(manifest: Manifest, env_file: Path | None = None, device_id: str | None = None,
+                require_exclusive_device: bool = False):
     env = dict(os.environ)
     # An adapter reads only its own prefix. Inheriting the other adapter's
     # prefix would let a stray export (a build subdirectory, a Ninja job count)
@@ -66,6 +67,13 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
         if not re.fullmatch(r"[0-9]+", device_id):
             raise ValueError("--device-id must be a nonnegative decimal ID")
         env["TILELANG_HIVM_DEVICE_ID"] = str(int(device_id))
+    # Exclusivity is a policy the operator chose in the local configuration, not
+    # a precondition for running. Forwarding it lets the Adapter decide whether a
+    # shared card is acceptable, which is the only layer that can see occupancy.
+    if require_exclusive_device:
+        env["TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE"] = "1"
+    else:
+        env.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
     return env
 
 
@@ -148,12 +156,13 @@ class Engine:
         self.store = store or EvidenceStore()
         self.lock_root = lock_root
 
-    def doctor(self, adapter, source, *, env_file=None, device_id=None):
+    def doctor(self, adapter, source, *, env_file=None, device_id=None,
+               require_exclusive_device=False):
         manifest = self.registry.get(adapter)
         source = source_root(Path(source))
         if self.store.root.resolve().is_relative_to(source):
             raise ValueError("evidence directory must be outside the source root")
-        env = environment(manifest, env_file, device_id)
+        env = environment(manifest, env_file, device_id, require_exclusive_device)
         run_id, directory = self.store.create_run()
         checks, failures = [], []
         for recipe_id in manifest.recipes:
@@ -174,12 +183,13 @@ class Engine:
         return {"runId": run_id, "adapter": adapter, "source": str(source), "status": "BLOCKED_ENV" if failures else "PASS",
                 "checks": checks, "failures": failures, "logDirectory": str(directory)}
 
-    def run(self, adapter, source, selected, *, env_file=None, device_id=None):
+    def run(self, adapter, source, selected, *, env_file=None, device_id=None,
+            require_exclusive_device=False):
         manifest = self.registry.get(adapter)
         source = source_root(Path(source))
         if self.store.root.resolve().is_relative_to(source):
             raise ValueError("evidence directory must be outside the source root")
-        env = environment(manifest, env_file, device_id)
+        env = environment(manifest, env_file, device_id, require_exclusive_device)
         order = manifest.order(selected)
         run_id, directory = self.store.create_run()
         receipt = {"schemaVersion": 1, "runId": run_id, "startedAt": now(), "finishedAt": None,
