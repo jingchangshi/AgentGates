@@ -1,0 +1,49 @@
+# AgentGates V2 — 本机配置示例
+
+复制到 `~/.config/agent-gates/config.toml` 并修改路径。
+完整字段说明见 `config-schema.md`。
+
+```toml
+schema_version = 1
+
+state_root    = "/home/CHANGEME/.local/state/agent-gates/v2"
+evidence_root = "/home/CHANGEME/.local/state/agent-gates/v2/evidence"
+# lock_root 可省略，默认 <state_root>/locks
+
+# ── adapters ────────────────────────────────────────────────────────────────
+# Adapter 读取的 env 文件是机器事实，不是请求参数。
+# ascendnpu-ir 从启动环境读取容器身份，因此没有 env_file。
+[adapters.ascendnpu-ir]
+
+[adapters.tilelang-hivm]
+env_file = "/path/to/AgentGates/agent_gates/adapters/tilelang-hivm/env.sh"
+
+[adapters.tilelang-hivm-npu]
+env_file = "/path/to/AgentGates/agent_gates/adapters/tilelang-hivm/env.sh"
+
+# ── workspaces ──────────────────────────────────────────────────────────────
+# 只有登记过的源码树才能被 Gate 使用。
+[workspaces.ascendnpu-ir]
+source_root = "/home/CHANGEME/work/AscendNPU-IR"
+adapters = ["ascendnpu-ir"]
+
+[workspaces.tilelang]
+source_root = "/home/CHANGEME/work/tilelang"
+adapters = ["tilelang-hivm", "tilelang-hivm-npu"]
+# 可选：限制该 workspace 可运行的 Gate
+# allowed_gates = ["tilelang-hivm-build", "tilelang-hivm-regression"]
+
+# ── worker ──────────────────────────────────────────────────────────────────
+[worker]
+backend = "systemd"          # 唯一后端；不提供 in-process 退化
+max_concurrent = 2
+python = "/path/to/AgentGates/.venv/bin/python"
+start_timeout_seconds = 60
+
+# ── devices ─────────────────────────────────────────────────────────────────
+# 空列表 = 不允许任何 NPU Gate 运行。空闲卡不是授权卡。
+# 需要 NPU 时显式写入设备号，例如 [1]。
+[devices]
+authorized_npu_devices = []
+smi_command = "npu-smi"
+```
