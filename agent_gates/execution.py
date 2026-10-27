@@ -118,6 +118,19 @@ class ExecutionManager:
                 details={"authorized": authorized})
         return authorized[0]
 
+    @staticmethod
+    def _valid_id(execution_id) -> str:
+        """Reject a malformed execution id as a REQUEST error.
+
+        The id reaches a file path and a systemd unit name, so a value that is
+        not 32 hex characters must fail before either is built. Reporting it as
+        an APIError keeps the refusal in the documented error taxonomy.
+        """
+        if not isinstance(execution_id, str) or not EXECUTION_ID.fullmatch(execution_id):
+            raise api.APIError(api.ErrorCode.INVALID_REQUEST,
+                               "invalid execution id; expected 32 hexadecimal characters")
+        return execution_id
+
     # ── submit (D1) ─────────────────────────────────────────────────────────
 
     def submit(self, request: api.ExecutionRequest) -> api.ExecutionStatus:
@@ -240,6 +253,7 @@ class ExecutionManager:
 
     def status(self, execution_id: str) -> api.ExecutionStatus:
         """Read the current state, reconciling it with the machine first."""
+        execution_id = self._valid_id(execution_id)
         status = self._reconcile(execution_id)
         if status is None:
             raise api.APIError(api.ErrorCode.EXECUTION_NOT_FOUND,
@@ -269,6 +283,7 @@ class ExecutionManager:
 
     def wait(self, execution_id: str, timeout=None) -> api.WaitResult:
         """Block for at most the given timeout, then return whatever is known."""
+        execution_id = self._valid_id(execution_id)
         limit = DEFAULT_WAIT_SECONDS if timeout is None else float(timeout)
         # A caller cannot ask for an unbounded wait; the ceiling is enforced here
         # so neither a model nor a script can hold a tool call open indefinitely.
@@ -295,6 +310,7 @@ class ExecutionManager:
         The resource leases are flock descriptors held by those processes, so
         they are released exactly when the tree is gone - not before.
         """
+        execution_id = self._valid_id(execution_id)
         status = self._reconcile(execution_id)
         if status is None:
             raise api.APIError(api.ErrorCode.EXECUTION_NOT_FOUND,
