@@ -1,0 +1,18 @@
+{
+  "kind": "frozen contract; synthetic observations, not hardware evidence",
+  "head": "9ca04ba6814154a778ecf30168c793d73352e643",
+  "manifests": [
+    {
+      "adapter": "ascendnpu-ir",
+      "manifestSha256": "bce77dee668e7994bd49c11173a6baaa975b7082c1253a8799590539cd75366a"
+    },
+    {
+      "adapter": "tilelang-hivm",
+      "manifestSha256": "38ecce402506f1ba5a128d78cde778bb5543eb16d5439147034c01d424881bab"
+    },
+    {
+      "adapter": "tilelang-hivm-npu",
+      "manifestSha256": "6e65d6c29f3c546ba6af737b4cf2d869b0dae5b1d90af23d1578b901a06a3222"
+    }
+  ]
+}

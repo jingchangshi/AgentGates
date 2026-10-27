@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "ascendnpu-ir",
+  "version": "1.0.0",
+  "capabilities": [
+    "build",
+    "regression"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/docker_gate.py": "a25660e36e972f3a0f1afab1f2b068fe41a261f207e2b4d75275619959764b24",
+    "scripts/full-build.sh": "71fb3cf54603d099c0bc6d750b8ce7aa05facbc865f635e090f812b0d6453057",
+    "scripts/init-toolchain.sh": "f06fb762a0b216500e100b6666006e5b97b31731ef06cf1931b2d7f08ab307fc"
+  },
+  "recipes": [
+    {
+      "id": "ascendnpu-ir.incremental-build",
+      "cwd": "source",
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/docker_gate.py",
+        "--timeout",
+        "840",
+        "bishengir-opt",
+        "bishengir-compile",
+        "install-bishengir-publish-products"
+      ]
+    },
+    {
+      "id": "ascendnpu-ir.regression",
+      "cwd": "source",
+      "timeout": 1200,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/docker_gate.py",
+        "--timeout",
+        "1140",
+        "check-bishengir"
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "ascend-build",
+      "recipeId": "ascendnpu-ir.incremental-build",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true
+      }
+    },
+    {
+      "id": "ascend-regression",
+      "recipeId": "ascendnpu-ir.regression",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true
+      },
+      "dependsOn": [
+        "ascend-build"
+      ]
+    }
+  ]
+}
