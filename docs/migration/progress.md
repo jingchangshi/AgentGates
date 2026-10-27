@@ -39,7 +39,7 @@ The user identified the configured `ANTHROPIC_DEFAULT_OPUS_MODEL=claude/claude-o
 
 Local sensitive logs/configuration are stored only under ignored `.evidence/`. No machine env.sh, credentials, full source trees or binary artifacts enter Git.
 
-## Resume: defect found and fixed
+## Resume: defects found and fixed
 
 The resume found one behavioural defect that the paused state did not record: **the NPU adapter had no device occupancy check at all.** It required an explicit `TILELANG_HIVM_DEVICE_ID` and mapped the logical to the physical device, but never asked whether that card was already in use. On this machine both cards are held by other users' jobs, so an operator who guessed a device id would have shared a card with a running job.
 
@@ -55,19 +55,31 @@ The container's own `npu-smi` is unusable in the current image (`libc_sec.so` fa
 
 `engine.py` also gained `config_reason()`, which puts one bounded line of the Adapter's own stderr on the blocked gate. The machine-readable failure marker `CONFIG_CHECK_FAILED` is unchanged, so existing tests and consumers are unaffected.
 
+### Second defect, found by round 3: a busy card recorded as FAIL
+
+Round 3 of the real-machine acceptance produced `1ca6496956d2a1aaf67195324adca4b2` with `--device-id 0`: the card was free during `--check-config` and held by another job by the time the pre-dispatch probe ran. The adapter refused dispatch — correctly — but exited with its generic error code, so the gate was published as `FAIL` with `NONZERO_EXIT` and ten `MISSING_OBSERVATION`s. That was wrong on two counts: no test was dispatched, so no test failed; and the same condition caught seconds earlier is already `BLOCKED_ENV`, which `docs/cli.md` already promised for both probes.
+
+Fix, in three places:
+
+- `npu_gate.py` raises `OccupancyBlocked(BridgeError)` for all eleven occupancy refusals, with `EXIT = 75` (sysexits `EX_TEMPFAIL`; outside pytest's 0–5 and the container script's 3, so no test run can produce it). The `__main__` guard reads `error.EXIT` from the *instance* — reading `BridgeError.EXIT` would flatten every subclass back to 2 and silently undo the fix.
+- `manifest.py` validates an optional per-recipe `blockedExitCodes` list: distinct integers 1–255.
+- `engine.py` maps a recipe exit in that list to `BLOCKED_ENV` with `BLOCKED_EXIT_CODE: <code>`, dropping the observation failures because they only report an empty report. An undeclared code stays an ordinary failure, and `aggregate` still refuses a passing run containing `BLOCKED_ENV`, so the classification cannot absorb a real test failure.
+
+Round 4 confirms both paths on the real machine: device 0 (busy at dispatch) is `BLOCKED_ENV` / `BLOCKED_EXIT_CODE: 75`, device 1 (busy at the check) is `BLOCKED_ENV` / `CONFIG_CHECK_FAILED`. Three engine tests and one adapter test cover the mapping, the undeclared-code case, the "still cannot pass" case and the exit-code choice.
+
 ## Final validation
 
 | Item | Result |
 | --- | --- |
-| Offline suite | 452 passed, 88 subtests passed, exit 0 (`.evidence/final-pytest.log`; 441 before the eleven review-fix tests were added) |
+| Offline suite | 462 passed, 88 subtests passed, exit 0 (`.evidence/final-pytest.log`; 441 before the review-fix tests, 452 after them, 462 after the follow-up fixes) |
 | Isolated wheel install | PASS (pinned files present, no machine config, no Harness/Claude/Anthropic import) |
-| P1 `ascendnpu-ir` | doctor + run PASS, `52ea3b30495dba9d086cabe0dc9c38bb`, verify `valid: true` |
-| P1 `tilelang-hivm` | doctor + run PASS, `61ed95d533a314da934e4e8e6cd6eca7`, verify `valid: true` |
-| P1 `tilelang-hivm-npu` | BLOCKED_ENV, no assignment, `e6d1680cd9b2972d645729089cc5a1ae`; verify `valid: false` |
-| Occupancy probe, device 0 / 1 | BLOCKED_ENV `57063f7d46de74f1cee9b8ac87c761ff` / `b767bf002a52e80b721ab1180f927e72` |
+| P1 `ascendnpu-ir` | doctor + run PASS, round 4 `50fd4866c1ebe7a77256b84a04b81d1b`, verify `valid: true` |
+| P1 `tilelang-hivm` | doctor + run PASS, round 4 `5c156a74910d2dee7be4159585d8826c`, verify `valid: true` |
+| P1 `tilelang-hivm-npu` | BLOCKED_ENV, no assignment, round 4 `4c459676b57eab7f57d4c80c6a3bfd0f`; verify `valid: false` |
+| Occupancy probe, device 0 / 1 | round 4: `BLOCKED_EXIT_CODE: 75` `7dbe75b1e9fd159d394a1b674cd8a69e` / `CONFIG_CHECK_FAILED` `5f01a23a98547ed0c6f19502361374af` |
 | `claude plugin validate` | passes, no warnings |
-| P2 fresh plugin session | round 2: exit 0, 201.6 s, three skills discovered, plugin-initiated TileLang PASS `a62906a815e77f9001c706c0c932b7dc` (round 1 `74e428e9…` now STALE) |
-| P2 worktree exercises | round 2 `b2ef7ee4…` / `62eec625…`: both FAIL honestly on missing worktree builds; not redirected to the original checkouts (round 1 IDs now STALE) |
+| P2 fresh plugin session | see [P2 validation](p2-validation.md) for the current round |
+| P2 worktree exercises | both FAIL honestly on missing worktree builds; not redirected to the original checkouts |
 | GitHub visibility | PRIVATE, proven on four independent facts |
 
 ## GitHub visibility
@@ -98,6 +110,8 @@ After the first push a read-only review was delegated to a separate reviewer age
 | 7 | LOW | The plugin hook's 30 s CLI timeout could expire during a cold-cache `verify` (measured 23 s on this checkout) and read as "receipt invalid" | Fixed: 60 s inside the hook's 75 s bound, with a distinct timeout message. |
 
 The fixes changed the adapter scripts, which correctly turned every round-1 receipt `STALE`; the real-machine acceptance was re-run as round 2 (see [P1 equivalence](p1-equivalence.md)) and reproduced every verdict. The review also found no issue in: `shell=True`/`os.system`/`eval` (none present), orphaned children or foreign kills, manifest pin escape, NPU device selection or reset, and receipt replay. Its verdict — "not yet safe to publish" — was answered by fixing items 1–7 before the second push.
+
+Round 3 then found a further defect of a different kind — the busy-card mis-classification described above — and round 4 reproduced every verdict against the fixed adapter. Two later findings came from the lead's own audit rather than the delegated review: the manifest accepted a truthy non-boolean `hostExecution` (fixed, with two tests), and `report` could print a gate as `PASS` while the receipt as a whole no longer verified (fixed, with one test).
 
 ## Delivery
 

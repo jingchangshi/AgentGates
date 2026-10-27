@@ -8,17 +8,17 @@ Two layers are tested separately: the offline suite (no Docker, compiler or devi
 python3 -m pytest -q tests/
 ```
 
-Current result: **452 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
+Current result: **462 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
 
 | File | Tests | Subtests | Covers |
 | --- | ---: | ---: | --- |
-| `test_core.py` | 33 | — | Manifest schema and digest pinning, `{pack}` expansion, registry, evaluator types, engine ordering, locks, evidence store, CLI |
+| `test_core.py` | 39 | — | Manifest schema and digest pinning, `{pack}` expansion, registry, evaluator types, engine ordering, locks, evidence store, CLI, host-execution consent, `blockedExitCodes` classification, `report` on a non-PASS receipt |
 | `test_core_audit.py` | 1 | — | Persisted audit references and the deliberate corrections list |
-| `test_negative_correctness.py` | 71 | — | Type-strict observations, zero/all-skipped runs, config preflight, source mutation, receipt corruption and staleness, artifact identity, unknown aggregate statuses, supervisor deadline, lock-key normalisation, inherited-environment binding |
+| `test_negative_correctness.py` | 72 | — | Type-strict observations, zero/all-skipped runs, config preflight, source mutation, receipt corruption and staleness, artifact identity, unknown aggregate statuses, supervisor deadline, lock-key normalisation, inherited-environment binding, ignore-rule binding |
 | `test_adapters_ascend.py` | 90 | 3 | Ascend bridge: argv, timeouts, bind-mount mapping, host/container identity, preflight |
-| `test_adapters_tilelang.py` | 181 | 4 | TileLang and NPU bridges, statistics contract, JUnit handling, device authorization, occupancy probe (including unreadable driver layouts), container-script quoting |
+| `test_adapters_tilelang.py` | 182 | 4 | TileLang and NPU bridges, statistics contract, JUnit handling, device authorization, occupancy probe (including unreadable driver layouts), blocked-exit-code declaration, container-script quoting |
 | `test_adapters_raw_reports.py` | 7 | 70 | Malformed container facts cannot become a PASS |
-| `test_adapters_packaging.py` | 5 | — | Adapter data layout, `--check-config` presence, shipped deployment files, template neutrality |
+| `test_adapters_packaging.py` | 7 | — | Adapter data layout, `--check-config` presence, shipped deployment files, template neutrality, no literal device default |
 | `test_equivalence_gates.py` | 54 | — | Frozen original contracts for all five gates versus the migrated evaluator |
 | `test_plugin_receipts.py` | 10 | 11 | Claude Code skills and the opt-in `TaskCompleted` receipt hook |
 
@@ -27,11 +27,14 @@ Current result: **452 passed, 88 subtests passed**, exit 0. No network, Docker, 
 - **Nothing is accepted by coercion.** `True` and `1` are different; duplicate JSON keys and `NaN`/`Infinity` are rejected; a missing observation fails.
 - **Zero tests, all-skipped runs and CPU fallbacks fail.** Boolean claims cannot hide bad counts, and the NPU gate requires measured tensor movement, numerical assertions, device memory and synchronization.
 - **Configuration is checked before dispatch.** A failing or missing `configCheck` yields `BLOCKED_ENV` with no recipe process; a config check that mutates source yields `STALE`.
-- **The NPU card is probed, not assumed.** A busy card, an unreadable driver, a missing `npu-smi`, a timeout, a device absent from the mapping table and a card that becomes busy between the two probes all refuse dispatch. So does an answer the parser cannot read in full: a process row whose layout drifted, a table with neither a row nor the driver's `No process in device.` marker, and a table claiming both processes and an idle card. The probe never selects, resets or substitutes a device.
+- **The NPU card is probed, not assumed.** A busy card, an unreadable driver, a missing `npu-smi`, a timeout, a device absent from the mapping table and a card that becomes busy between the two probes all refuse dispatch. So does an answer the parser cannot read in full: a process row whose layout drifted, a table with neither a row nor the driver's `No process in device.` marker, and a table claiming both processes and an idle card. The probe never selects, resets or substitutes a device. A card that becomes busy after the configuration check is recorded as `BLOCKED_ENV` via the recipe's declared `blockedExitCodes`, not as `FAIL`: no test started, and the same condition caught earlier is already `BLOCKED_ENV`. An undeclared code stays an ordinary failure, so the classification cannot absorb a real test failure.
 - **Unknown states cannot aggregate to PASS.** `aggregate()` returns PASS only when every gate is literally `PASS`; an empty run is `NOT_RUN` and an unrecognised status is `INVALID_EVIDENCE`, so a receipt written by a bug cannot verify as valid.
 - **Machine-file values are data inside the container script.** Values that reach `bash -c` are emitted as single-quoted literals, because inside double quotes a `$(...)` would execute in the container.
 - **Leases are per resource, not per spelling.** Lock keys resolve their path component, so two spellings of one build directory cannot take two leases.
-- **Receipts are revalidated.** Mutating the receipt, logs, source, manifest, script or a product downgrades a recorded PASS to `INVALID_EVIDENCE` or `STALE`.
+- **Receipts are revalidated.** Mutating the receipt, logs, source, manifest, script or a product downgrades a recorded PASS to `INVALID_EVIDENCE` or `STALE`. A receipt that no longer verifies never reports an individual gate as `PASS` either, so a reader iterating `gates` cannot see a passing claim the top-level status denies.
+- **Host execution needs explicit consent.** A manifest without `"permissions": {"hostExecution": true}` never runs a command; a missing block is not read as permission.
+- **Ignore rules are part of the source identity.** Editing `.git/info/exclude` or `core.excludesFile` changes the snapshot digest, so a rule cannot hide bytes while an already-issued `PASS` keeps verifying as current.
+- **Deployment helpers carry no device default.** An omitted `ASCEND_VISIBLE_DEVICES` means no filtering, not a built-in card list; naming devices is the operator's explicit act.
 - **Fixtures cannot escape.** A pinned file path outside the adapter directory is a `ManifestError`.
 
 Tests use synthetic fixture adapters for engine-level behaviour, so the offline suite needs no hardware. Real-adapter tests patch `subprocess.run`, which is why the occupancy probe is exercised without a card.
@@ -49,13 +52,13 @@ Constraints observed for every real run: existing build trees only, Ninja capped
 
 | Adapter | Result | Run ID (current) | Evidence |
 | --- | --- | --- | --- |
-| `ascendnpu-ir` | PASS | `52ea3b30495dba9d086cabe0dc9c38bb` | build + regression; 1142 discovered / 1023 passed / 119 unsupported |
-| `tilelang-hivm` | PASS | `61ed95d533a314da934e4e8e6cd6eca7` | build + regression; 14 collected / 14 passed / 12 native libs |
-| `tilelang-hivm-npu` | BLOCKED_ENV | `e6d1680cd9b2972d645729089cc5a1ae` | no assigned device id |
-| `tilelang-hivm-npu` device 0 | BLOCKED_ENV | `57063f7d46de74f1cee9b8ac87c761ff` | card held by another job (7 holders) |
-| `tilelang-hivm-npu` device 1 | BLOCKED_ENV | `b767bf002a52e80b721ab1180f927e72` | card held by another job (4 holders) |
+| `ascendnpu-ir` | PASS | `50fd4866c1ebe7a77256b84a04b81d1b` | build + regression; 1142 discovered / 1023 passed / 119 unsupported |
+| `tilelang-hivm` | PASS | `5c156a74910d2dee7be4159585d8826c` | build + regression; 14 collected / 14 passed / 12 native libs |
+| `tilelang-hivm-npu` | BLOCKED_ENV | `4c459676b57eab7f57d4c80c6a3bfd0f` | no assigned device id |
+| `tilelang-hivm-npu` device 0 | BLOCKED_ENV | `7dbe75b1e9fd159d394a1b674cd8a69e` | card free at the config check, held by 1 process at dispatch: `BLOCKED_EXIT_CODE: 75` |
+| `tilelang-hivm-npu` device 1 | BLOCKED_ENV | `5f01a23a98547ed0c6f19502361374af` | card held by another job at the config check: `CONFIG_CHECK_FAILED` |
 
-These are the round-2 runs, taken after the review fixes changed the adapter scripts; the round-1 receipts are retained under `.evidence/p1-runs` and now verify as `STALE` (`ADAPTER_IDENTITY_CHANGED`), which is the correct outcome for evidence taken against different adapter bytes.
+These are the round-4 runs, taken against the current adapter bytes (evidence root `.evidence/p1-runs-r4`). Earlier rounds are retained: round-1 receipts verify `STALE` (`ADAPTER_IDENTITY_CHANGED`), round-2 receipts verify `STALE` (`SOURCE_IDENTITY_CHANGED`, because the ignore-rule binding changed the source digest), and round-3 `ascendnpu-ir` / `tilelang-hivm` receipts still verify `valid: true` while its NPU receipts are `ADAPTER_IDENTITY_CHANGED`. Every stale verdict is the correct outcome for evidence taken against different bytes.
 
 `verify` returned `valid: true` for the two PASS runs and `valid: false` for the blocked ones, which is the correct outcome: a blocked gate satisfies no requirement.
 

@@ -1,10 +1,48 @@
 # P2 validation: real Claude Code plugin session
 
-A fresh, non-interactive Claude Code session was launched against the repository plugin with the installed CLI on `PATH`. This is a real session, not a simulated hook test. Raw transcript and logs stay in ignored `.evidence/p2-session/` and `.evidence/p2-session-r2/`.
+A fresh, non-interactive Claude Code session was launched against the repository plugin with the installed CLI on `PATH`. This is a real session, not a simulated hook test. Raw transcript and logs stay in ignored `.evidence/p2-session/`, `.evidence/p2-session-r2/` and `.evidence/p2-session-r3/`.
 
-Two sessions were run. Round 1 (below, session `63e5fbf2…`) was taken before the independent review's fixes changed the adapter scripts; its receipts now verify as `STALE` with `ADAPTER_IDENTITY_CHANGED`, which is the correct outcome for evidence bound to different adapter bytes. Round 2 is the current evidence and is documented first.
+Three sessions were run. Round 1 was taken before the independent review's fixes changed the adapter scripts (`STALE` / `ADAPTER_IDENTITY_CHANGED`); round 2 before the ignore-rule binding changed the source digest (`STALE` / `SOURCE_IDENTITY_CHANGED`). Both are retained, and both stale verdicts are correct for evidence bound to different bytes. Round 3 is the current evidence and is documented first.
 
-## Round 2 (current evidence)
+## Round 3 (current evidence)
+
+```text
+claude -p --plugin-dir <repo>/integrations/claude-code \
+  --dangerously-skip-permissions --output-format stream-json --verbose \
+  --include-hook-events --tools Bash,Read,Edit,Skill --strict-mcp-config \
+  --name agent-gates-p2-validation-r3
+```
+
+- Claude Code `2.1.296`, session `508ad58f-c690-4c91-9088-566f9f30e119`, exit code 0, 209.0 s, 59 turns, no timeout.
+- Model reported by the session: `group/auto-deepseek-v4-1-flash`. **Not Opus**; no Opus claim is made anywhere in this document.
+- `system/init` loads `agent-gates@inline` v0.1.0 and lists exactly the three AgentGates skills `doctor`, `verify`, `report` among the harness's own skills.
+- All three skills were invoked by the session itself through the `Skill` tool, with the arguments from the prompt: `doctor` once, `verify` three times (two of them for the worktrees), `report` once.
+
+| Step | Skill invoked | Exit | Run ID | Status |
+| --- | --- | ---: | --- | --- |
+| `doctor` | `agent-gates:doctor` | 0 | `f6aa07cfe8190491926bcf8424942015` | PASS (both `--check-config` exit 0) |
+| `run --all` | `agent-gates:verify` | 0 | `3ab2fb02832832b7d4d1faa428ab77ce` | PASS |
+| `verify` | `agent-gates:verify` | 0 | same | `valid: true`, `failures: []` |
+| `report` | `agent-gates:report` | 0 | same | recordedStatus PASS / current PASS |
+
+Evidence root `.evidence/p2-plugin-runs-r3`. Source `<tilelang-checkout>`, HEAD `6fe6f09182c854e680a5488f4d8461fe5d5a76a6`, 1990 files, source hash unchanged before and after, five pre-existing tracked modifications preserved. `tilelang-hivm-build` PASS and `tilelang-hivm-regression` PASS with all five required observations and 13 bound artifacts. `trust: local-user-integrity`, `historicalPassReuse: false`.
+
+`doctor` publishes no receipt — it writes only its config-check logs — so there is nothing for `verify` to check on that run ID in any round; the PASS is the CLI's own exit status and log tree.
+
+The build is an incremental `tilelang` target against a pre-existing warm build tree. It attests that the current tree compiles and links and that the suite passes; it is not a cold-build measurement.
+
+### Round-3 worktree exercises
+
+The two pre-created detached worktrees were reset to their HEADs before this round, so the session made the single-file edits itself. Evidence root `.evidence/p2-worktree-runs-r3`.
+
+| Worktree | Change | Run ID | Result |
+| --- | --- | --- | --- |
+| `ascend-dev` | `bishengir/test/Transforms/canonicalize-module.mlir:9`, `){` → `) {`, whitespace only | `f03f0dfb1c5957e1e340795cee4a006c` | FAIL: `ascend-build` `NONZERO_EXIT`, recipe exit 3 (`no build/build.ninja under …/ascend-dev; initialize the build directory first`); `ascend-regression` `NOT_RUN` `DEPENDENCY_NOT_PASSED` |
+| `tilelang-dev` | one assertion at `testing/ascend/target/test_tilelang_ascend_target.py:30` | `c6e69cd63040e9009d854fbd31644540` | FAIL: `tilelang-hivm-build` `NONZERO_EXIT`, recipe exit 2 (`no build directory under …/tilelang-dev; configure the build directory first`, then `container produced no build report`); regression `NOT_RUN` |
+
+Both `verify` → exit 1, `valid: false`, the same three failures. Both worktrees have no `build/`, no `CMakeCache.txt`/`build.ninja`, and empty submodules (`third-party/llvm-project`, `third-party/torch-mlir`, `third-party/shmem`, `3rdparty/tvm`, `3rdparty/cutlass`). Neither run was redirected to the original checkouts, nothing was built elsewhere, no checkout was symlinked in, and both diffs remain uncommitted at their original HEADs.
+
+## Round 2 (retained, now STALE)
 
 ```text
 claude -p --plugin-dir <repo>/integrations/claude-code \
@@ -32,7 +70,7 @@ The 0.6 s build is an incremental `tilelang` target against a pre-existing warm 
 
 ### Round-2 worktree exercises
 
-Same two detached worktrees, same uncommitted single-file edits, evidence root `.evidence/p2-worktree-runs-r2`.
+Same two detached worktrees, same uncommitted single-file edits, evidence root `.evidence/p2-worktree-runs-r2`. These receipts now verify `STALE` with `SOURCE_IDENTITY_CHANGED`, because the ignore-rule binding changed the source digest after they were recorded; the round-3 runs above reproduce every verdict against the current bytes.
 
 | Worktree | Change | Run ID | Result |
 | --- | --- | --- | --- |
@@ -70,7 +108,7 @@ From that session's `system/init` event, the plugin was loaded as `agent-gates@i
 
 ## Round-1 plugin-initiated runs (STALE)
 
-Source `<tilelang-checkout>`, HEAD `6fe6f09`, five pre-existing tracked modifications preserved. Evidence root `.evidence/p2-plugin-runs`. The round-1 `run` ID `74e428e9…` now verifies as `STALE` / `ADAPTER_IDENTITY_CHANGED`; the round-1 `doctor` ID `1bab01b8…` publishes no receipt, so `verify` reports `INVALID_EVIDENCE` for it — the same "no receipt" answer that the round-2 doctor ID gives. The round-2 table above is the current evidence for the same steps.
+Source `<tilelang-checkout>`, HEAD `6fe6f09`, five pre-existing tracked modifications preserved. Evidence root `.evidence/p2-plugin-runs`. The round-1 `run` ID `74e428e9…` now verifies as `STALE` / `ADAPTER_IDENTITY_CHANGED`; the round-1 `doctor` ID `1bab01b8…` publishes no receipt, so `verify` reports `INVALID_EVIDENCE` for it — the same "no receipt" answer that the round-3 doctor ID gives. The round-3 table above is the current evidence for the same steps.
 
 | Step | Exit | Run ID | Status |
 | --- | ---: | --- | --- |
@@ -87,7 +125,7 @@ This result is a duplicate measurement of the same source as the P1 TileLang run
 
 Two pre-created worktrees under `.evidence/worktrees/` were used. Both are detached at the original HEADs and visible through the existing container `/home` bind mount. Neither has its own configured build, and neither has initialized submodules.
 
-Both round-1 run IDs below now verify as `STALE` / `ADAPTER_IDENTITY_CHANGED`, because the review fixes changed the adapter scripts after they were recorded. The round-2 runs above reproduce every verdict against the current adapter bytes.
+Both round-1 run IDs below now verify as `STALE` / `ADAPTER_IDENTITY_CHANGED`, because the review fixes changed the adapter scripts after they were recorded. The round-3 runs above reproduce every verdict against the current adapter bytes.
 
 ### Ascend: `ascend-dev` (round 1)
 
@@ -135,9 +173,9 @@ Consequence for the P2 claim: **the plugin's execution mode, receipt reading and
 ## What remains unproven
 
 - No Opus-model independent review. The earlier Opus reviewer failed with `model_not_found` for `claude-opus-5`, and the exact-name retry session `333e2661-73d9-4bed-b7f8-eaaca366281a` produced no completed verdict.
-- The `TaskCompleted` hook was never fired by a real task-completion event: neither session completed a task, so no `TaskCompleted` event occurred in either round. It is covered by `tests/test_plugin_receipts.py` and was invoked directly, with `PATH` pointing at the installed CLI, on three events: a round-2 plugin PASS receipt (exit 0), a round-2 `BLOCKED_ENV` receipt (exit 2, "agent-gates rejected the requested receipt"), and an event with no receipt block (exit 0, hook inactive).
+- The `TaskCompleted` hook was never fired by a real task-completion event: no session completed a task, so no `TaskCompleted` event occurred in any round. It is covered by `tests/test_plugin_receipts.py` and was invoked directly, with `PATH` pointing at the installed CLI, on three events: a plugin PASS receipt (exit 0), a `BLOCKED_ENV` receipt (exit 2, "agent-gates rejected the requested receipt"), and an event with no receipt block (exit 0, hook inactive).
 - A full isolated-worktree development loop, as described above.
 
 ## Observed harness behaviour worth recording
 
-`disable-model-invocation: true` is declared on all three skills, yet both sessions launched them through the `Skill` tool without any bypass. The flag is not being enforced for these plugin skills in Claude Code 2.1.296. This is a property of the harness, not of the plugin; the skills remain CLI-only in the sense that they take explicit `--adapter`/`--source` arguments and never guess them.
+`disable-model-invocation: true` is declared on all three skills, yet every session launched them through the `Skill` tool without any bypass. The flag is not being enforced for these plugin skills in Claude Code 2.1.296. This is a property of the harness, not of the plugin; the skills remain CLI-only in the sense that they take explicit `--adapter`/`--source` arguments and never guess them.
