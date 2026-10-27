@@ -63,9 +63,9 @@ Both `verify` results were `valid: false`. Neither run was redirected to the ori
 | CLI reproduces gate outcomes | P1 runs, matching counts | Verified |
 | No Harness/Claude runtime dependency | Wheel install + import assertions | Verified |
 | Offline correctness | 452 tests, 88 subtests, exit 0 (`.evidence/final-pytest.log`) | Verified |
-| Plugin loads and runs gates | Real session, three plugin skills, run PASS | Verified |
+| Plugin loads and runs gates | Two real sessions, three plugin skills discovered and invoked, round-2 run PASS | Verified |
 | Repository private | Auth `ls-remote` exit 0; nonexistent-repo control 128; anonymous API 404 vs public 200; 102-repo public listing omits it | Proven private |
-| NPU gate on hardware | None in any phase | Not measured |
+| NPU gate on hardware | None in any phase; the gate is covered only by offline fixtures and negative tests | Not measured |
 | Independent Opus review | `claude-opus-5` `model_not_found`; exact-name retry `333e2661-73d9-4bed-b7f8-eaaca366281a` gave no verdict | **No completed Opus review** |
 | Independent review (default model, not Opus) | Seven confirmed defects, all reproduced by the lead and fixed, with eleven new regression tests; round-2 real-machine runs reproduce every verdict | Completed, see [ledger](progress.md#independent-review) |
 
