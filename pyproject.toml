@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-gates"
+version = "0.1.0"
+description = "Standalone deterministic compiler engineering gates"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+agent-gates = "agent_gates.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_gates*"]
+
+[tool.setuptools.package-data]
+agent_gates = ["adapters/*/manifest.json", "adapters/*/scripts/*", "adapters/*/env.example.sh", "adapters/*/README.md"]
