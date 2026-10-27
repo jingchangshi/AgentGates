@@ -53,6 +53,12 @@ def main(argv=None):
             else:
                 result = store.read(run_id)
                 result["verification"] = verified
+                # A receipt with no recorded status is malformed. It has already
+                # failed verification, but reading `["status"]` would raise a
+                # KeyError the handler below does not catch, so the command
+                # would exit 1 with empty stdout instead of a structured report.
+                if "status" not in result:
+                    raise ValueError("receipt has no recorded status")
                 result["recordedStatus"] = result["status"]
                 result["status"] = verified["status"]
                 # A gate's recorded PASS describes the run that produced it, not

@@ -254,7 +254,17 @@ class Engine:
                                          "failures": ["RUN_INTERRUPTED"], "observations": {}, "artifacts": []})
         receipt["status"] = aggregate(receipt["gates"])
         receipt["finishedAt"] = now()
-        path = self.store.publish(receipt)
+        try:
+            path = self.store.publish(receipt)
+        except (OSError, ValueError) as exc:
+            # Everything before this point is already on disk: the logs and
+            # process records live in the run directory even when the signed
+            # receipt cannot be written. Name that directory so the run is not
+            # lost silently, and keep the failure a RuntimeError like every
+            # other evidence-path fault rather than letting a bare ValueError
+            # escape.
+            raise RuntimeError(f"receipt could not be published ({exc}); "
+                               f"run evidence retained in {directory}") from exc
         return {**receipt, "receiptPath": str(path)}
 
     def _gate(self, manifest, source, recipe, gate, receipt, env, directory, lease_fds):
@@ -293,7 +303,8 @@ class Engine:
                           log_dir=directory / gate["gateId"] / "recipe", lease_fds=lease_fds)
         gate["process"] = process
         gate.update(evaluate(process, gate["checks"]))
-        if type(process.get("exitCode")) is int and process["exitCode"] in recipe.blocked_exit_codes:
+        if type(process.get("exitCode")) is int and process["exitCode"] in recipe.blocked_exit_codes \
+                and not process.get("timedOut") and not process.get("interrupted"):
             # The Adapter uses a dedicated exit code for "the environment is not
             # available to this Gate" - a card another job holds, for instance.
             # Nothing was dispatched and no assertion ran, so recording FAIL
@@ -303,6 +314,9 @@ class Engine:
             # BLOCKED_ENV out of a passing run. The evaluation's observation
             # failures are dropped on purpose - they only say "the report was
             # empty", which is a consequence of not running, not a finding.
+            # A timeout or an interrupt is a different event even when the
+            # supervisor's final status happens to match: the child may have
+            # been killed mid-run after starting work, so it stays a failure.
             gate.update(status="BLOCKED_ENV", failures=[f"BLOCKED_EXIT_CODE: {process['exitCode']}"],
                         configReason=config_reason(process))
         gate["sourceAfter"] = snapshot(source)

@@ -174,6 +174,51 @@ class EvaluationTests(CoreFixture):
                               "testsCollected": collected, "testsSkipped": skipped})
             self.assertEqual(evaluate(self.process(raw), {"testsCollectedPositive": True, "notAllSkipped": True})["status"], "FAIL")
 
+    def test_a_missing_counter_cannot_opt_out_of_the_cross_check(self):
+        # Omitting `testsCollected` and `testsSkipped` used to skip the
+        # cross-check entirely, so a report with the two boolean claims and no
+        # counts passed - which is the zero-test case those checks exist for.
+        for raw in ({"testsCollectedPositive": True, "notAllSkipped": True},
+                    {"testsCollectedPositive": True},
+                    {"notAllSkipped": True}):
+            result = evaluate(self.process(json.dumps(raw)),
+                              {"testsCollectedPositive": True, "notAllSkipped": True})
+            self.assertEqual(result["status"], "FAIL", raw)
+            self.assertTrue(result["failures"], raw)
+        self.assertEqual(evaluate(self.process(json.dumps(
+            {"testsCollectedPositive": True, "notAllSkipped": True,
+             "testsCollected": 3, "testsSkipped": 0})),
+            {"testsCollectedPositive": True, "notAllSkipped": True})["status"], "PASS")
+
+    def test_a_produced_exit_code_claim_cannot_outvote_the_real_one(self):
+        # An adapter writes `exitCodeZero` for a command *inside* the container,
+        # but the receipt binds the host process. An exit-code-only gate ignores
+        # the produced value entirely - ordinary build output must not speak.
+        # Any other gate keeps it, so a container failure cannot be hidden by an
+        # adapter that exited 0, and only a literal `true` agrees with a pass.
+        process = self.process('{"exitCodeZero": true, "ok": true}')
+        process["exitCode"] = 1
+        self.assertEqual(evaluate(process, {"exitCodeZero": True})["status"], "FAIL")
+        self.assertEqual(evaluate(process, {"ok": True, "exitCodeZero": True})["status"], "FAIL")
+        self.assertEqual(evaluate(self.process('{"exitCodeZero": false}'), {"exitCodeZero": True})["status"], "PASS")
+        for raw in ('{"exitCodeZero": false, "ok": true}', '{"exitCodeZero": 1, "ok": true}',
+                    '{"exitCodeZero": "true", "ok": true}'):
+            self.assertEqual(evaluate(self.process(raw), {"ok": True, "exitCodeZero": True})["status"], "FAIL", raw)
+        self.assertEqual(evaluate(self.process('{"exitCodeZero": true, "ok": true}'),
+                                  {"ok": True, "exitCodeZero": True})["status"], "PASS")
+
+    def test_overflowing_json_number_is_rejected_not_read_as_infinity(self):
+        # `parse_constant` rejects the NaN/Infinity literals, but `1e999` is a
+        # syntactically finite spelling that parses to `inf`. Such a value would
+        # only fail later, when the receipt is serialised with allow_nan=False.
+        path = self.root / "overflow.json"
+        path.write_text('{"value": 1e999}')
+        from agent_gates.manifest import strict_json
+        with self.assertRaises(ValueError):
+            strict_json(path.read_text())
+        process = dict(exitCode=0, timedOut=False, interrupted=False, stdout={"path": str(path)})
+        self.assertEqual(evaluate(process, {"value": 1.0})["status"], "FAIL")
+
     def test_exit_only_gate_preserves_old_build_contract(self):
         process = self.process("ordinary build output")
         self.assertEqual(evaluate(process, {"exitCodeZero": True})["status"], "PASS")
@@ -251,6 +296,61 @@ class EngineTests(CoreFixture):
         run = self.run_gate()
         self.assertEqual(run["status"], "BLOCKED_ENV")
         self.assertNotEqual(run["gates"][0]["status"], "PASS")
+
+    def test_a_timed_out_recipe_stays_a_failure_despite_its_exit_status(self):
+        # The supervisor kills a timed-out child, and the status of a killed
+        # child can coincide with a declared blocked code. A timeout means work
+        # started and was cut short, which is a different event from "the
+        # environment is not available", so it must not be reclassified.
+        self.manifest["recipes"][0]["blockedExitCodes"] = [75]
+        self.script.write_text('import sys\nif "--check-config" in sys.argv: sys.exit(0)\nsys.exit(75)\n')
+        self.write_manifest()
+        from agent_gates import engine as engine_module
+        real = engine_module.execute
+
+        def timed_out(argv, **kwargs):
+            # Only the recipe is timed out; the configuration check still runs.
+            if "--check-config" in argv:
+                return real(argv, **kwargs)
+            return {**real(argv, **kwargs), "timedOut": True}
+
+        with patch("agent_gates.engine.execute", side_effect=timed_out):
+            run = self.run_gate()
+        gate = run["gates"][0]
+        self.assertEqual(gate["status"], "FAIL")
+        self.assertIn("TIMEOUT", gate["failures"])
+        self.assertNotIn("BLOCKED_EXIT_CODE: 75", gate["failures"])
+
+    def test_an_unwritable_receipt_names_the_directory_instead_of_vanishing(self):
+        # Everything before publishing is already on disk. A publish fault used
+        # to escape as a bare ValueError from outside the run's handler, so the
+        # caller saw only an exception and the run directory went unmentioned.
+        with patch.object(self.store, "publish", side_effect=OSError("disk full")):
+            with self.assertRaises(RuntimeError) as error:
+                self.run_gate()
+        self.assertIn("disk full", str(error.exception))
+        self.assertIn("retained in", str(error.exception))
+        runs = list((self.root / "evidence" / "runs").iterdir())
+        self.assertEqual(len(runs), 1, "the run directory must survive a publish fault")
+        self.assertTrue(any(runs[0].rglob("stdout.log")), "gate logs must survive a publish fault")
+
+    def test_a_malformed_receipt_reports_a_status_instead_of_crashing(self):
+        # `report` read `receipt["status"]` unguarded, so a receipt without one
+        # raised KeyError outside the CLI's handler: exit 1, empty stdout.
+        run = self.run_gate()
+        self.assertEqual(run["status"], "PASS")
+        receipt_path = Path(run["receiptPath"])
+        receipt = json.loads(receipt_path.read_text())
+        del receipt["status"]
+        receipt_path.write_text(json.dumps(receipt))
+        with patch("agent_gates.cli.Registry", return_value=self.registry), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = main(["report", "--run-id", run["runId"],
+                         "--evidence-root", str(self.root / "evidence"), "--json"])
+        self.assertEqual(code, 2)
+        reported = json.loads(output.getvalue())
+        self.assertEqual(reported["status"], "BLOCKED_ENV")
+        self.assertIn("recorded status", " ".join(reported["failures"]))
 
     def test_source_changed_during_execution_cannot_pass(self):
         self.script.write_text('import json,sys\nfrom pathlib import Path\nif "--check-config" in sys.argv: sys.exit(0)\nPath("input.txt").write_text("changed")\nprint(json.dumps({"ok": True}))\n')
@@ -356,6 +456,23 @@ class ProcessTests(CoreFixture):
         self.assertTrue(result["timedOut"])
         self.assertEqual(result["signal"], signal.SIGKILL)
         self.assertIn("checkpoint", Path(result["stdout"]["path"]).read_text())
+
+    def test_relative_path_entries_resolve_against_the_recipe_cwd(self):
+        # A relative PATH entry means "relative to the process's own cwd". The
+        # recipe runs with cwd=recipe.cwd, not with the directory that launched
+        # agent-gates, so resolving it against this process would bind a binary
+        # the recipe never executed.
+        from agent_gates.executor import executable_identity
+        tool_dir = self.source / "bin"
+        tool_dir.mkdir()
+        tool = tool_dir / "fixture-tool"
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+        identity = executable_identity(["fixture-tool"], str(self.source), {"PATH": "bin"})
+        self.assertEqual(identity["sha256"], digest(tool))
+        # A relative entry that only exists under the launching directory is
+        # not a resolution: the recipe's cwd is the one that counts.
+        self.assertFalse((self.root / "bin" / "fixture-tool").exists())
 
     def test_normal_exit_reaps_detached_descendant(self):
         result = self.execute('import subprocess,sys; from pathlib import Path; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"],start_new_session=True); Path("child-pid").write_text(str(p.pid))')

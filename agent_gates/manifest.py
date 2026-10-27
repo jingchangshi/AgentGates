@@ -35,7 +35,17 @@ def strict_json(text: str):
         return value
     def constant(value):
         raise ValueError(f"invalid JSON constant: {value}")
-    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+    def number(value):
+        # `parse_constant` covers the `NaN`/`Infinity` literals, but a finite
+        # spelling can still overflow: `1e999` parses to `inf` and would reach
+        # an observation comparison as a float that is not a JSON number. A
+        # receipt is serialised with `allow_nan=False`, so such a value would
+        # otherwise fail only at publish time, after the run.
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"non-finite JSON number: {value}")
+        return result
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
 
 
 @dataclass(frozen=True)

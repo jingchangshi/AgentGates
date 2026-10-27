@@ -44,19 +44,36 @@ def evaluate(process: dict, checks: dict):
         except (OSError, ValueError, KeyError) as exc:
             failures.append(f"INVALID_OBSERVATION: {exc}")
             observations = {}
-    observations["exitCodeZero"] = type(process.get("exitCode")) is int and process["exitCode"] == 0 and not process.get("timedOut") and not process.get("interrupted")
+    # Two different claims share this name. An Adapter that emits
+    # `exitCodeZero` describes a command *inside* the container; the receipt
+    # binds the host process that ran the Adapter. For an exit-code-only gate
+    # the runner's own status is the whole contract - ordinary build output
+    # must not be able to speak, so any produced value is discarded. For every
+    # other gate a produced claim is kept, but only as a literal boolean and
+    # only when the host process agrees: otherwise a container-reported failure
+    # could be hidden by an Adapter that exited 0.
+    host_exit_zero = type(process.get("exitCode")) is int and process["exitCode"] == 0 \
+        and not process.get("timedOut") and not process.get("interrupted")
+    if checks != {"exitCodeZero": True} and "exitCodeZero" in observations:
+        observations["exitCodeZero"] = host_exit_zero and observations["exitCodeZero"] is True
+    else:
+        observations["exitCodeZero"] = host_exit_zero
     for key, expected in checks.items():
         if key not in observations:
             failures.append(f"MISSING_OBSERVATION: {key}")
         elif not equal(observations[key], expected):
             failures.append(f"OBSERVATION_MISMATCH: {key}")
-    # Cross-check counters when emitted; boolean claims cannot conceal zero/all-skip runs.
-    if "testsCollectedPositive" in checks and "testsCollected" in observations:
-        count = observations["testsCollected"]
+    # A boolean claim is only accepted alongside the counter it summarises. When
+    # the cross-check was skipped for an absent counter, a producer could opt
+    # out of it: a report containing `testsCollectedPositive: true` and
+    # `notAllSkipped: true` with no counts at all passed, which is exactly the
+    # zero-test case those checks exist to catch.
+    if "testsCollectedPositive" in checks:
+        count = observations.get("testsCollected")
         if type(count) is not int or count <= 0:
             failures.append("INVALID_TEST_COUNT")
-    if "notAllSkipped" in checks and "testsSkipped" in observations:
-        skipped, collected = observations["testsSkipped"], observations.get("testsCollected")
+    if "notAllSkipped" in checks:
+        skipped, collected = observations.get("testsSkipped"), observations.get("testsCollected")
         if type(skipped) is not int or type(collected) is not int or skipped < 0 or skipped >= collected:
             failures.append("ALL_TESTS_SKIPPED_OR_INVALID_COUNT")
     return {"status": "FAIL" if failures else "PASS", "observations": observations, "failures": failures}

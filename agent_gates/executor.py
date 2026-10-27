@@ -18,9 +18,25 @@ def file_reference(path: Path):
     return {"path": str(path.resolve()), "bytes": path.stat().st_size, "sha256": digest(path)}
 
 
+def resolved_path(env, cwd):
+    """The PATH the recipe process will actually search, expanded against its cwd.
+
+    A relative entry such as `.` or `bin` means "relative to the process's cwd",
+    and the recipe runs with `cwd=recipe.cwd`, not with the directory that
+    launched `agent-gates`. Passing the raw value to `shutil.which` would
+    resolve it against this process's cwd and bind a binary the recipe never
+    executed.
+    """
+    entries = []
+    for entry in env.get("PATH", "").split(os.pathsep):
+        # An empty entry means "the current directory", so it is relative too.
+        entries.append(entry if os.path.isabs(entry) else str(Path(cwd) / entry))
+    return os.pathsep.join(entries)
+
+
 def executable_identity(argv, cwd, env):
     name = argv[0]
-    path = shutil.which(name, path=env.get("PATH")) if "/" not in name else str(Path(cwd) / name)
+    path = shutil.which(name, path=resolved_path(env, cwd)) if "/" not in name else str(Path(cwd) / name)
     if not path or not Path(path).is_file() or not os.access(path, os.X_OK):
         raise ValueError(f"recipe executable unavailable: {name}")
     return file_reference(Path(path))
