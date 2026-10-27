@@ -13,7 +13,7 @@ import re
 import secrets
 from .evaluator import equal, evaluate
 from .executor import file_reference
-from .manifest import Manifest, digest, strict_json
+from .manifest import Manifest, strict_json
 from .source_identity import snapshot
 
 RUN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -186,9 +186,28 @@ class EvidenceStore:
         return {"runId": run_id, "status": status, "valid": status == "PASS", "failures": failures}
 
 
+# Every status the engine can write. A receipt carrying anything else - a
+# typo, a truncated write, a status a future gate path invents - is not a
+# result this module understands, so it must never be read as a pass.
+STATUSES = ("PASS", "FAIL", "BLOCKED_ENV", "NOT_RUN", "STALE", "INVALID_EVIDENCE")
+
+
 def aggregate(gates):
-    statuses = {gate["status"] for gate in gates}
+    """The overall status of a run: PASS only when every gate literally passed.
+
+    The previous form blocked a fixed list of failure literals and returned
+    PASS for everything else, so an unknown status such as SKIPPED or ERROR
+    became an overall pass and `verify` recomputed the same pass. The
+    condition is now positive: an empty run is NOT_RUN, any unrecognised
+    status is INVALID_EVIDENCE, and PASS requires every gate to be PASS.
+    """
+    statuses = [gate["status"] for gate in gates]
+    if not statuses:
+        return "NOT_RUN"
+    unknown = [status for status in statuses if status not in STATUSES]
+    if unknown:
+        return "INVALID_EVIDENCE"
     for status in ("INVALID_EVIDENCE", "STALE", "FAIL", "BLOCKED_ENV", "NOT_RUN"):
         if status in statuses:
             return status
-    return "PASS" if gates else "NOT_RUN"
+    return "PASS"

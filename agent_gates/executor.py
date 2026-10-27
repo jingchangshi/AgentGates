@@ -47,6 +47,14 @@ def execute(argv, *, cwd, env, timeout, log_dir: Path, lease_fds=()):
                                 pass_fds=tuple(lease_fds))
         try:
             proc.wait(timeout=timeout + 10)
+        except subprocess.TimeoutExpired as exc:
+            # A supervisor that outlives its own deadline is a failure of this
+            # process, not of the recipe. Convert it here: TimeoutExpired is a
+            # SubprocessError, which is not an OSError, so leaving it uncaught
+            # would escape every handler in engine.py and cli.py and lose the
+            # receipt entirely instead of recording BLOCKED_ENV.
+            raise RuntimeError(f"supervisor did not finish within {timeout + 10}s; "
+                               f"lease retained; inspect {live_path}") from exc
         finally:
             if proc.poll() is None:
                 proc.terminate()

@@ -839,11 +839,15 @@ def container_script(source_root: str, build: str, jobs: str, timeout: int,
     if hivm_compiler is not None:
         quoted = shlex.quote(str(hivm_compiler))
         lines.append(f'[ -x {quoted} ] '
-                     f'|| fail "{HIVM_COMPILER_VAR} is not an executable in the container: {quoted}"')
+                     f'|| fail {shlex.quote(f"{HIVM_COMPILER_VAR} is not an executable in the container: {hivm_compiler}")}')
         lines.append(f'export {HIVM_COMPILER_VAR}={quoted}')
-    lines.append(f'cd {shlex.quote(source_root)} || fail "cannot enter {source_root}"')
+    # Messages that carry an env-file value are single-quoted literals: inside
+    # double quotes a `$(...)` in the value would execute in the container,
+    # which would make the machine file code rather than data.
+    lines.append(f'cd {shlex.quote(source_root)} '
+                 f'|| fail {shlex.quote(f"cannot enter {source_root}")}')
     lines.append(f'[ -d {shlex.quote(build)} ] '
-                 f'|| fail "no {build} directory under {source_root}; configure the build directory first"')
+                 f'|| fail {shlex.quote(f"no {build} directory under {source_root}; configure the build directory first")}')
     lines.append('command=$1; shift')
     lines.append('case "$command" in')
     # Build: an incremental Ninja run of the one stable phony target. The build
@@ -851,7 +855,7 @@ def container_script(source_root: str, build: str, jobs: str, timeout: int,
     # so the Harness source-identity check still holds afterwards.
     lines.append('  build)')
     lines.append(f'    [ -f {shlex.quote(build)}/build.ninja ] '
-                 f'|| fail "no {build}/build.ninja; initialize the build directory first"')
+                 f'|| fail {shlex.quote(f"no {build}/build.ninja; initialize the build directory first")}')
     lines.append(f'    timeout --signal=TERM --kill-after={KILL_AFTER_SECONDS} {timeout} '
                  f'ninja -C {shlex.quote(build)} -j {jobs} tilelang >&2')
     lines.append('    rc=$?')
@@ -869,10 +873,10 @@ def container_script(source_root: str, build: str, jobs: str, timeout: int,
     # JUnit XML. Test statistics never come from pytest's summary text.
     lines.append('  regression)')
     lines.append(f'    [ -f {shlex.quote(build)}/build.ninja ] '
-                 f'|| fail "no {build}/build.ninja; initialize the build directory first"')
+                 f'|| fail {shlex.quote(f"no {build}/build.ninja; initialize the build directory first")}')
     for test in REGRESSION_TESTS:
         lines.append(f'    [ -f {shlex.quote(test)} ] '
-                     f'|| fail "regression test file is missing: {test}"')
+                     f'|| fail {shlex.quote(f"regression test file is missing: {test}")}')
     lines.append('    tmp=$(mktemp -d) || fail "cannot create a temporary directory"')
     lines.append('    python3 - regression "$PWD" >"$tmp/report.json" <<\'TILELANG_HIVM_PROBE\'')
     lines.extend(PROBE.strip('\n').splitlines())

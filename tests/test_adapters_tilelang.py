@@ -1198,6 +1198,11 @@ class _FakeDockerCase(unittest.TestCase):
                               f'\t{device}  76  0  {device}  Ascend950PR\n', '')
             npu_id = argv[argv.index('-i') + 1]
             lines = [f'\tNPU ID                         : {npu_id}']
+            # The real driver prints this sentence, and only this sentence,
+            # when the device holds nothing; an empty table with no marker is
+            # an answer the bridge refuses.
+            if not occupancy:
+                lines.append('\tNo process in device.')
             lines += [f'\tProcess id:{pid} Process name:{name}           Process memory(MB):256'
                       for pid, name in occupancy]
             return subprocess.CompletedProcess(argv, 0, '\n'.join(lines) + '\n', '')
@@ -1841,7 +1846,7 @@ class NpuOccupancyCase(_FakeDockerCase):
             if argv[0] == npu.NPU_SMI:
                 if argv[2:] == ['-m']:
                     return subprocess.CompletedProcess(argv, 0, mapping, '')
-                return subprocess.CompletedProcess(argv, 0, '\tNPU ID : 0\n', '')
+                return subprocess.CompletedProcess(argv, 0, '\tNPU ID : 0\n\tNo process in device.\n', '')
             return self.fake_npu(calls=None, device='1')(argv, **kwargs)
 
         with patch('subprocess.run', side_effect=run):
@@ -1888,6 +1893,55 @@ class NpuOccupancyCase(_FakeDockerCase):
             with self.assertRaises(npu.BridgeError):
                 npu.main(['--timeout', '900'])
         self.assertFalse([call for call in calls if call[:2] == ['docker', 'exec']])
+
+    def test_an_unrecognised_process_table_is_unknown_occupancy_not_a_free_card(self):
+        # The probe used to raise only when the `NPU ID` header was missing.
+        # If the header matched but the per-process layout drifted - a driver
+        # upgrade adding a space before the colon, a name containing spaces -
+        # no row matched, the holder list came back empty, and a busy card was
+        # reported free. Any answer this Gate cannot read in full is unknown.
+        drift = ('\tNPU ID                         : 0\n'
+                 '\tProcess id:4242 Process name:python3 Process memory(MB) : 256\n')
+        with patch('subprocess.run', side_effect=self.fake_npu(probe_text=drift)):
+            with self.assertRaises(npu.BridgeError) as error:
+                npu.processes_on('0')
+        self.assertIn('not understood', str(error.exception))
+
+    def test_a_table_with_neither_a_row_nor_the_idle_marker_is_refused(self):
+        # Absence of rows is not a statement that the card is idle. The driver
+        # says so explicitly; without that sentence the answer is unreadable.
+        silent = '\tNPU ID                         : 0\n'
+        with patch('subprocess.run', side_effect=self.fake_npu(probe_text=silent)):
+            with self.assertRaises(npu.BridgeError):
+                npu.processes_on('0')
+
+    def test_the_drivers_idle_marker_is_the_only_empty_table_that_is_free(self):
+        idle = '\tNPU ID                         : 0\n\tNo process in device.\n'
+        with patch('subprocess.run', side_effect=self.fake_npu(probe_text=idle)):
+            self.assertEqual(npu.processes_on('0'), [])
+
+    def test_a_table_claiming_both_processes_and_an_idle_card_is_refused(self):
+        contradictory = ('\tNPU ID                         : 0\n'
+                         '\tNo process in device.\n'
+                         '\tProcess id:4242 Process name:python3           Process memory(MB):256\n')
+        with patch('subprocess.run', side_effect=self.fake_npu(probe_text=contradictory)):
+            with self.assertRaises(npu.BridgeError):
+                npu.processes_on('0')
+
+    def test_a_machine_file_value_cannot_execute_inside_the_container_script(self):
+        # `fail "text {value}"` would expand `$(...)` in the value when the
+        # container shell runs the script, which would make a value read from
+        # env.sh executable code. Values must reach the script as literals.
+        hostile = Path('/tmp/$(touch /tmp/PWNED)/cann.sh')
+        script = npu.container_script('/src', 900, '0', hostile, None, None, None)
+        self.assertNotIn('fail "CANN setup not readable', script)
+        for line in script.splitlines():
+            if 'CANN setup not readable' in line:
+                self.assertIn("'/tmp/$(touch /tmp/PWNED)/cann.sh'", line)
+        conda = npu.container_script('/src', 900, '0', None, Path('/tmp/c.sh'), 'env$(touch /tmp/PWNED)', None)
+        for line in conda.splitlines():
+            if 'conda activate' in line:
+                self.assertNotIn('fail "', line)
 
 
 class NpuIsolationCase(unittest.TestCase):

@@ -316,3 +316,109 @@ def test_source_byte_identity_detects_untracked_changes(sandbox):
     before = snapshot(sandbox)
     (sandbox / 'new.py').write_text('value = 1\n')
     assert snapshot(sandbox) != before
+
+
+def test_an_unknown_gate_status_can_never_aggregate_to_pass():
+    # `aggregate` used to block a fixed list of failure literals and return
+    # PASS for everything else, so a gate that recorded SKIPPED or ERROR - a
+    # future status, or a receipt written by a bug - produced an overall pass
+    # that `verify` then recomputed as valid. PASS must be a positive claim.
+    from agent_gates.evidence import aggregate
+    for status in ('SKIPPED', 'ERROR', 'PASSED', 'TIMEOUT', '', 'pass', 'Pass'):
+        assert aggregate([{'status': status}]) == 'INVALID_EVIDENCE', status
+    assert aggregate([]) == 'NOT_RUN'
+    assert aggregate([{'status': 'PASS'}]) == 'PASS'
+    assert aggregate([{'status': 'PASS'}, {'status': 'PASS'}]) == 'PASS'
+    for status in ('FAIL', 'BLOCKED_ENV', 'NOT_RUN', 'STALE', 'INVALID_EVIDENCE'):
+        assert aggregate([{'status': 'PASS'}, {'status': status}]) == status
+
+
+def test_a_receipt_with_an_unknown_status_verifies_as_invalid(tmp_path, sandbox):
+    engine, store, _ = local_engine(tmp_path, sandbox)
+    result = engine.run('fixture', sandbox, ['fixture-gate'])
+    assert result['status'] == 'PASS'
+    receipt_path = Path(result['receiptPath'])
+    receipt = json.loads(receipt_path.read_text())
+    receipt['gates'][0]['status'] = 'SKIPPED'
+    receipt_path.write_text(json.dumps(receipt))
+    # Re-sign so the only thing wrong is the status, not the HMAC. This is the
+    # exact shape a buggy writer would leave behind: a well-formed, correctly
+    # signed receipt whose gate status this code has never seen.
+    import hashlib, hmac
+    from agent_gates.evidence import canonical
+    signature = hmac.new((store.root / '.receipt-key').read_bytes(), canonical(receipt), hashlib.sha256).hexdigest()
+    (receipt_path.parent / 'receipt.attestation.json').write_text(
+        json.dumps({'signature': signature, 'algorithm': 'HMAC-SHA256', 'trust': 'local-user-integrity'}))
+    verified = store.verify(result['runId'], registry=engine.registry)
+    assert verified['valid'] is False
+    assert verified['status'] == 'INVALID_EVIDENCE'
+
+
+def test_a_supervisor_that_outlives_its_deadline_is_a_runtime_error(tmp_path, monkeypatch):
+    # subprocess.TimeoutExpired is a SubprocessError, not an OSError, so it
+    # escaped every handler in engine.py and cli.py and lost the receipt
+    # instead of recording a failure. The executor must convert it.
+    import subprocess as sp
+    from agent_gates import executor
+
+    class Hanging:
+        returncode = None
+        def __init__(self, *a, **k):
+            pass
+        def wait(self, timeout=None):
+            raise sp.TimeoutExpired(cmd='supervisor', timeout=timeout)
+        def poll(self):
+            return None
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(executor.subprocess, 'Popen', Hanging)
+    with pytest.raises(RuntimeError):
+        executor.execute([sys.executable, '-c', 'pass'], cwd=tmp_path, env={}, timeout=1,
+                         log_dir=tmp_path / 'logs')
+
+
+def test_a_lock_key_normalises_path_spellings(tmp_path):
+    # `source:/x`, `source:/x/` and `source:/x/.` hashed to three lock files,
+    # so two runs could lease "the same" build tree twice.
+    target = tmp_path / 'tree'
+    target.mkdir()
+    spellings = [str(target), str(target) + '/', str(target) + '/.', str(target / '.' / '')]
+    paths = {ResourceLock('source:' + value, tmp_path / 'locks').path for value in spellings}
+    assert len(paths) == 1, paths
+    # Non-path keys keep their exact spelling: a device lease is not a path.
+    assert ResourceLock('npu:3', tmp_path / 'locks').path != ResourceLock('npu:03', tmp_path / 'locks').path
+
+
+def test_configuration_binds_the_inherited_toolchain_environment(tmp_path, sandbox, monkeypatch):
+    # PATH, PYTHONPATH and LD_PRELOAD select the toolchain without appearing in
+    # the adapter prefix, so the receipt binds them by hash: two runs under
+    # different toolchains must not present the same configuration identity,
+    # and no value may be stored. `verify` deliberately does not re-derive
+    # this, because the verifying shell is not the running shell.
+    from agent_gates.engine import configuration
+    from agent_gates.manifest import Manifest
+    manifest = Manifest(ADAPTERS / 'tilelang-hivm' / 'manifest.json')
+    before = configuration(manifest, {'PATH': '/usr/bin', 'LD_PRELOAD': ''})
+    after = configuration(manifest, {'PATH': '/opt/toolchain/bin:/usr/bin', 'LD_PRELOAD': ''})
+    assert before['inheritedEnvironmentSha256'] != after['inheritedEnvironmentSha256']
+    assert before['environmentSha256'] == after['environmentSha256']
+    assert '/opt/toolchain/bin' not in json.dumps(before)
+    preload = configuration(manifest, {'PATH': '/usr/bin', 'LD_PRELOAD': '/tmp/inject.so'})
+    assert preload['inheritedEnvironmentSha256'] not in (
+        before['inheritedEnvironmentSha256'], after['inheritedEnvironmentSha256'])
+
+
+def test_one_adapter_cannot_inherit_the_other_adapters_prefix(monkeypatch):
+    # A stray ASCENDNPU_BUILD_SUBDIR export must not steer a TileLang run
+    # through a knob that `configuration()` does not hash for that adapter.
+    from agent_gates.engine import environment
+    from agent_gates.manifest import Manifest
+    monkeypatch.setenv('ASCENDNPU_BUILD_SUBDIR', 'elsewhere')
+    monkeypatch.setenv('TILELANG_HIVM_BUILD_SUBDIR', 'build')
+    tilelang = Manifest(ADAPTERS / 'tilelang-hivm' / 'manifest.json')
+    ascend = Manifest(ADAPTERS / 'ascendnpu-ir' / 'manifest.json')
+    assert 'ASCENDNPU_BUILD_SUBDIR' not in environment(tilelang)
+    assert environment(tilelang)['TILELANG_HIVM_BUILD_SUBDIR'] == 'build'
+    assert 'TILELANG_HIVM_BUILD_SUBDIR' not in environment(ascend)
+    assert environment(ascend)['ASCENDNPU_BUILD_SUBDIR'] == 'elsewhere'

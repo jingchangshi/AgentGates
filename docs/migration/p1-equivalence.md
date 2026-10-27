@@ -14,13 +14,15 @@ This compares the P0 original-recipe baseline with the migrated standalone CLI o
 
 ## Results
 
-| Gate | P0 | P1 | P1 run ID | Notes |
+| Gate | P0 | P1 (round 1) | P1 (round 2, after the review fixes) | Notes |
 | --- | --- | --- | --- | --- |
-| `ascend-build` | PASS 80.670s | PASS | `c1610b674026bc2156c1a3ccedb48ee0` | Incremental; build tree already current |
-| `ascend-regression` | PASS 410.713s | PASS | same run | 1142 discovered / 1023 passed / 119 unsupported, identical counts |
-| `tilelang-hivm-build` | PASS 0.615s | PASS | `181cad5aa72c8893043f4a53f7b2e79b` | Incremental `tilelang` target |
-| `tilelang-hivm-regression` | PASS 8.727s | PASS | same run | 14 collected / 14 passed / 0 skipped / 12 native libraries |
-| `tilelang-hivm-npu-sanity` | BLOCKED_ENV | BLOCKED_ENV | `414c2ca7aaf5880ec7e7711545e8475e` | No task-assigned device id in either phase |
+| `ascend-build` | PASS 80.670s | PASS `c1610b674026bc2156c1a3ccedb48ee0` | PASS `52ea3b30495dba9d086cabe0dc9c38bb` | Incremental; build tree already current |
+| `ascend-regression` | PASS 410.713s | PASS, same run | PASS, same round-2 run | 1142 discovered / 1023 passed / 119 unsupported, identical counts in every round |
+| `tilelang-hivm-build` | PASS 0.615s | PASS `181cad5aa72c8893043f4a53f7b2e79b` | PASS `61ed95d533a314da934e4e8e6cd6eca7` | Incremental `tilelang` target |
+| `tilelang-hivm-regression` | PASS 8.727s | PASS, same run | PASS, same round-2 run | 14 collected / 14 passed / 0 skipped / 12 native libraries |
+| `tilelang-hivm-npu-sanity` | BLOCKED_ENV | BLOCKED_ENV `414c2ca7aaf5880ec7e7711545e8475e` | BLOCKED_ENV `e6d1680cd9b2972d645729089cc5a1ae` | No task-assigned device id in either phase |
+
+Round 2 exists because the independent review found seven defects after round 1. Fixing them changed the adapter scripts, which correctly turned every round-1 receipt `STALE` (`ADAPTER_IDENTITY_CHANGED`); the round-1 receipts are retained unchanged under `.evidence/p1-runs` as history, and the current evidence is `.evidence/p1-runs-r2`. Round 2 re-ran the same argv against the same sources and machine files and reproduced every verdict.
 
 P1 wall-clock is shorter than P0 because the trees were warm after the baseline: `ascend-regression` took 3.12 s against 410.7 s and `tilelang-hivm-regression` 7.38 s against 8.73 s. Timings are therefore not comparable evidence of equivalence; the discovered/passed/unsupported counts and the observation values are.
 
@@ -45,8 +47,12 @@ These differences are intentional and covered by negative tests; they are not re
 
 | Probe run | Device | Status | Recorded reason |
 | --- | --- | --- | --- |
-| `a0c167250ab7c79a1e286ddf4e8cd7c2` | 0 | BLOCKED_ENV | card in use by 2 processes not started by this Gate |
-| `a3428763b378f1b6a0297b4bf42c8c97` | 1 | BLOCKED_ENV | card in use by 5 processes not started by this Gate |
+| `a0c167250ab7c79a1e286ddf4e8cd7c2` (round 1) | 0 | BLOCKED_ENV | card in use by 2 processes not started by this Gate |
+| `a3428763b378f1b6a0297b4bf42c8c97` (round 1) | 1 | BLOCKED_ENV | card in use by 5 processes not started by this Gate |
+| `57063f7d46de74f1cee9b8ac87c761ff` (round 2) | 0 | BLOCKED_ENV | card in use by 7 processes not started by this Gate |
+| `b767bf002a52e80b721ab1180f927e72` (round 2) | 1 | BLOCKED_ENV | card in use by 4 processes not started by this Gate |
+
+   The holder counts differ between rounds because they are a live reading of a shared machine, not a property of the Gate. Round 2 runs the hardened parser: an answer whose layout it cannot read in full is now unknown occupancy rather than a free card.
 
    The probe never selects a card and reports only the holder count, not other users' PIDs or command lines.
 5. **Receipt re-validation.** A recorded PASS is only current while `verify` returns `valid: true`; mutating the receipt, logs, source, manifest, script or product turns it `INVALID_EVIDENCE` or `STALE`. The legacy path had no equivalent.

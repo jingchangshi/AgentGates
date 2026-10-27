@@ -55,15 +55,15 @@ The container's own `npu-smi` is unusable in the current image (`libc_sec.so` fa
 
 | Item | Result |
 | --- | --- |
-| Offline suite | 441 passed, 88 subtests passed, exit 0 (`.evidence/final-pytest.log`; 439 before the two packaging tests were added) |
+| Offline suite | 452 passed, 88 subtests passed, exit 0 (`.evidence/final-pytest.log`; 441 before the eleven review-fix tests were added) |
 | Isolated wheel install | PASS (pinned files present, no machine config, no Harness/Claude/Anthropic import) |
-| P1 `ascendnpu-ir` | doctor + run PASS, `c1610b674026bc2156c1a3ccedb48ee0`, verify `valid: true` |
-| P1 `tilelang-hivm` | doctor + run PASS, `181cad5aa72c8893043f4a53f7b2e79b`, verify `valid: true` |
-| P1 `tilelang-hivm-npu` | BLOCKED_ENV, no assignment; verify `valid: false` |
-| Occupancy probe, device 0 / 1 | BLOCKED_ENV `a0c167250ab7c79a1e286ddf4e8cd7c2` / `a3428763b378f1b6a0297b4bf42c8c97` |
+| P1 `ascendnpu-ir` | doctor + run PASS, `52ea3b30495dba9d086cabe0dc9c38bb`, verify `valid: true` |
+| P1 `tilelang-hivm` | doctor + run PASS, `61ed95d533a314da934e4e8e6cd6eca7`, verify `valid: true` |
+| P1 `tilelang-hivm-npu` | BLOCKED_ENV, no assignment, `e6d1680cd9b2972d645729089cc5a1ae`; verify `valid: false` |
+| Occupancy probe, device 0 / 1 | BLOCKED_ENV `57063f7d46de74f1cee9b8ac87c761ff` / `b767bf002a52e80b721ab1180f927e72` |
 | `claude plugin validate` | passes, no warnings |
-| P2 fresh plugin session | exit 0, 243.3 s, three skills discovered, plugin-initiated TileLang PASS `74e428e9818aa75ad7fb1b95f20032bc` |
-| P2 worktree exercises | both FAIL honestly on missing worktree builds; not redirected to the original checkouts |
+| P2 fresh plugin session | round 2: exit 0, 201.6 s, three skills discovered, plugin-initiated TileLang PASS `a62906a815e77f9001c706c0c932b7dc` (round 1 `74e428e9…` now STALE) |
+| P2 worktree exercises | round 2 `b2ef7ee4…` / `62eec625…`: both FAIL honestly on missing worktree builds; not redirected to the original checkouts (round 1 IDs now STALE) |
 | GitHub visibility | PRIVATE, proven on four independent facts |
 
 ## GitHub visibility
@@ -79,4 +79,18 @@ No credential value, token or private key was read or written by this check.
 
 ## Independent review
 
-No completed Opus review exists. The first reviewer failed with `model_not_found` for the `claude-opus-5` alias; the exact-name retry (`claude/claude-opus-5-5`, session `333e2661-73d9-4bed-b7f8-eaaca366281a`) initialised with the correct model but produced no verdict before being stopped. The P2 session ran on `group/auto-deepseek-v4-1-flash`, which is not Opus. A read-only independent review was run after resuming; its findings and dispositions are recorded in the final report.
+No completed Opus review exists. The first reviewer failed with `model_not_found` for the `claude-opus-5` alias; the exact-name retry (`claude/claude-opus-5-5`, session `333e2661-73d9-4bed-b7f8-eaaca366281a`) initialised with the correct model but produced no verdict before being stopped. The P2 session ran on `group/auto-deepseek-v4-1-flash`, which is not Opus.
+
+After the first push a read-only review was delegated to a separate reviewer agent on the configured default model — not Opus, and recorded as such. It reported seven confirmed defects, each of which the lead reproduced independently before fixing:
+
+| # | Severity | Defect | Disposition |
+| --- | --- | --- | --- |
+| 1 | HIGH | `aggregate()` returned `PASS` for any status it did not recognise, so `SKIPPED`/`ERROR`/`PASSED`/`""` all aggregated to a pass that `verify` recomputed as `valid: true` | Fixed: PASS requires every gate to be literally `PASS`; unknown statuses are `INVALID_EVIDENCE`. Two tests. |
+| 2 | HIGH | An uncaught `subprocess.TimeoutExpired` (a `SubprocessError`, not an `OSError`) escaped every handler and skipped `store.publish`, losing the receipt instead of recording a failure | Fixed in `executor.py`; converted to `RuntimeError`. One test. |
+| 3 | HIGH | The occupancy probe failed **open** on driver format drift: a matching `NPU ID` header with unreadable process rows returned an empty holder list, so a busy card read as free | Fixed: the answer must be readable in full or name the driver's `No process in device.` marker; otherwise `BridgeError`. Four tests. |
+| 4 | MEDIUM | Machine-file values were interpolated into `bash -c` inside double quotes, so `$(...)` in an env value would execute in the container | Fixed in all three bridges: values reach the script as single-quoted literals. One test. |
+| 5 | MEDIUM | The recipe inherited the full launching environment; the other adapter's prefix and `PATH`/`PYTHONPATH`/`LD_PRELOAD` were neither filtered nor recorded | Fixed: foreign prefixes are dropped and the toolchain variables are bound by digest. Two tests. |
+| 6 | MEDIUM | Lock keys were raw strings, so `source:/x`, `source:/x/` and `source:/x/.` took three leases on one directory | Fixed: the path component is resolved before hashing. One test. |
+| 7 | LOW | The plugin hook's 30 s CLI timeout could expire during a cold-cache `verify` (measured 23 s on this checkout) and read as "receipt invalid" | Fixed: 60 s inside the hook's 75 s bound, with a distinct timeout message. |
+
+The fixes changed the adapter scripts, which correctly turned every round-1 receipt `STALE`; the real-machine acceptance was re-run as round 2 (see [P1 equivalence](p1-equivalence.md)) and reproduced every verdict. The review also found no issue in: `shell=True`/`os.system`/`eval` (none present), orphaned children or foreign kills, manifest pin escape, NPU device selection or reset, and receipt replay. Its verdict — "not yet safe to publish" — was answered by fixing items 1–7 before the second push.

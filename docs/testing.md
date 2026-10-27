@@ -8,15 +8,15 @@ Two layers are tested separately: the offline suite (no Docker, compiler or devi
 python3 -m pytest -q tests/
 ```
 
-Current result: **441 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
+Current result: **452 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
 
 | File | Tests | Subtests | Covers |
 | --- | ---: | ---: | --- |
 | `test_core.py` | 33 | — | Manifest schema and digest pinning, `{pack}` expansion, registry, evaluator types, engine ordering, locks, evidence store, CLI |
 | `test_core_audit.py` | 1 | — | Persisted audit references and the deliberate corrections list |
-| `test_negative_correctness.py` | 65 | — | Type-strict observations, zero/all-skipped runs, config preflight, source mutation, receipt corruption and staleness, artifact identity |
+| `test_negative_correctness.py` | 71 | — | Type-strict observations, zero/all-skipped runs, config preflight, source mutation, receipt corruption and staleness, artifact identity, unknown aggregate statuses, supervisor deadline, lock-key normalisation, inherited-environment binding |
 | `test_adapters_ascend.py` | 90 | 3 | Ascend bridge: argv, timeouts, bind-mount mapping, host/container identity, preflight |
-| `test_adapters_tilelang.py` | 176 | 4 | TileLang and NPU bridges, statistics contract, JUnit handling, device authorization, occupancy probe |
+| `test_adapters_tilelang.py` | 181 | 4 | TileLang and NPU bridges, statistics contract, JUnit handling, device authorization, occupancy probe (including unreadable driver layouts), container-script quoting |
 | `test_adapters_raw_reports.py` | 7 | 70 | Malformed container facts cannot become a PASS |
 | `test_adapters_packaging.py` | 5 | — | Adapter data layout, `--check-config` presence, shipped deployment files, template neutrality |
 | `test_equivalence_gates.py` | 54 | — | Frozen original contracts for all five gates versus the migrated evaluator |
@@ -27,7 +27,10 @@ Current result: **441 passed, 88 subtests passed**, exit 0. No network, Docker, 
 - **Nothing is accepted by coercion.** `True` and `1` are different; duplicate JSON keys and `NaN`/`Infinity` are rejected; a missing observation fails.
 - **Zero tests, all-skipped runs and CPU fallbacks fail.** Boolean claims cannot hide bad counts, and the NPU gate requires measured tensor movement, numerical assertions, device memory and synchronization.
 - **Configuration is checked before dispatch.** A failing or missing `configCheck` yields `BLOCKED_ENV` with no recipe process; a config check that mutates source yields `STALE`.
-- **The NPU card is probed, not assumed.** A busy card, an unreadable driver, a missing `npu-smi`, a timeout, a device absent from the mapping table and a card that becomes busy between the two probes all refuse dispatch. The probe never selects, resets or substitutes a device.
+- **The NPU card is probed, not assumed.** A busy card, an unreadable driver, a missing `npu-smi`, a timeout, a device absent from the mapping table and a card that becomes busy between the two probes all refuse dispatch. So does an answer the parser cannot read in full: a process row whose layout drifted, a table with neither a row nor the driver's `No process in device.` marker, and a table claiming both processes and an idle card. The probe never selects, resets or substitutes a device.
+- **Unknown states cannot aggregate to PASS.** `aggregate()` returns PASS only when every gate is literally `PASS`; an empty run is `NOT_RUN` and an unrecognised status is `INVALID_EVIDENCE`, so a receipt written by a bug cannot verify as valid.
+- **Machine-file values are data inside the container script.** Values that reach `bash -c` are emitted as single-quoted literals, because inside double quotes a `$(...)` would execute in the container.
+- **Leases are per resource, not per spelling.** Lock keys resolve their path component, so two spellings of one build directory cannot take two leases.
 - **Receipts are revalidated.** Mutating the receipt, logs, source, manifest, script or a product downgrades a recorded PASS to `INVALID_EVIDENCE` or `STALE`.
 - **Fixtures cannot escape.** A pinned file path outside the adapter directory is a `ManifestError`.
 
@@ -44,13 +47,15 @@ agent-gates verify --run-id RUN_ID --evidence-root DIR --json
 
 Constraints observed for every real run: existing build trees only, Ninja capped at 2 jobs, no image rebuild, no Conda reset, no container stop, no tracked-source modification, no NPU unless a device is explicitly assigned.
 
-| Adapter | Result | Run ID | Evidence |
+| Adapter | Result | Run ID (current) | Evidence |
 | --- | --- | --- | --- |
-| `ascendnpu-ir` | PASS | `c1610b674026bc2156c1a3ccedb48ee0` | build + regression; 1142 discovered / 1023 passed / 119 unsupported |
-| `tilelang-hivm` | PASS | `181cad5aa72c8893043f4a53f7b2e79b` | build + regression; 14 collected / 14 passed / 12 native libs |
-| `tilelang-hivm-npu` | BLOCKED_ENV | `414c2ca7aaf5880ec7e7711545e8475e` | no assigned device id |
-| `tilelang-hivm-npu` device 0 | BLOCKED_ENV | `a0c167250ab7c79a1e286ddf4e8cd7c2` | card held by another job |
-| `tilelang-hivm-npu` device 1 | BLOCKED_ENV | `a3428763b378f1b6a0297b4bf42c8c97` | card held by another job |
+| `ascendnpu-ir` | PASS | `52ea3b30495dba9d086cabe0dc9c38bb` | build + regression; 1142 discovered / 1023 passed / 119 unsupported |
+| `tilelang-hivm` | PASS | `61ed95d533a314da934e4e8e6cd6eca7` | build + regression; 14 collected / 14 passed / 12 native libs |
+| `tilelang-hivm-npu` | BLOCKED_ENV | `e6d1680cd9b2972d645729089cc5a1ae` | no assigned device id |
+| `tilelang-hivm-npu` device 0 | BLOCKED_ENV | `57063f7d46de74f1cee9b8ac87c761ff` | card held by another job (7 holders) |
+| `tilelang-hivm-npu` device 1 | BLOCKED_ENV | `b767bf002a52e80b721ab1180f927e72` | card held by another job (4 holders) |
+
+These are the round-2 runs, taken after the review fixes changed the adapter scripts; the round-1 receipts are retained under `.evidence/p1-runs` and now verify as `STALE` (`ADAPTER_IDENTITY_CHANGED`), which is the correct outcome for evidence taken against different adapter bytes.
 
 `verify` returned `valid: true` for the two PASS runs and `valid: false` for the blocked ones, which is the correct outcome: a blocked gate satisfies no requirement.
 

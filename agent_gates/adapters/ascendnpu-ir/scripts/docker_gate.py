@@ -399,9 +399,13 @@ def container_script(source_root: str, build: str, jobs: str, timeout: int,
         init_snippet(),
         f'init_toolchain {init_args(cann, conda_sh, conda_env)} '
         '|| fail "toolchain initialization failed"',
-        f'cd {shlex.quote(source_root)} || fail "cannot enter {source_root}"',
+        # Messages that carry an env-file value are single-quoted literals:
+        # inside double quotes a `$(...)` in the value would execute in the
+        # container, which would make the machine file code rather than data.
+        f'cd {shlex.quote(source_root)} '
+        f'|| fail {shlex.quote(f"cannot enter {source_root}")}',
         f'[ -f {shlex.quote(build)}/build.ninja ] '
-        f'|| fail "no {build}/build.ninja under {source_root}; initialize the build directory first"',
+        f'|| fail {shlex.quote(f"no {build}/build.ninja under {source_root}; initialize the build directory first")}',
         f'exec timeout --signal=TERM --kill-after={KILL_AFTER_SECONDS} {timeout} '
         f'ninja -C {shlex.quote(build)} -j {jobs} "$@"',
     ]

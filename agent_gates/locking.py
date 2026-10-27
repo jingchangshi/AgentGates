@@ -10,10 +10,25 @@ class LockBusy(RuntimeError):
     pass
 
 
+def normalise(resource: str) -> str:
+    """One lease per on-disk resource, however its path is spelled.
+
+    Keys are hashed strings, so `source:/x`, `source:/x/` and `source:/x/.`
+    used to be three different leases for one directory and two runs could
+    share a build tree. Any absolute path after the `prefix:` is resolved;
+    non-path keys such as `npu:3` are left exactly as written.
+    """
+    prefix, separator, value = resource.partition(":")
+    if separator and value.startswith("/"):
+        return f"{prefix}:{os.path.realpath(value)}"
+    return resource
+
+
 class ResourceLock:
     def __init__(self, resource: str, root: Path | None = None):
         # One namespace per host user, independent of evidence-directory selection.
         self.root = Path(root) if root else Path.home() / ".local/state/agent-gates/locks"
+        resource = normalise(resource)
         self.path = self.root / (hashlib.sha256(resource.encode()).hexdigest() + ".lock")
         self.resource = resource
         self.fd = None

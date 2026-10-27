@@ -26,28 +26,30 @@ Source HEADs: AscendNPU-IR `bfefe18011152cca671e7e6ddf03793afbacaa2a`; TileLang 
 
 | Adapter | `doctor` | `run` | Run ID | Gates | `verify` |
 | --- | --- | --- | --- | --- | --- |
-| `ascendnpu-ir` | PASS 0.192 s `408db982743005773b0720bc32eca0c7` | PASS 56.473 s | `c1610b674026bc2156c1a3ccedb48ee0` | build PASS, regression PASS | `valid: true` |
-| `tilelang-hivm` | PASS 0.197 s `e674eb1a85d46179c0d89ba22e6996cb` | PASS 20.247 s | `181cad5aa72c8893043f4a53f7b2e79b` | build PASS, regression PASS (14/14, 12 native libs) | `valid: true` |
-| `tilelang-hivm-npu` | BLOCKED_ENV `3b5f392b58f3f5fde72b0b9ec3db9b4b` | BLOCKED_ENV | `414c2ca7aaf5880ec7e7711545e8475e` | no device assignment | `valid: false` |
+| `ascendnpu-ir` | PASS 0.196 s `4f713ee9129568c83fde8b2887180360` | PASS 57.873 s | `52ea3b30495dba9d086cabe0dc9c38bb` | build PASS, regression PASS | `valid: true` |
+| `tilelang-hivm` | PASS 0.195 s `59f4093c1f2c1c44b7318b2919bbc2dc` | PASS 21.057 s | `61ed95d533a314da934e4e8e6cd6eca7` | build PASS, regression PASS (14/14, 12 native libs) | `valid: true` |
+| `tilelang-hivm-npu` | BLOCKED_ENV `2f5ee7dc81905e8805acc2ac7f017cd8` | BLOCKED_ENV | `e6d1680cd9b2972d645729089cc5a1ae` | no device assignment | `valid: false` |
 
-An occupancy probe with explicit device ids (read-only host `npu-smi`; container `npu-smi` cannot load `libc_sec.so`) blocked both visible cards with `CONFIG_CHECK_FAILED`: device 0, run `a0c167250ab7c79a1e286ddf4e8cd7c2`, "already in use by 2 process(es) this Gate did not start"; device 1, run `a3428763b378f1b6a0297b4bf42c8c97`, 5 such processes. Both `verify` `valid: false`.
+These are the round-2 runs, taken after the independent review's fixes changed the adapter scripts. Round 1 (`c1610b67…`, `181cad5a…`, `414c2ca7…`) is retained under `.evidence/p1-runs` and now verifies as `STALE` (`ADAPTER_IDENTITY_CHANGED`), which is the correct outcome for evidence taken against different adapter bytes; the current evidence root is `.evidence/p1-runs-r2`.
 
-Offline suite: **441 passed, 88 subtests passed, exit 0**, logged to ignored `.evidence/final-pytest.log`; the earlier 439 figure was the same suite before two packaging tests were added. Isolated wheel proof (`.evidence/check_wheel.py`): PASS — the wheel contains every manifest-pinned file and the adapter deployment files, and no `env.sh`, `config.env`, `__pycache__` or machine configuration; it installs into a fresh venv away from the checkout where `agent-gates list --json` works and `engineering`, `anthropic`, `claude_code` are not importable. A fresh clone of the branch also passes the suite (441 tests) and `claude plugin validate`.
+An occupancy probe with explicit device ids (read-only host `npu-smi`; container `npu-smi` cannot load `libc_sec.so`) blocked both visible cards with `CONFIG_CHECK_FAILED`: device 0, run `57063f7d46de74f1cee9b8ac87c761ff`, "already in use by 7 process(es) this Gate did not start"; device 1, run `b767bf002a52e80b721ab1180f927e72`, 4 such processes. Both `verify` `valid: false`. The holder counts differ from round 1 because they are a live reading of a shared machine.
+
+Offline suite: **452 passed, 88 subtests passed, exit 0**, logged to ignored `.evidence/final-pytest.log`. The count grew from 441 because the review fixes added eleven regression tests, one or more per confirmed defect; the earlier 439 figure was the suite before the two packaging tests. Isolated wheel proof (`.evidence/check_wheel.py`): PASS — the wheel contains every manifest-pinned file and the adapter deployment files, and no `env.sh`, `config.env`, `__pycache__` or machine configuration; it installs into a fresh venv away from the checkout where `agent-gates list --json` works and `engineering`, `anthropic`, `claude_code` are not importable. A fresh clone of the branch also passes the suite (441 tests) and `claude plugin validate`.
 
 ### P2 — Claude Code plugin
 
-`claude plugin validate ./integrations/claude-code` passes with no warnings (re-run during this report). A fresh session (Claude Code 2.1.296, session `63e5fbf2-2815-4f03-995f-3b8d3bff4117`) exited 0 after 243.3 s. Its `init` event records the plugin as `agent-gates@inline` v0.1.0 contributing exactly three AgentGates skills — `agent-gates:doctor`, `agent-gates:verify`, `agent-gates:report`, all `disable-model-invocation: true` — alongside the harness's own global skills; the `TaskCompleted` hook is registered from `hooks/hooks.json`, though no `TaskCompleted` event occurred in this session. The session reported model `group/auto-deepseek-v4-1-flash`, flagged `unrecognized_model`; it was **not** Opus.
+`claude plugin validate ./integrations/claude-code` passes with no warnings (re-run during this report). Two fresh sessions were run. Round 1 (Claude Code 2.1.296, session `63e5fbf2-2815-4f03-995f-3b8d3bff4117`) exited 0 after 243.3 s and was taken before the review fixes changed the adapter scripts; its receipts now verify `STALE` / `ADAPTER_IDENTITY_CHANGED`. Round 2 (session `e8fbc41e-0bbf-42b4-b522-15d8bf8e5381`) exited 0 after 201.6 s and is the current evidence. Both `init` events record the plugin as `agent-gates@inline` v0.1.0 contributing exactly three AgentGates skills — `agent-gates:doctor`, `agent-gates:verify`, `agent-gates:report`, all `disable-model-invocation: true` — alongside the harness's own global skills; the `TaskCompleted` hook is registered from `hooks/hooks.json`, though no `TaskCompleted` event occurred in either session. Both sessions reported model `group/auto-deepseek-v4-1-flash`, flagged `unrecognized_model`; neither was Opus.
 
-Plugin-initiated runs on the TileLang checkout: doctor PASS `1bab01b8adab80325a3becf9ee9ecf0d`; run PASS `74e428e9818aa75ad7fb1b95f20032bc`; verify `valid: true`; report PASS. This duplicates the P1 TileLang source, **not** a third independent validation.
+Round-2 plugin-initiated runs on the TileLang checkout (evidence root `.evidence/p2-plugin-runs-r2`): doctor PASS `9d59fc2378fcadaafb5d0f949f4498ba`; run PASS `a62906a815e77f9001c706c0c932b7dc` (build 0.616 s, regression 8.13 s, 13 bound artifacts); verify `valid: true`; report PASS. This duplicates the P1 TileLang source, **not** a third independent validation. Round 1's `1bab01b8…` and `74e428e9…` are retained and verify `STALE`.
 
-Two isolated worktree exercises both FAILED:
+Two isolated worktree exercises both FAILED in both rounds; round-2 run IDs (`.evidence/p2-worktree-runs-r2`):
 
 | Worktree | Change | Run ID | Result |
 | --- | --- | --- | --- |
-| `ascend-dev` | Whitespace-only fix in `bishengir/test/Transforms/canonicalize-module.mlir:9` | `6b14a3dc48720c0ef9738823554ae358` | FAIL: build `NONZERO_EXIT`, recipe exit 3 (no `build/build.ninja`); regression `NOT_RUN` |
-| `tilelang-dev` | One assertion at `testing/ascend/target/test_tilelang_ascend_target.py:30` | `b1e29f54789df1a328bb3fd891aaf8e3` | FAIL: build `NONZERO_EXIT`, recipe exit 2 (no build directory); regression `NOT_RUN` |
+| `ascend-dev` | Whitespace-only fix in `bishengir/test/Transforms/canonicalize-module.mlir:9` | `b2ef7ee46e15cfe90313f099de2a8afd` | FAIL: build `NONZERO_EXIT`, recipe exit 3 (no `build/build.ninja`); regression `NOT_RUN` |
+| `tilelang-dev` | One assertion at `testing/ascend/target/test_tilelang_ascend_target.py:30` | `62eec6254852af279ace6b5651e365e1` | FAIL: build `NONZERO_EXIT`, recipe exit 2 (no build directory); regression `NOT_RUN` |
 
-Both `verify` results were `valid: false`. Neither run was redirected to the original checkouts; both worktree diffs remain uncommitted.
+Both `verify` results were `valid: false`. Neither run was redirected to the original checkouts; both worktree diffs remain uncommitted. Round 1's `6b14a3dc…` and `b1e29f54…` are retained and verify `STALE`.
 
 ## Architecture
 
@@ -60,19 +62,21 @@ Both `verify` results were `valid: false`. Neither run was redirected to the ori
 | Original recipes still pass | P0 baseline, four gates | Verified |
 | CLI reproduces gate outcomes | P1 runs, matching counts | Verified |
 | No Harness/Claude runtime dependency | Wheel install + import assertions | Verified |
-| Offline correctness | 441 tests, 88 subtests, exit 0 (`.evidence/final-pytest.log`) | Verified |
+| Offline correctness | 452 tests, 88 subtests, exit 0 (`.evidence/final-pytest.log`) | Verified |
 | Plugin loads and runs gates | Real session, three plugin skills, run PASS | Verified |
 | Repository private | Auth `ls-remote` exit 0; nonexistent-repo control 128; anonymous API 404 vs public 200; 102-repo public listing omits it | Proven private |
 | NPU gate on hardware | None in any phase | Not measured |
-| Independent Opus review | `claude-opus-5` `model_not_found`; exact-name retry `333e2661-73d9-4bed-b7f8-eaaca366281a` gave no verdict | **No completed review** |
+| Independent Opus review | `claude-opus-5` `model_not_found`; exact-name retry `333e2661-73d9-4bed-b7f8-eaaca366281a` gave no verdict | **No completed Opus review** |
+| Independent review (default model, not Opus) | Seven confirmed defects, all reproduced by the lead and fixed, with eleven new regression tests; round-2 real-machine runs reproduce every verdict | Completed, see [ledger](progress.md#independent-review) |
 
 ## Deliberately stricter than the legacy path
 
 1. **Type-strict observations** — legacy `observed.get(k) == expected` accepted `1` for `true`; the migrated evaluator requires identical types and rejects duplicate keys and non-finite numbers.
-2. **Ascend preflight** — the legacy Ascend manifest had no `configCheck`; a read-only `--check-config` now yields `BLOCKED_ENV` before any Ninja target starts.
-3. **Artifact binding** — products are recorded and re-checked after the run; a changed `.so` is `STALE`, an unbound native artifact `INVALID_EVIDENCE`, closing the P0 gap going forward.
-4. **NPU occupancy probe** — a read-only host `npu-smi` probe runs in preflight and again before dispatch; a busy or unreadable card is `BLOCKED_ENV`. The legacy adapter had none.
-5. **Receipt revalidation** — a PASS is current only while `verify` returns `valid: true`.
+2. **Positive PASS aggregation** — an overall PASS now requires every gate to be literally `PASS`; an unrecognised status is `INVALID_EVIDENCE` rather than falling through to a pass, so a receipt written by a bug cannot verify as valid.
+3. **Ascend preflight** — the legacy Ascend manifest had no `configCheck`; a read-only `--check-config` now yields `BLOCKED_ENV` before any Ninja target starts.
+4. **Artifact binding** — products are recorded and re-checked after the run; a changed `.so` is `STALE`, an unbound native artifact `INVALID_EVIDENCE`, closing the P0 gap going forward.
+5. **NPU occupancy probe** — a read-only host `npu-smi` probe runs in preflight and again before dispatch; a busy card, an unreadable driver, or an answer the parser cannot read in full is `BLOCKED_ENV`. The legacy adapter had none.
+6. **Receipt revalidation** — a PASS is current only while `verify` returns `valid: true`.
 
 ## Known limitations and what is not proven
 
@@ -81,7 +85,7 @@ Both `verify` results were `valid: false`. Neither run was redirected to the ori
 - **Local trust only.** Receipts are per-user HMAC (`local-user-integrity`), not externally signed, and cannot resist a same-OS-user process.
 - **Occupancy is a snapshot** and cannot see a job starting after the probe.
 - **The plugin's full isolated-worktree loop was not demonstrated** — both exercises stopped at missing build configuration.
-- **The `TaskCompleted` hook was exercised only by offline tests**, not by a real task-completion event.
+- **The `TaskCompleted` hook was never fired by a real task-completion event.** It is covered by offline tests and by two manual invocations against real receipts — a round-2 PASS (exit 0) and a round-2 `BLOCKED_ENV` receipt (exit 2) — but no `TaskCompleted` event occurred in any recorded session.
 - Also unestablished: compiler semantic correctness, coordination with other users' jobs, and a completed Opus review. Equivalence does not extend to Harness scheduling, approvals or model routing.
 
 ## Reproduction

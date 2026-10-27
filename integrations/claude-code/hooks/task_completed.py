@@ -18,8 +18,15 @@ class ReceiptError(ValueError):
 
 
 def cli_json(arguments, run=subprocess.run):
-    completed = run(['agent-gates', *arguments, '--json'], capture_output=True,
-                    text=True, timeout=30, check=False)
+    # `verify` re-hashes the whole source tree and every bound artifact. On a
+    # large checkout with a cold page cache that takes longer than 30s, and a
+    # timeout here would read to the user as "receipt invalid" when the
+    # receipt is fine. hooks.json allows 75s for this hook; leave room inside.
+    try:
+        completed = run(['agent-gates', *arguments, '--json'], capture_output=True,
+                        text=True, timeout=60, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ReceiptError('verification timed out; the receipt was not evaluated') from exc
     try:
         result = json.loads(completed.stdout)
     except (ValueError, TypeError) as exc:

@@ -464,15 +464,35 @@ def npu_id_of_physical(device: str) -> str:
 def processes_on(npu_id: str) -> list[tuple[str, str]]:
     """The `(pid, name)` pairs `npu-smi` reports for one NPU ID.
 
-    The report must name the queried NPU ID; anything else is a driver answer
-    this Gate does not understand and is treated as unknown occupancy.
+    The answer must be structurally recognisable in full: it has to name the
+    queried NPU ID, and every process row it prints has to match the documented
+    layout, or the table has to say in the driver's own words that the device
+    is idle. A row this Gate cannot read means the driver's format changed, and
+    a format this Gate cannot read is unknown occupancy, never a free card.
+    Anything else - an empty table, a partially matching table, a different
+    layout - is a BridgeError.
     """
     text = npu_smi('-t', 'proc-mem', '-i', npu_id)
     if not re.search(rf'^\s*NPU ID\s*:\s*{re.escape(npu_id)}\s*$', text, re.MULTILINE):
         raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
                           f'did not report NPU ID {npu_id}')
+    # The driver prints this sentence, and only this sentence, when the device
+    # holds nothing. It is an explicit statement, not the absence of rows.
+    idle = len(re.findall(r'^\s*No process in device\.?\s*$', text, re.MULTILINE))
     pattern = re.compile(r'Process id:(\d+)\s+Process name:(\S+)\s+Process memory\(MB\):(\d+)')
-    return [(match.group(1), match.group(2)) for match in pattern.finditer(text)]
+    rows = [(match.group(1), match.group(2)) for match in pattern.finditer(text)]
+    announced = len(re.findall(r'Process id:', text))
+    if rows and idle:
+        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                          f'reported both processes and an idle device')
+    if len(rows) != announced:
+        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                          f'reported {announced} process row(s) but only {len(rows)} matched the known '
+                          f'layout; the driver answer is not understood')
+    if not rows and not idle:
+        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                          f'neither listed a process nor said the device is idle')
+    return rows
 
 
 def require_device_free(device: str) -> str:
@@ -733,21 +753,30 @@ def container_script(source_root: str, timeout: int, device: str,
         'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH',
         'export PYTHONDONTWRITEBYTECODE=1',
     ]
+    # Every message that carries a machine-file or command-line value is
+    # emitted as a single-quoted literal. `fail "text {value}"` would expand
+    # `$(...)` or backticks inside the container, which would make a value read
+    # from env.sh executable code and break the rule that the file is data.
     if cann is not None:
-        lines.append(f'[ -r {shlex.quote(str(cann))} ] || fail "CANN setup not readable: {cann}"')
+        lines.append(f'[ -r {shlex.quote(str(cann))} ] '
+                     f'|| fail {shlex.quote(f"CANN setup not readable: {cann}")}')
         lines.append(f'. {shlex.quote(str(cann))}')
     if conda_sh is not None and conda_env:
-        lines.append(f'[ -r {shlex.quote(str(conda_sh))} ] || fail "conda.sh not readable: {conda_sh}"')
+        lines.append(f'[ -r {shlex.quote(str(conda_sh))} ] '
+                     f'|| fail {shlex.quote(f"conda.sh not readable: {conda_sh}")}')
         # The directory comes from the machine file and from nowhere else. A
         # guessed `$HOME/.conda/envs` used to stand in for it, which meant the
         # Gate searched a directory the operator had not written down.
         if conda_envs_path is not None:
-            lines.append(f'export CONDA_ENVS_PATH="{shlex.quote(str(conda_envs_path))}'
-                         f'${{CONDA_ENVS_PATH:+:$CONDA_ENVS_PATH}}"')
+            # Concatenation, not a quoted value inside double quotes: the
+            # latter would keep the quotes as literal characters in the path.
+            lines.append(f'export CONDA_ENVS_PATH={shlex.quote(str(conda_envs_path))}'
+                         f'"${{CONDA_ENVS_PATH:+:$CONDA_ENVS_PATH}}"')
         lines.append(f'. {shlex.quote(str(conda_sh))}')
         lines.append(f'conda activate {shlex.quote(conda_env)} '
-                     f'|| fail "conda activate {conda_env} failed"')
-    lines.append(f'cd {shlex.quote(source_root)} || fail "cannot enter {source_root}"')
+                     f'|| fail {shlex.quote(f"conda activate {conda_env} failed")}')
+    lines.append(f'cd {shlex.quote(source_root)} '
+                 f'|| fail {shlex.quote(f"cannot enter {source_root}")}')
     lines.append(f'[ -f {shlex.quote(GATE_TEST)} ] || fail "Gate test file is missing: {GATE_TEST}"')
     lines.append('tmp=$(mktemp -d) || fail "cannot create a temporary directory"')
     lines.append(f'timeout --signal=TERM --kill-after={KILL_AFTER_SECONDS} {timeout} '

@@ -20,6 +20,13 @@ ENV_KEYS = {"ascendnpu-ir": "ASCENDNPU_ENV_FILE", "tilelang-hivm": "TILELANG_HIV
 # other users' process ids, nothing the receipt should not carry.
 REASON_LIMIT = 300
 
+# Variables that change which toolchain, interpreter or libraries the recipe
+# executes without appearing in the adapter's own prefix. They are inherited
+# from the launching shell, so the receipt binds them by hash: two runs of the
+# same recorded argv must not resolve to different compilers while their
+# configuration hash stays identical. Values are never written to a receipt.
+EXECUTION_ENV = ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "HOME", "SHELL")
+
 
 def config_reason(check):
     reference = check.get("stderr") or check.get("stdout") or {}
@@ -38,6 +45,13 @@ def config_reason(check):
 
 def environment(manifest: Manifest, env_file: Path | None = None, device_id: str | None = None):
     env = dict(os.environ)
+    # An adapter reads only its own prefix. Inheriting the other adapter's
+    # prefix would let a stray export (a build subdirectory, a Ninja job count)
+    # steer this run without being part of what `configuration()` hashes.
+    own = "ASCENDNPU_" if manifest.id == "ascendnpu-ir" else "TILELANG_HIVM_"
+    for name in [name for name in env
+                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_")) and not name.startswith(own)]:
+        del env[name]
     if env_file is not None:
         if not Path(env_file).is_absolute():
             raise ValueError("--env-file must be an absolute path")
@@ -71,7 +85,16 @@ def configuration(manifest, env):
     # No secrets are copied to the receipt. Configuration files are hashed as data.
     prefix = "ASCENDNPU_" if manifest.id == "ascendnpu-ir" else "TILELANG_HIVM_"
     assignments = "\0".join(f"{key}={value}" for key, value in sorted(env.items()) if key.startswith(prefix))
-    return {"files": references, "environmentSha256": hashlib.sha256(assignments.encode()).hexdigest()}
+    # Inherited variables that select a toolchain are bound by hash only. They
+    # are recorded so two runs under different toolchains cannot present the
+    # same configuration identity; `verify` deliberately does not re-derive
+    # them, because the verifying shell's PATH is not the running shell's and
+    # a changed PATH would otherwise mark every receipt STALE. No value is
+    # stored: only the digest.
+    inherited = "\0".join(f"{name}={env.get(name, '')}" for name in EXECUTION_ENV)
+    return {"files": references,
+            "environmentSha256": hashlib.sha256(assignments.encode()).hexdigest(),
+            "inheritedEnvironmentSha256": hashlib.sha256(inherited.encode()).hexdigest()}
 
 
 def artifact_inputs(source, manifest, env):
