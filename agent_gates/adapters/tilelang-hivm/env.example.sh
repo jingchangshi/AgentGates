@@ -26,8 +26,8 @@
 #     chmod 600 env.sh
 #
 # `env.sh` is git-ignored, so it is never committed and never leaves the
-# machine. `PackStore.install` skips it, and the manifest pins only `scripts/`,
-# so a Pack reinstall never overwrites it.
+# machine. The Adapter manifest pins only `scripts/`, so the Gate reads this
+# file at run time and no adapter install or upgrade overwrites it.
 #
 # ---------------------------------------------------------------------------
 # Two locations, in this order

@@ -776,7 +776,16 @@ def container_script(source_root: str, timeout: int, device: str,
     if cann is not None:
         lines.append(f'[ -r {shlex.quote(str(cann))} ] '
                      f'|| fail {shlex.quote(f"CANN setup not readable: {cann}")}')
-        lines.append(f'. {shlex.quote(str(cann))}')
+        # A readability check is not a load check. `set_env.sh` can be present
+        # and still fail (a partially installed CANN, a path that exists but is
+        # not a setup script), and without this status check the shell would
+        # carry on into the runner with no CANN on the loader path - surfacing
+        # much later as an ImportError inside pytest, which the Gate would then
+        # record as a test failure. The other two bridges call
+        # `scripts/init-toolchain.sh`, which checks exactly this; this Adapter
+        # inlines its own toolchain lines, so it checks them here.
+        lines.append(f'. {shlex.quote(str(cann))} '
+                     f'|| fail {shlex.quote(f"failed to source CANN setup: {cann}")}')
     if conda_sh is not None and conda_env:
         lines.append(f'[ -r {shlex.quote(str(conda_sh))} ] '
                      f'|| fail {shlex.quote(f"conda.sh not readable: {conda_sh}")}')
@@ -788,7 +797,8 @@ def container_script(source_root: str, timeout: int, device: str,
             # latter would keep the quotes as literal characters in the path.
             lines.append(f'export CONDA_ENVS_PATH={shlex.quote(str(conda_envs_path))}'
                          f'"${{CONDA_ENVS_PATH:+:$CONDA_ENVS_PATH}}"')
-        lines.append(f'. {shlex.quote(str(conda_sh))}')
+        lines.append(f'. {shlex.quote(str(conda_sh))} '
+                     f'|| fail {shlex.quote(f"failed to source conda.sh: {conda_sh}")}')
         lines.append(f'conda activate {shlex.quote(conda_env)} '
                      f'|| fail {shlex.quote(f"conda activate {conda_env} failed")}')
     lines.append(f'cd {shlex.quote(source_root)} '

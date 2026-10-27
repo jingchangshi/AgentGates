@@ -2064,6 +2064,27 @@ class NpuRunsAsRootCase(_FakeDockerCase):
                                       conda_envs_path=Path('/home/someone/.conda/envs'))
         self.assertIn('${CONDA_ENVS_PATH:+:$CONDA_ENVS_PATH}', script)
 
+    def test_a_toolchain_that_fails_to_load_stops_the_script(self):
+        # A readability check is not a load check. Sourcing an unreadable-but-
+        # listed or broken CANN/conda setup used to continue into the runner
+        # with no toolchain on the path, surfacing later as an ImportError
+        # inside pytest - which the Gate would record as a test failure. The
+        # other two bridges call init-toolchain.sh, which checks the status.
+        script = npu.container_script('/src', 900, '0', Path('/data/cann/set_env.sh'),
+                                      Path('/data/conda.sh'), 'myenv')
+        lines = script.splitlines()
+        for source, message in (('. /data/cann/set_env.sh', 'failed to source CANN setup'),
+                                ('. /data/conda.sh', 'failed to source conda.sh')):
+            index = next(number for number, line in enumerate(lines)
+                         if line.startswith(source))
+            self.assertIn('|| fail', lines[index], lines[index])
+            self.assertIn(message, lines[index])
+        # The checks happen in the fixed order: CANN, conda.sh, activate, runner.
+        order = [line for line in lines if line.startswith(('. /data/cann', '. /data/conda', 'conda activate'))]
+        self.assertEqual([line.split()[0] for line in order], ['.', '.', 'conda'])
+        activate = next(number for number, line in enumerate(lines) if line.startswith('conda activate'))
+        self.assertIn('|| fail', lines[activate])
+
 
 
 
