@@ -9,5 +9,8 @@ dist/
 .evidence/
 .agent-gates/
 *.env
+# Machine configuration is ignored by name; the reviewed, all-empty
+# templates that ship with the Adapters are not machine configuration.
+!config.example.env
 env.sh
 .claude/
