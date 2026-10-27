@@ -16,4 +16,9 @@ agent-gates = "agent_gates.cli:main"
 include = ["agent_gates*"]
 
 [tool.setuptools.package-data]
-agent_gates = ["adapters/*/manifest.json", "adapters/*/scripts/*", "adapters/*/env.example.sh", "adapters/*/README.md"]
+# Deployment files (Dockerfile, entry.sh, create-container.sh and the
+# all-empty config.example.env) ship too: a reader of an installed wheel must
+# be able to create the container the Adapters address. A real config.env is
+# never packaged, because it is not named here and is git-ignored.
+agent_gates = ["adapters/*/manifest.json", "adapters/*/scripts/*", "adapters/*/env.example.sh",
+               "adapters/*/README.md", "adapters/*/docker/*"]
