@@ -75,7 +75,11 @@ CGROUPNS="${CGROUPNS:-host}"
 SECURITY_OPTS="${SECURITY_OPTS:-label=disable}"
 SHM_SIZE="${SHM_SIZE:-512g}"
 MEMLOCK="${MEMLOCK:-150000000000:150000000000}"
-ASCEND_VISIBLE_DEVICES="${ASCEND_VISIBLE_DEVICES-0,1}"
+# Omitted means no filtering, not "every card on this host". Defaulting to a
+# literal device list would let a configuration file that simply leaves the
+# line out expose cards nobody allocated to this container; an explicit value
+# is the only way to name devices.
+ASCEND_VISIBLE_DEVICES="${ASCEND_VISIBLE_DEVICES-}"
 NPU_DEVICES="${NPU_DEVICES:-}"
 BIND_MOUNTS="${BIND_MOUNTS:-}"
 OPTIONAL_BIND_MOUNTS="${OPTIONAL_BIND_MOUNTS:-}"

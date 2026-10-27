@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -43,7 +44,8 @@ def local_engine(tmp_path, sandbox, *, adapter='fixture', code="print('{}')", co
     if config is not None:
         recipe['configCheck'] = [sys.executable, '-I', '{pack}/gate.py', '--check']
         script.write_text('import sys\nif "--check" in sys.argv:\n    raise SystemExit(' + str(config) + ')\n' + code + '\n')
-    raw = {'schemaVersion': 1, 'id': adapter, 'files': {'gate.py': digest(script)}, 'recipes': [recipe],
+    raw = {'schemaVersion': 1, 'id': adapter, 'files': {'gate.py': digest(script)},
+           'permissions': {'sourceWrite': False, 'hostExecution': True}, 'recipes': [recipe],
            'gates': [{'id': 'fixture-gate', 'gateType': 'deterministic-test', 'recipeId': recipe['id'],
                       'observationChecks': checks or {'exitCodeZero': True}}]}
     (directory / 'manifest.json').write_text(json.dumps(raw))
@@ -272,6 +274,9 @@ def test_receipt_binds_actual_loaded_native_outside_default_build_dirs(tmp_path,
             stdout = os.fsencode(str(sandbox)) + b'\n'
         elif args == ('rev-parse', 'HEAD'):
             stdout = b'0123456789012345678901234567890123456789\n'
+        elif args[:2] == ('config', '--get'):
+            # No global ignore file in this fixture; the checkout has none either.
+            return subprocess.CompletedProcess(args, 1, stdout=b'', stderr=b'')
         elif args[0] == 'ls-files':
             stdout = b'program.txt\0tilelang/__init__.py\0'
         else:
@@ -316,6 +321,39 @@ def test_source_byte_identity_detects_untracked_changes(sandbox):
     before = snapshot(sandbox)
     (sandbox / 'new.py').write_text('value = 1\n')
     assert snapshot(sandbox) != before
+
+
+def _init_repo(path):
+    run = lambda *args: subprocess.run(['git', '-C', str(path), *args], check=True,
+                                       capture_output=True)
+    run('init', '-q')
+    run('config', 'user.email', 'gate@example.invalid')
+    run('config', 'user.name', 'gate')
+    run('config', 'core.excludesFile', '/dev/null')
+    (path / 'a.py').write_text('value = 1\n')
+    run('add', 'a.py')
+    run('commit', '-qm', 'init')
+
+
+def test_git_exclusion_rules_are_bound_into_source_identity(tmp_path):
+    # `ls-files --others --exclude-standard` honours `.git/info/exclude` and
+    # `core.excludesFile`. Neither file is part of the tracked tree, so without
+    # binding them a writer can hide arbitrary bytes from the snapshot while a
+    # previously recorded PASS keeps verifying as current.
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_repo(repo)
+    base = snapshot(repo)
+    (repo / '.git' / 'info').mkdir(parents=True, exist_ok=True)
+    (repo / '.git' / 'info' / 'exclude').write_text('evil.py\n')
+    assert snapshot(repo)['hash'] != base['hash'], 'info/exclude change was invisible'
+    (repo / 'evil.py').write_text("value = 'evil'\n")
+    assert snapshot(repo)['fileCount'] == base['fileCount'], 'evil.py was enumerated'
+
+    elsewhere = tmp_path / 'global-ignore'
+    elsewhere.write_text('other.py\n')
+    subprocess.run(['git', '-C', str(repo), 'config', 'core.excludesFile', str(elsewhere)], check=True)
+    assert snapshot(repo)['hash'] != base['hash'], 'core.excludesFile change was invisible'
 
 
 def test_an_unknown_gate_status_can_never_aggregate_to_pass():

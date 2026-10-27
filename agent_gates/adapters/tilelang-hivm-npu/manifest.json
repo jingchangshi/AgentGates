@@ -14,7 +14,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/npu_gate.py": "3a27df9eee8bb3276369de2c3642a6b1f3c38dc89022d8bf64e02b8cccc3d925"
+    "scripts/npu_gate.py": "d8f348f8e0b48b9cd2b88fe6ed5ef441bee711a10748242b51ec18718c245733"
   },
   "recipes": [
     {
@@ -33,6 +33,9 @@
         "-B",
         "{pack}/scripts/npu_gate.py",
         "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
       ]
     }
   ],

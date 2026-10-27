@@ -55,6 +55,15 @@ def main(argv=None):
                 result["verification"] = verified
                 result["recordedStatus"] = result["status"]
                 result["status"] = verified["status"]
+                # A gate's recorded PASS describes the run that produced it, not
+                # the current state of the evidence. Once verification has
+                # failed the whole receipt is no longer a passing claim, so no
+                # gate may still present itself as PASS to a reader who iterates
+                # `gates` instead of the top-level status.
+                if verified["status"] != "PASS":
+                    result["gates"] = [
+                        {**gate, "recordedStatus": gate.get("status"), "status": verified["status"]}
+                        for gate in result.get("gates", [])]
                 result["receiptPath"] = str(store.directory(run_id) / "receipt.json")
         if args.json:
             print(json.dumps(result, indent=2))

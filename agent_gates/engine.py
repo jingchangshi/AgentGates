@@ -293,6 +293,18 @@ class Engine:
                           log_dir=directory / gate["gateId"] / "recipe", lease_fds=lease_fds)
         gate["process"] = process
         gate.update(evaluate(process, gate["checks"]))
+        if type(process.get("exitCode")) is int and process["exitCode"] in recipe.blocked_exit_codes:
+            # The Adapter uses a dedicated exit code for "the environment is not
+            # available to this Gate" - a card another job holds, for instance.
+            # Nothing was dispatched and no assertion ran, so recording FAIL
+            # would claim a test failed that never started. This is the same
+            # classification the configuration check produces for the same
+            # condition, and it is still not a PASS: `aggregate` keeps
+            # BLOCKED_ENV out of a passing run. The evaluation's observation
+            # failures are dropped on purpose - they only say "the report was
+            # empty", which is a consequence of not running, not a finding.
+            gate.update(status="BLOCKED_ENV", failures=[f"BLOCKED_EXIT_CODE: {process['exitCode']}"],
+                        configReason=config_reason(process))
         gate["sourceAfter"] = snapshot(source)
         if gate["sourceAfter"] != gate["sourceBefore"]:
             gate.update(status="STALE", failures=gate["failures"] + ["SOURCE_IDENTITY_CHANGED"])

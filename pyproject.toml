@@ -18,7 +18,13 @@ include = ["agent_gates*"]
 [tool.setuptools.package-data]
 # Deployment files (Dockerfile, entry.sh, create-container.sh and the
 # all-empty config.example.env) ship too: a reader of an installed wheel must
-# be able to create the container the Adapters address. A real config.env is
-# never packaged, because it is not named here and is git-ignored.
+# be able to create the container the Adapters address. The docker/ entries are
+# named one at a time rather than matched with `docker/*`, because that glob
+# also matched a real machine `config.env` sitting beside the template, and
+# git-ignore rules do not keep a file out of package-data. Keep this list in
+# step with the files the Adapters actually ship.
 agent_gates = ["adapters/*/manifest.json", "adapters/*/scripts/*", "adapters/*/env.example.sh",
-               "adapters/*/README.md", "adapters/*/docker/*"]
+               "adapters/*/README.md",
+               "adapters/*/docker/Dockerfile", "adapters/*/docker/entry.sh",
+               "adapters/*/docker/create-container.sh", "adapters/*/docker/config.example.env",
+               "adapters/*/docker/README.md"]

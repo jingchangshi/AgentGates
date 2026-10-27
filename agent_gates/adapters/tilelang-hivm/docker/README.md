@@ -6,6 +6,6 @@ These deployment files are retained from PiEngineeringHarness revision `9ca04ba6
 
 The helper refuses an existing container and missing required mounts. Its UID/GID/HOME check protects access to bind-mounted source and HOME. The entrypoint is byte-identical to the Ascend adapter copy and manages the container account/readiness only. It never provisions CANN or Conda and never changes host HOME ownership.
 
-Inherited defaults include privileged mode and visibility `0,1` if the visibility key is omitted; an explicitly empty value means no runtime filtering. These settings do not authorize a device and are never used to choose a gate's device. Set reviewed values for the allocation. The NPU adapter still requires a separate explicit device ID and never runs from the base adapter.
+Inherited defaults include privileged mode. Device visibility has no default: an omitted or empty `ASCEND_VISIBLE_DEVICES` exports an empty `ASCEND_RT_VISIBLE_DEVICES`, which the runtime reads as "no filtering". A literal default list was removed deliberately — it let a configuration file that merely left the line out expose cards nobody allocated. Name devices explicitly for your allocation. These settings do not authorize a device and are never used to choose a gate's device. The NPU adapter still requires a separate explicit device ID and never runs from the base adapter.
 
 See [adapter configuration](../../../../../docs/adapters.md). No container image build or creation was performed during the offline migration tests.

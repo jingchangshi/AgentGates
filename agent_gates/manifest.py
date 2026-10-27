@@ -45,6 +45,7 @@ class Recipe:
     cwd: str
     timeout: float
     config_check: tuple[str, ...] = ()
+    blocked_exit_codes: tuple[int, ...] = ()
 
 
 class Manifest:
@@ -60,9 +61,13 @@ class Manifest:
             raise ManifestError("unsupported manifest schemaVersion (expected 1)")
         if not isinstance(raw.get("id"), str) or not ID.fullmatch(raw["id"]):
             raise ManifestError("invalid adapter ID")
-        permissions = raw.get("permissions", {})
-        if not isinstance(permissions, dict) or permissions.get("hostExecution") is False:
-            raise ManifestError("adapter does not permit host execution")
+        # Host execution is the manifest's own consent, so it has to be granted
+        # explicitly. Reading a missing block as "allowed" would make an adapter
+        # that simply forgot the key run arbitrary commands on the host, and the
+        # rest of this schema rejects a merely truthy value everywhere else.
+        permissions = raw.get("permissions")
+        if not isinstance(permissions, dict) or permissions.get("hostExecution") is not True:
+            raise ManifestError("adapter does not declare permissions.hostExecution: true")
         self.root = self.path.parent.resolve()
         self.id = raw["id"]
         self.raw = raw
@@ -146,8 +151,12 @@ class Manifest:
         check = item.get("configCheck", [])
         if not isinstance(check, list):
             raise ManifestError("configCheck must be a list")
+        blocked = item.get("blockedExitCodes", [])
+        if not isinstance(blocked, list) or any(type(code) is not int or not 1 <= code <= 255 for code in blocked) \
+                or len(set(blocked)) != len(blocked):
+            raise ManifestError("blockedExitCodes must be distinct exit codes between 1 and 255")
         return Recipe(recipe_id, self._argv(item.get("argv")), str(Path(source).resolve() if cwd == "source" else self.root),
-                      float(timeout), self._argv(check, check=True) if check else ())
+                      float(timeout), self._argv(check, check=True) if check else (), tuple(blocked))
 
     def order(self, selected: list[str]) -> list[str]:
         ordered, active, done = [], set(), set()

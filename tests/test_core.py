@@ -1,5 +1,7 @@
 """Offline extraction contracts; compiler checkouts and hardware are never touched."""
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -35,6 +37,7 @@ class CoreFixture(unittest.TestCase):
         self.script = self.pack / "scripts/gate.py"
         self.script.write_text('import json,sys\nif "--check-config" in sys.argv: sys.exit(0)\nprint(json.dumps({"ok": True}))\n')
         self.manifest = {"schemaVersion": 1, "id": "test-pack", "version": "1", "files": {},
+                         "permissions": {"sourceWrite": False, "hostExecution": True},
                          "recipes": [{"id": "test.run", "cwd": "source", "timeout": 5,
                                       "argv": [sys.executable, "-I", "{pack}/scripts/gate.py"],
                                       "configCheck": [sys.executable, "-I", "{pack}/scripts/gate.py", "--check-config"]}],
@@ -93,6 +96,35 @@ class ManifestTests(CoreFixture):
         self.write_manifest()
         with self.assertRaises(ManifestError):
             self.registry.get("test-pack")
+
+    def test_host_execution_must_be_granted_explicitly(self):
+        # The permission is the manifest's consent to run commands on this
+        # machine, so an omitted or merely truthy grant must not read as yes.
+        for value in (None, {}, {"hostExecution": 0}, {"hostExecution": "true"},
+                      {"hostExecution": 1}, {"hostExecution": False}):
+            if value is None:
+                self.manifest.pop("permissions", None)
+            else:
+                self.manifest["permissions"] = value
+            self.write_manifest()
+            with self.assertRaisesRegex(ManifestError, "hostExecution"):
+                self.registry.get("test-pack")
+        self.manifest["permissions"] = {"sourceWrite": False, "hostExecution": True}
+        self.write_manifest()
+        self.assertEqual(self.registry.get("test-pack").id, "test-pack")
+
+    def test_a_manifest_without_permissions_never_executes(self):
+        # End to end: the refusal happens at load, so no recipe process starts.
+        marker = self.root / "EXECUTED"
+        self.script.write_text(
+            'import json,sys\nfrom pathlib import Path\n'
+            f'Path({str(marker)!r}).write_text("ran")\n'
+            'print(json.dumps({"ok": True}))\n')
+        self.manifest["permissions"] = {}
+        self.write_manifest()
+        with self.assertRaises(ManifestError):
+            self.engine.run("test-pack", self.source, ["test"])
+        self.assertFalse(marker.exists(), "an ungranted adapter executed on the host")
 
     def test_dag_closure_order_and_cycle(self):
         self.manifest["gates"].append({"id": "second", "recipeId": "test.run", "gateType": "deterministic-test",
@@ -178,6 +210,48 @@ class EngineTests(CoreFixture):
         self.assertEqual([gate["status"] for gate in run["gates"]], ["FAIL", "NOT_RUN"])
         self.assertNotIn("process", run["gates"][1])
 
+    def test_a_declared_blocked_exit_code_is_not_a_failed_test(self):
+        # The Adapter uses a dedicated exit code for "the environment is not
+        # available" - a card another job holds. Nothing was dispatched, so
+        # recording FAIL would claim a test failed that never started. The
+        # classification must match what the configuration check produces for
+        # the same condition, and it must still never pass.
+        self.manifest["recipes"][0]["blockedExitCodes"] = [75]
+        self.script.write_text('import sys\nif "--check-config" in sys.argv: sys.exit(0)\n'
+                               'print("the card is held by another job", file=sys.stderr)\nsys.exit(75)\n')
+        self.write_manifest()
+        run = self.run_gate()
+        gate = run["gates"][0]
+        self.assertEqual(run["status"], "BLOCKED_ENV")
+        self.assertEqual(gate["status"], "BLOCKED_ENV")
+        self.assertIn("BLOCKED_EXIT_CODE: 75", gate["failures"])
+        self.assertIn("held by another job", gate["configReason"])
+        self.assertEqual(gate["process"]["exitCode"], 75)
+        self.assertFalse(self.store.verify(run["runId"], registry=self.registry)["valid"])
+
+    def test_an_undeclared_exit_code_is_still_a_failure(self):
+        # The classification is opt-in per recipe: without the declaration the
+        # same exit status is an ordinary non-zero result, so an adapter cannot
+        # make arbitrary failures disappear into BLOCKED_ENV.
+        self.script.write_text('import sys\nif "--check-config" in sys.argv: sys.exit(0)\nsys.exit(75)\n')
+        self.write_manifest()
+        run = self.run_gate()
+        self.assertEqual(run["status"], "FAIL")
+        self.assertEqual(run["gates"][0]["status"], "FAIL")
+        self.assertIn("NONZERO_EXIT", run["gates"][0]["failures"])
+
+    def test_a_blocked_exit_code_still_cannot_pass(self):
+        # A gate that exits with the blocked code after doing the work is not a
+        # pass even if its stdout claims every observation succeeded: the
+        # declaration is a statement about the environment, not a bypass.
+        self.manifest["recipes"][0]["blockedExitCodes"] = [75]
+        self.script.write_text('import json,sys\nif "--check-config" in sys.argv: sys.exit(0)\n'
+                               'print(json.dumps({"ok": True}))\nsys.exit(75)\n')
+        self.write_manifest()
+        run = self.run_gate()
+        self.assertEqual(run["status"], "BLOCKED_ENV")
+        self.assertNotEqual(run["gates"][0]["status"], "PASS")
+
     def test_source_changed_during_execution_cannot_pass(self):
         self.script.write_text('import json,sys\nfrom pathlib import Path\nif "--check-config" in sys.argv: sys.exit(0)\nPath("input.txt").write_text("changed")\nprint(json.dumps({"ok": True}))\n')
         self.write_manifest()
@@ -251,6 +325,25 @@ class EngineTests(CoreFixture):
     def test_cli_invalid_adapter_and_run_id(self):
         self.assertEqual(main(["run", "--adapter", "../bad", "--source", str(self.source), "--all", "--json"]), 2)
         self.assertEqual(main(["verify", "--run-id", "../bad", "--evidence-root", str(self.root), "--json"]), 1)
+
+    def test_report_never_shows_a_passing_gate_once_verification_fails(self):
+        # `report` keeps the recorded gate statuses for traceability, but a
+        # reader that iterates `gates` must not see PASS for a receipt that no
+        # longer verifies. The recorded value moves to `recordedStatus`.
+        run = self.run_gate()
+        self.assertEqual(run["status"], "PASS")
+        (self.source / "input.txt").write_text("source bytes changed after the run")
+        with patch("agent_gates.cli.Registry", return_value=self.registry), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = main(["report", "--run-id", run["runId"],
+                         "--evidence-root", str(self.root / "evidence"), "--json"])
+        self.assertEqual(code, 1)
+        reported = json.loads(output.getvalue())
+        self.assertEqual(reported["status"], "STALE")
+        self.assertTrue(reported["gates"], "report dropped the gate list")
+        for gate in reported["gates"]:
+            self.assertEqual(gate["status"], "STALE")
+            self.assertEqual(gate["recordedStatus"], "PASS")
 
 
 class ProcessTests(CoreFixture):

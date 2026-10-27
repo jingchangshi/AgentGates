@@ -17,6 +17,33 @@ def git(repo: Path, *args):
     return subprocess.run(["git", *GIT_SAFE, "-C", str(repo), *args], capture_output=True, env=environment, timeout=120)
 
 
+def exclusion_rules(root: Path) -> list[str]:
+    """Every rule that could hide a source file from `ls-files --others`.
+
+    `--exclude-standard` honours three ignore sources: the checkout's own
+    `.gitignore` files (tracked, so they are already hashed as source), the
+    global `core.excludesFile`, and `.git/info/exclude`. The last two are not
+    part of the snapshot: a file added to either makes arbitrary bytes vanish
+    from the hash while a recorded PASS keeps verifying. They are read here and
+    bound into the digest, so changing them changes the source identity.
+    """
+    paths = [root / ".git" / "info" / "exclude"]
+    configured = git(root, "config", "--get", "core.excludesFile")
+    if configured.returncode == 0:
+        name = os.fsdecode(configured.stdout.rstrip(b"\n")).strip()
+        if name:
+            paths.append(Path(os.path.expanduser(name)))
+    rules = []
+    for path in paths:
+        try:
+            text = path.read_text(errors="surrogateescape")
+        except OSError:
+            rules.append(f"{path}\0<absent>")
+            continue
+        rules.append(f"{path}\0{text}")
+    return rules
+
+
 def source_root(path: Path) -> Path:
     path = Path(path).resolve(strict=True)
     if not path.is_dir():
@@ -62,6 +89,12 @@ def snapshot(root: Path, *, _nested=False) -> dict:
         if staged.returncode:
             raise ValueError("cannot capture Git index identity")
         digest.update(staged.stdout + b"\0")
+        # The enumeration below is a function of these rules as much as of the
+        # tree, so the rules are part of the identity. Without this, editing
+        # `.git/info/exclude` or `core.excludesFile` hides arbitrary bytes from
+        # the hash while an already-issued PASS keeps verifying as current.
+        for rule in exclusion_rules(root):
+            digest.update(rule.encode("utf-8", "surrogateescape") + b"\0")
     external = []
     for name in names:
         path = root / name

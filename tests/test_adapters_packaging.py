@@ -59,14 +59,37 @@ class PackagingCase(unittest.TestCase):
 
     def test_the_distribution_declares_the_deployment_files_it_ships(self):
         # A wheel that omits `docker/` can run Gates but cannot create the
-        # container they address. The pattern must stay narrow enough to never
-        # match a real `config.env`, which is machine data.
+        # container they address. Each file is named explicitly rather than
+        # matched with `docker/*`, because that glob also matched a real machine
+        # `config.env` - git-ignore rules do not apply to package-data. This
+        # test asserts the property, not just the presence of a pattern.
         data = (ROOT / 'pyproject.toml').read_text()
-        self.assertIn('adapters/*/docker/*', data)
-        for name in ('Dockerfile', 'entry.sh', 'create-container.sh', 'config.example.env'):
+        # Only the data list matters; the comment above it explains the glob.
+        listing = data.split('[tool.setuptools.package-data]', 1)[1]
+        listing = '\n'.join(line for line in listing.splitlines()
+                            if not line.lstrip().startswith('#'))
+        self.assertNotIn('docker/*', listing, 'a docker/* glob would ship a real config.env')
+        shipped = ('Dockerfile', 'entry.sh', 'create-container.sh', 'config.example.env', 'README.md')
+        for name in shipped:
+            self.assertIn(f'"adapters/*/docker/{name}"', listing, f'{name} is not packaged')
+        self.assertNotIn('config.env"', listing.replace('config.example.env"', ''),
+                         'a real config.env must not be packaged')
+        for name in shipped:
             for adapter in ('ascendnpu-ir', 'tilelang-hivm'):
                 self.assertTrue((ADAPTERS / adapter / 'docker' / name).is_file(),
                                 f'{adapter}/docker/{name}')
+
+    def test_the_packaging_list_covers_every_shipped_deployment_file(self):
+        # The explicit list is only safe while it is complete: a new deployment
+        # file that nobody adds to pyproject.toml would silently drop out of the
+        # wheel instead of being noticed here.
+        data = (ROOT / 'pyproject.toml').read_text()
+        for adapter in ('ascendnpu-ir', 'tilelang-hivm'):
+            for path in sorted((ADAPTERS / adapter / 'docker').iterdir()):
+                if not path.is_file() or path.name == 'config.env':
+                    continue
+                self.assertIn(f'"adapters/*/docker/{path.name}"', data,
+                              f'{adapter}/docker/{path.name} is not packaged')
 
     def test_the_example_container_configuration_holds_no_machine_value(self):
         # Both templates are committed, so neither may carry this machine's
@@ -81,6 +104,19 @@ class PackagingCase(unittest.TestCase):
             for value in machine:
                 self.assertNotIn(value, text, f'{template}: {value}')
             self.assertNotRegex(text, r'ASCEND_RT_VISIBLE_DEVICES=[0-9]')
+
+    def test_the_container_helper_has_no_literal_device_default(self):
+        # `ASCEND_VISIBLE_DEVICES=0,1` as a fallback made a configuration file
+        # that merely omitted the line expose cards nobody allocated to it. The
+        # only safe default is the empty one: no filtering is the operator's
+        # explicit choice, not a side effect of forgetting a key. A template
+        # value is not enough - the script itself must carry no fallback.
+        for adapter in ('ascendnpu-ir', 'tilelang-hivm'):
+            script = (ADAPTERS / adapter / 'docker' / 'create-container.sh').read_text()
+            self.assertIn('ASCEND_VISIBLE_DEVICES="${ASCEND_VISIBLE_DEVICES-}"', script,
+                          f'{adapter}/docker/create-container.sh has a device default')
+            self.assertNotRegex(script, r'ASCEND_VISIBLE_DEVICES:-[0-9]',
+                                f'{adapter}/docker/create-container.sh defaults to devices')
 
 
 if __name__ == '__main__':

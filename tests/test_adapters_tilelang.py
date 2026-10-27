@@ -1788,6 +1788,27 @@ class NpuOccupancyCase(_FakeDockerCase):
         self.assertNotIn('4243', message)
         self.assertFalse([call for call in calls if call[:2] == ['docker', 'exec']])
 
+    def test_a_card_that_became_busy_is_blocked_not_failed(self):
+        # The same condition caught at the configuration check is
+        # `BLOCKED_ENV`; caught at the pre-dispatch probe it must not become
+        # `FAIL`, because no test started. The distinct exit code is what
+        # carries that classification to the runner, so it has to be the
+        # declared one and not a code a failing test run could produce.
+        os.environ['TILELANG_HIVM_DEVICE_ID'] = '0'
+        with patch('subprocess.run', side_effect=self.fake_npu(occupancy=[(7, 'python')])):
+            with self.assertRaises(npu.OccupancyBlocked) as error:
+                npu.main(['--timeout', '900'])
+        self.assertEqual(type(error.exception).EXIT, 75)
+        # pytest's own statuses are 0-5 and the container script uses 3, so 75
+        # cannot be a test failure that was mistaken for a blocked environment.
+        self.assertNotIn(npu.OccupancyBlocked.EXIT, (0, 1, 2, 3, 4, 5))
+        manifest = load_manifest(NPU / 'manifest.json')
+        for recipe in manifest['recipes']:
+            self.assertEqual(recipe.get('blockedExitCodes'), [npu.OccupancyBlocked.EXIT], recipe['id'])
+        for recipe in load_manifest(BASE / 'manifest.json')['recipes']:
+            self.assertNotIn('blockedExitCodes', recipe,
+                             'the base Adapter has no blocked-environment exit code')
+
     def test_check_config_blocks_on_a_busy_card(self):
         # Preflight is the first place the Host learns the machine is unusable;
         # a busy card must stop there rather than after the Recipe starts.

@@ -110,6 +110,21 @@ class BridgeError(Exception):
         self.message = message
 
 
+class OccupancyBlocked(BridgeError):
+    """The card is held by a job this Gate did not start.
+
+    This is an environment prerequisite that is missing, not a test that ran
+    and failed: nothing was dispatched and no assertion was evaluated. It
+    therefore exits with its own code so the runner can record `BLOCKED_ENV`
+    rather than `FAIL`, matching what the same condition already produces when
+    the configuration check sees it. The code is 75 (sysexits `EX_TEMPFAIL`),
+    chosen because pytest's own statuses are 0-5 and the container script uses
+    3, so this value cannot be produced by a test run that failed.
+    """
+
+    EXIT = 75
+
+
 def env_value(name: str, *, required: bool = False, default: str | None = None) -> str | None:
     value = os.environ.get(name, '')
     value = value.strip() if isinstance(value, str) else ''
@@ -411,25 +426,25 @@ def npu_smi(*args: str) -> str:
 
     Only `info` subcommands are ever issued: the probe must not reset, set or
     otherwise change a device. Every way of not getting an answer - a missing
-    binary, a non-zero exit, a timeout, a signal - is a BridgeError, because
-    "unknown" is not "free" and a card whose state cannot be read must not be
-    handed to a test that would then share it with another user's job.
+    binary, a non-zero exit, a timeout, a signal - is an OccupancyBlocked,
+    because "unknown" is not "free" and a card whose state cannot be read must
+    not be handed to a test that would then share it with another user's job.
     """
     try:
         done = subprocess.run([NPU_SMI, 'info', *args], capture_output=True, text=True,
                               timeout=PROBE_TIMEOUT_SECONDS)
     except FileNotFoundError as error:
-        raise BridgeError(f'cannot determine NPU occupancy: {NPU_SMI} is not installed on the Host '
-                          f'({error})') from error
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} is not installed on the Host '
+                                f'({error})') from error
     except subprocess.TimeoutExpired as error:
-        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info {" ".join(args)}` '
-                          f'did not answer within {PROBE_TIMEOUT_SECONDS}s') from error
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: `{NPU_SMI} info {" ".join(args)}` '
+                                f'did not answer within {PROBE_TIMEOUT_SECONDS}s') from error
     except OSError as error:
-        raise BridgeError(f'cannot determine NPU occupancy: {NPU_SMI} could not be started: {error}') from error
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} could not be started: {error}') from error
     if done.returncode != 0:
         detail = (done.stderr or done.stdout).strip().splitlines()
-        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info {" ".join(args)}` exited '
-                          f'{done.returncode}: {detail[0] if detail else "no message"}')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: `{NPU_SMI} info {" ".join(args)}` exited '
+                                f'{done.returncode}: {detail[0] if detail else "no message"}')
     return done.stdout
 
 
@@ -453,11 +468,11 @@ def npu_id_of_physical(device: str) -> str:
             npu_ids.append(fields[0])
     unique = sorted(set(npu_ids))
     if not unique:
-        raise BridgeError(f'cannot determine NPU occupancy: no device in the npu-smi mapping table '
-                          f'reports physical id {device}')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: no device in the npu-smi mapping table '
+                                f'reports physical id {device}')
     if len(unique) > 1:
-        raise BridgeError(f'cannot determine NPU occupancy: physical id {device} is claimed by several '
-                          f'npu-smi NPU IDs {unique}')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: physical id {device} is claimed by several '
+                                f'npu-smi NPU IDs {unique}')
     return unique[0]
 
 
@@ -470,12 +485,13 @@ def processes_on(npu_id: str) -> list[tuple[str, str]]:
     is idle. A row this Gate cannot read means the driver's format changed, and
     a format this Gate cannot read is unknown occupancy, never a free card.
     Anything else - an empty table, a partially matching table, a different
-    layout - is a BridgeError.
+    layout - is an OccupancyBlocked: the environment could not be read, so the
+    Gate is blocked rather than reported as a failing test.
     """
     text = npu_smi('-t', 'proc-mem', '-i', npu_id)
     if not re.search(rf'^\s*NPU ID\s*:\s*{re.escape(npu_id)}\s*$', text, re.MULTILINE):
-        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
-                          f'did not report NPU ID {npu_id}')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                                f'did not report NPU ID {npu_id}')
     # The driver prints this sentence, and only this sentence, when the device
     # holds nothing. It is an explicit statement, not the absence of rows.
     idle = len(re.findall(r'^\s*No process in device\.?\s*$', text, re.MULTILINE))
@@ -483,15 +499,15 @@ def processes_on(npu_id: str) -> list[tuple[str, str]]:
     rows = [(match.group(1), match.group(2)) for match in pattern.finditer(text)]
     announced = len(re.findall(r'Process id:', text))
     if rows and idle:
-        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
-                          f'reported both processes and an idle device')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                                f'reported both processes and an idle device')
     if len(rows) != announced:
-        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
-                          f'reported {announced} process row(s) but only {len(rows)} matched the known '
-                          f'layout; the driver answer is not understood')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                               f'reported {announced} process row(s) but only {len(rows)} matched the known '
+                               f'layout; the driver answer is not understood')
     if not rows and not idle:
-        raise BridgeError(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
-                          f'neither listed a process nor said the device is idle')
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: `{NPU_SMI} info -t proc-mem -i {npu_id}` '
+                                f'neither listed a process nor said the device is idle')
     return rows
 
 
@@ -507,9 +523,9 @@ def require_device_free(device: str) -> str:
     npu_id = npu_id_of_physical(device)
     holders = processes_on(npu_id)
     if holders:
-        raise BridgeError(f'NPU device {device} (npu-smi NPU ID {npu_id}) is already in use by '
-                          f'{len(holders)} process(es) this Gate did not start; refusing to share a '
-                          f'card that was not explicitly released to this task')
+        raise OccupancyBlocked(f'NPU device {device} (npu-smi NPU ID {npu_id}) is already in use by '
+                               f'{len(holders)} process(es) this Gate did not start; refusing to share a '
+                               f'card that was not explicitly released to this task')
     return npu_id
 
 
@@ -966,4 +982,7 @@ if __name__ == '__main__':
         raise SystemExit(main(sys.argv[1:]))
     except BridgeError as error:
         print(f'{PROG}: {error.message}', file=sys.stderr)
-        raise SystemExit(BridgeError.EXIT)
+        # The instance, not the class: an OccupancyBlocked carries its own code
+        # so the runner can record BLOCKED_ENV instead of a failed test. Reading
+        # `BridgeError.EXIT` here would silently flatten every subclass to 2.
+        raise SystemExit(error.EXIT)

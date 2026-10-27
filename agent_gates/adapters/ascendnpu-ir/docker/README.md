@@ -6,6 +6,6 @@ These deployment files are retained from PiEngineeringHarness revision `9ca04ba6
 
 The helper refuses an existing container, missing required mounts and incompatible UID/GID/HOME. The entrypoint creates/verifies the container account, preserves bind-mounted HOME ownership and writes a readiness marker. It does not install CANN or Conda. The helper never stops or removes an existing container.
 
-The inherited deployment defaults include privileged mode and device visibility `0,1`; they are not an allocation and are not used by the standalone gate CLI. Set reviewed values for your environment. NPU test authorization remains the separate explicit device-ID input of the NPU adapter.
+The inherited deployment defaults include privileged mode. Device visibility has no default: an omitted or empty `ASCEND_VISIBLE_DEVICES` exports an empty `ASCEND_RT_VISIBLE_DEVICES`, which the runtime reads as "no filtering". A literal default list was removed deliberately — it let a configuration file that merely left the line out expose cards nobody allocated. Name devices explicitly for your environment; that value is not an allocation and is not used by the standalone gate CLI. NPU test authorization remains the separate explicit device-ID input of the NPU adapter.
 
 See [adapter configuration](../../../../../docs/adapters.md) for gate setup and scope. No container image build or creation was performed during the offline migration tests.
