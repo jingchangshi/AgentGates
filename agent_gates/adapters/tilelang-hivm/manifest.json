@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "id": "tilelang-hivm",
+  "version": "1.0.0",
+  "capabilities": [
+    "build",
+    "regression"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/docker_gate.py": "adba4c9fc962d6484df0124a4807b55866f605b8d4919f863110b9eedfe6343e",
+    "scripts/full-build.sh": "9d3c3a9174a313f0564661ddc984037cd73fc9f4240ff68c9b7a09911ace1c20",
+    "scripts/init-toolchain.sh": "4b1ffeb060dfa5f4c7a99f22851170059468712a4f1a533b04683efa8dcb2df7",
+    "scripts/setup-python-env.sh": "0eabcb5fe96714e81cf97c90c1d5a6e91acdc462fa237ac26556c65a3500fd1c"
+  },
+  "recipes": [
+    {
+      "id": "tilelang-hivm.build",
+      "cwd": "source",
+      "timeout": 900,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/docker_gate.py",
+        "--timeout",
+        "840",
+        "build"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/docker_gate.py",
+        "--check-config"
+      ]
+    },
+    {
+      "id": "tilelang-hivm.regression",
+      "cwd": "source",
+      "timeout": 960,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/docker_gate.py",
+        "--timeout",
+        "900",
+        "regression"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/docker_gate.py",
+        "--check-config"
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "tilelang-hivm-build",
+      "recipeId": "tilelang-hivm.build",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true
+      }
+    },
+    {
+      "id": "tilelang-hivm-regression",
+      "recipeId": "tilelang-hivm.regression",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "importedModuleSha256MatchesHost": true,
+        "loadedNativeSha256MatchesHost": true,
+        "nativeLibsPresent": true,
+        "notAllSkipped": true,
+        "testsCollectedPositive": true
+      },
+      "dependsOn": [
+        "tilelang-hivm-build"
+      ]
+    }
+  ]
+}

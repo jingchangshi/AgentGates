@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "tilelang-hivm-npu",
+  "version": "1.0.0",
+  "capabilities": [
+    "device-regression"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/npu_gate.py": "b5146b06095182e51cb7445b50427997dcfe2f67b2f0752de785f734fd166ae8"
+  },
+  "recipes": [
+    {
+      "id": "tilelang-hivm-npu.sanity",
+      "cwd": "source",
+      "timeout": 960,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/npu_gate.py",
+        "--timeout",
+        "900"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/npu_gate.py",
+        "--check-config"
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "tilelang-hivm-npu-sanity",
+      "recipeId": "tilelang-hivm-npu.sanity",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "allPassed": true,
+        "deviceMatchesAuthorized": true,
+        "notAllSkipped": true,
+        "npuDeviceUsed": true,
+        "numericalAssertionsObserved": true,
+        "synchronizeOk": true,
+        "tensorMovedToDevice": true,
+        "testsCollectedPositive": true
+      }
+    }
+  ]
+}
