@@ -14,15 +14,15 @@ This compares the P0 original-recipe baseline with the migrated standalone CLI o
 
 ## Results
 
-| Gate | P0 | Round 1 | Round 2 | Round 3 | Round 4 (current) | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| `ascend-build` | PASS 80.670s | PASS `c1610b67…` | PASS `52ea3b30…` | PASS `984140c6883b150c683fc809fd6253f3` | PASS `50fd4866c1ebe7a77256b84a04b81d1b` | Incremental; build tree already current |
-| `ascend-regression` | PASS 410.713s | same run | same run | same run | same run | 1142 discovered / 1023 passed / 119 unsupported, identical counts in every round |
-| `tilelang-hivm-build` | PASS 0.615s | PASS `181cad5a…` | PASS `61ed95d5…` | PASS `2c3e2925a6446c342f8c05537d9228d7` | PASS `5c156a74910d2dee7be4159585d8826c` | Incremental `tilelang` target |
-| `tilelang-hivm-regression` | PASS 8.727s | same run | same run | same run | same run | 14 collected / 14 passed / 0 skipped / 12 native libraries |
-| `tilelang-hivm-npu-sanity` | BLOCKED_ENV | `414c2ca7…` | `e6d1680c…` | `e24d1b0c3e6708ca85ac52f286ffe99f` | `4c459676b57eab7f57d4c80c6a3bfd0f` | No task-assigned device id in any phase |
+| Gate | P0 | Round 1 | Round 2 | Round 3 | Round 4 | Round 5 (current) | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `ascend-build` | PASS 80.670s | PASS `c1610b67…` | PASS `52ea3b30…` | PASS `984140c6883b150c683fc809fd6253f3` | PASS `50fd4866c1ebe7a77256b84a04b81d1b` | same run | Incremental; build tree already current |
+| `ascend-regression` | PASS 410.713s | same run | same run | same run | same run | same run | 1142 discovered / 1023 passed / 119 unsupported, identical counts in every round |
+| `tilelang-hivm-build` | PASS 0.615s | PASS `181cad5a…` | PASS `61ed95d5…` | PASS `2c3e2925a6446c342f8c05537d9228d7` | PASS `5c156a74910d2dee7be4159585d8826c` | same run | Incremental `tilelang` target |
+| `tilelang-hivm-regression` | PASS 8.727s | same run | same run | same run | same run | same run | 14 collected / 14 passed / 0 skipped / 12 native libraries |
+| `tilelang-hivm-npu-sanity` | BLOCKED_ENV | `414c2ca7…` | `e6d1680c…` | `e24d1b0c3e6708ca85ac52f286ffe99f` | `4c459676b57eab7f57d4c80c6a3bfd0f` | **PASS on hardware**, see "Round 5" | No *assigned* device id in any phase |
 
-Rounds exist because the adapter bytes and the source-identity digest changed. Round 2 followed the independent review's seven fixes, which correctly turned every round-1 receipt `STALE` (`ADAPTER_IDENTITY_CHANGED`). Round 3 followed the ignore-rule binding fix, which changed the source digest itself: every round-2 receipt — including the two `ascendnpu-ir` / `tilelang-hivm` ones — now verifies `STALE` with `SOURCE_IDENTITY_CHANGED`, and the change is reproducible (feeding the old, unbound rule list to `source_identity` reproduces the stored round-2 hash exactly). Round 4 followed the fix described under "Round-3 finding" below, which changed only the NPU script: the round-3 `ascendnpu-ir` and `tilelang-hivm` receipts still verify `valid: true` against their unchanged adapters, while the round-3 NPU receipts verify `STALE` with `ADAPTER_IDENTITY_CHANGED`. Every round re-ran the same argv against the same sources and machine files and reproduced every verdict. Retained evidence roots: `.evidence/p1-runs` (round 1), `p1-runs-r2`, `p1-runs-r3`, `p1-runs-r4` (current).
+Rounds exist because the adapter bytes and the source-identity digest changed. Round 2 followed the independent review's seven fixes, which correctly turned every round-1 receipt `STALE` (`ADAPTER_IDENTITY_CHANGED`). Round 3 followed the ignore-rule binding fix, which changed the source digest itself: every round-2 receipt — including the two `ascendnpu-ir` / `tilelang-hivm` ones — now verifies `STALE` with `SOURCE_IDENTITY_CHANGED`, and the change is reproducible (feeding the old, unbound rule list to `source_identity` reproduces the stored round-2 hash exactly). Round 4 followed the fix described under "Round-3 finding" below, which changed only the NPU script: the round-3 `ascendnpu-ir` and `tilelang-hivm` receipts still verify `valid: true` against their unchanged adapters, while the round-3 NPU receipts verify `STALE` with `ADAPTER_IDENTITY_CHANGED`. Round 5 followed a second NPU-script change (the toolchain status check below), so again only the NPU receipts moved: the round-4 `ascendnpu-ir` (`50fd4866…`) and `tilelang-hivm` (`5c156a74…`) receipts still verify `valid: true`, and the three round-4 NPU receipts verify `STALE` with `ADAPTER_IDENTITY_CHANGED`. Every round re-ran the same argv against the same sources and machine files and reproduced every verdict. Retained evidence roots: `.evidence/p1-runs` (round 1), `p1-runs-r2`, `p1-runs-r3`, `p1-runs-r4`, `p1-runs-r5` (current).
 
 P1 wall-clock is shorter than P0 because the trees were warm after the baseline: `ascend-regression` took 3.12 s (round 1), 3.23 s (round 2), 3.13 s (round 4) against 410.7 s, and `tilelang-hivm-regression` 7.38 s, 8.03 s and 7.83 s against 8.73 s. Timings are therefore not comparable evidence of equivalence; the discovered/passed/unsupported counts and the observation values are.
 
@@ -67,6 +67,25 @@ These differences are intentional and covered by negative tests; they are not re
    The probe never selects a card and reports only the holder count, not other users' PIDs or command lines.
 5. **Receipt re-validation.** A recorded PASS is only current while `verify` returns `valid: true`; mutating the receipt, logs, source, manifest, script or product turns it `INVALID_EVIDENCE` or `STALE`. The legacy path had no equivalent.
 
+### Round 5: the NPU Gate ran on hardware, without an assignment
+
+Round 5 was needed because the NPU script changed again (see "Round-4 finding" below), and it produced the first real device execution in any phase. Both visible cards happened to be idle when the pre-dispatch probe ran, so with `--device-id 0` and then `--device-id 1` the Gate dispatched and the Ascend SIMD vector-add sanity test executed on the device:
+
+| Run | Device | Status | Elapsed | Observations |
+| --- | --- | --- | ---: | --- |
+| `57232ed104a4df5c22b7c69d3b4077d8` | 0 | PASS, `valid: true` | 24.1 s | 1 collected / 1 passed / 0 skipped; 2 tensor moves; 1 numerical assertion; peak device memory 25,165,824 B; `synchronizeOk` |
+| `6069185943659077013d6837c7ea0cf2` | 1 | PASS, `valid: true` | 25.1 s | identical facts |
+
+**This is not authorized evidence and must not be read as acceptance.** The goal requires an operator-assigned device, and no device was ever assigned. An idle card is not an assignment: the Adapter's own documentation says so, and the gate refused every earlier round for that reason. The two runs were launched by the lead with a guessed `--device-id`, which is the exact behaviour the occupancy rule exists to prevent. The probe was doing its job — the cards genuinely were free at that moment — so this is not a Gate defect; it is an operator error around the Gate.
+
+What it does establish, narrowly: the device branch works end to end on this machine and records real measurements rather than an assumption. What it does not establish: permission to use either card, and nothing about HIVM CodeGen E2E — the test is basic Ascend SIMD vector-add. Both cards were in use again within minutes, by other users' jobs (`c00946898` on device 1 started at 06:03:04 UTC, four seconds before the device-1 run finished; unrelated PIDs held device 0 by 06:03:42). No process from either run survived: the container is the pre-existing one, still up, and no `npu_gate`/`docker exec` process of this account remained.
+
+### Round-4 finding: an uncheckable toolchain reported as a test failure
+
+The NPU bridge sources the machine file's CANN setup and `conda.sh` inline. It checked that each file was *readable* and then sourced it with no status check, so a present-but-broken setup continued silently into the runner. The other two bridges avoid this because they call `scripts/init-toolchain.sh`, which checks the source result, `ASCEND_HOME_PATH`, the half-Conda configuration and `conda activate`. Here the damage would appear much later as an `ImportError` inside pytest, which the Gate records as a test failure — the same class of mis-classification as the round-3 defect: a real environment fault wearing a test's clothes.
+
+The fix adds `|| fail` after both `. <cann>` and `. <conda_sh>`, so a failed load exits 3 (`toolchain initialization failed`) before the runner starts. Verified behaviourally, not only by inspection: a generated script whose CANN setup returns non-zero exits 3 with `failed to source CANN setup`, and `bash -n` accepts the fully populated script. One offline test covers the status checks and the fixed CANN → conda.sh → activate ordering.
+
 ## Where the migrated path is weaker or narrower
 
 - **No historical PASS reuse.** Each P1 invocation is a fresh run. There is no cache, so a warm tree still costs a full recipe execution.
@@ -77,8 +96,8 @@ These differences are intentional and covered by negative tests; they are not re
 
 ## Uncovered risks
 
-- No real NPU execution occurred in P0 or P1: both cards are held by other users' jobs and no device was assigned. The NPU gate's hardware behaviour is covered only by offline fixtures and negative tests.
-- P1 ran against warm, pre-existing build trees. A cold full build was not re-measured, so cold-build timeouts (840 s / 1140 s inner) are unchanged assumptions, not re-validated facts.
+- No authorized real NPU execution occurred in P0 or P1: no device was assigned. Round 5 did execute the gate on both visible cards and it passed with real measurements, but the device ids were chosen rather than assigned, so it establishes that the hardware path works and nothing about permission or about HIVM CodeGen E2E.
+- P1 ran against warm, pre-existing build trees. A cold full build was not re-measured, so the inner timeouts are unchanged assumptions, not re-validated facts. They are per recipe, not uniform: Ascend build 840 s inside 900 s, Ascend regression 1140 s inside 1200 s, TileLang build 840 s inside 900 s, TileLang regression and the NPU sanity 900 s inside 960 s. Every pair leaves at least the 15 s `--kill-after` grace inside the recipe bound.
 - The equivalence argument covers the five gates and their observation sets. It does not cover Harness agent scheduling, approvals, sessions or model routing, which are deliberately not migrated.
 - Docker client and container process domains remain distinct: a Host-side kill is not proof that container work stopped, so the pinned container-side timeout with its 15 s grace remains the real bound.
 
