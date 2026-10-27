@@ -54,9 +54,9 @@ claude -p --plugin-dir <repo>/integrations/claude-code \
 - Actual model reported by the session: `group/auto-deepseek-v4-1-flash`. Claude Code flagged it as `unrecognized_model`. This is **not** Opus; no claim of an Opus-run review is made.
 - `PATH` was prefixed with the project virtualenv so `agent-gates` resolved to the editable install.
 
-## What the session actually discovered
+## Round-1 discovery
 
-From the `system/init` event, the plugin was loaded as `agent-gates@inline` (path `integrations/claude-code`, version `0.1.0`) and contributed exactly three skills:
+From that session's `system/init` event, the plugin was loaded as `agent-gates@inline` (path `integrations/claude-code`, version `0.1.0`) and contributed exactly three skills:
 
 | Skill | `allowed-tools` | `disable-model-invocation` |
 | --- | --- | --- |
