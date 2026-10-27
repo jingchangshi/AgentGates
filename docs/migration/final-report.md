@@ -1,6 +1,6 @@
 # Migration final report
 
-Repository `jingchangshi/AgentGates`, branch `migration/p0-p2`, execution date 2026-10-27. Prior commits: `cc573c7` (inventory), `3994c69` (audited baseline and extraction semantics).
+Repository `jingchangshi/AgentGates`, branch `migration/p0-p2`, HEAD `c676c71` at the time of writing, execution date 2026-10-27. Prior commits: `cc573c7` (inventory), `3994c69` (audited baseline and extraction semantics). `main` was deliberately not advanced; see [the delivery note](progress.md#delivery).
 
 ## Objective and scope
 
