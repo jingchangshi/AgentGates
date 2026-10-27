@@ -6,12 +6,17 @@ import sys
 from .engine import Engine
 from .evidence import EvidenceStore
 from .registry import Registry
+from .api_types import APIError, ExecutionRequest, VerificationRequirement, jsonable
+from .config import ConfigError
+from .execution import ExecutionManager
+from .verify_requirements import verify_requirements
 
 
 def parser():
     root = argparse.ArgumentParser(prog="agent-gates")
     subcommands = root.add_subparsers(dest="command", required=True)
-    for name in ("list", "doctor", "run", "report", "verify"):
+    for name in ("list", "doctor", "run", "report", "verify",
+                 "submit", "status", "wait", "cancel", "verify-requirements"):
         command = subcommands.add_parser(name)
         command.add_argument("--json", action="store_true", help="print structured JSON")
         command.add_argument("--evidence-root", type=Path, help="local private evidence directory")
@@ -26,6 +31,20 @@ def parser():
             selection.add_argument("--all", action="store_true", help="run every gate in this adapter")
         if name in {"report", "verify"}:
             command.add_argument("--run-id", help="run ID (default: most recent)")
+        if name == "submit":
+            command.add_argument("--workspace", required=True)
+            command.add_argument("--adapter", required=True)
+            command.add_argument("--gate", action="append", required=True)
+            command.add_argument("--request-id")
+        if name in {"status", "wait", "cancel"}:
+            command.add_argument("--execution-id", required=True)
+        if name == "wait":
+            command.add_argument("--timeout", type=float, default=15.0)
+        if name == "verify-requirements":
+            command.add_argument("--workspace", required=True)
+            command.add_argument("--adapter", required=True)
+            command.add_argument("--gate", action="append", required=True)
+            command.add_argument("--run-id", required=True)
     return root
 
 
@@ -34,6 +53,11 @@ def main(argv=None):
     registry = Registry()
     store = EvidenceStore(args.evidence_root)
     engine = Engine(registry=registry, store=store)
+    # Asynchronous verbs resolve machine parameters from the local
+    # configuration and delegate to the worker; they must not construct an
+    # Engine, which would run gates in this process.
+    if args.command in {"submit", "status", "wait", "cancel", "verify-requirements"}:
+        return _async_command(args)
     try:
         if args.command == "list":
             result = {"adapters": [{"id": manifest.id, "manifestSha256": manifest.manifest_hash,
@@ -93,6 +117,51 @@ def main(argv=None):
             print(json.dumps(result))
         else:
             print(f"BLOCKED_ENV: {exc}", file=sys.stderr)
+        return 2
+
+
+def _emit(payload, args, status_ok=True):
+    """Print one API model as JSON, identically for every asynchronous verb."""
+    print(json.dumps(jsonable(payload), indent=2))
+    return 0 if status_ok else 1
+
+
+def _async_command(args):
+    """Run one asynchronous verb; every failure becomes a stable error code."""
+    try:
+        manager = ExecutionManager()
+        if args.command == "submit":
+            request = ExecutionRequest(workspace=args.workspace, adapter=args.adapter,
+                                       gates=args.gate, request_id=args.request_id)
+            return _emit(manager.submit(request), args)
+        if args.command == "status":
+            return _emit(manager.status(args.execution_id), args)
+        if args.command == "wait":
+            result = manager.wait(args.execution_id, args.timeout)
+            # A bounded wait that returned without a verdict is a normal result,
+            # not a command failure: the caller asked to wait only so long.
+            return _emit(result, args)
+        if args.command == "cancel":
+            return _emit(manager.cancel(args.execution_id), args)
+        requirement = VerificationRequirement(workspace=args.workspace, adapter=args.adapter,
+                                              required_gates=args.gate, run_id=args.run_id)
+        result = verify_requirements(requirement, config=manager.config,
+                                     registry=manager.registry, store=manager.evidence)
+        return _emit(result, args, status_ok=result.satisfied)
+    except APIError as exc:
+        payload = jsonable(exc.to_model())
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(exc.code.value + ": " + exc.message, file=sys.stderr)
+        return 2
+    except ConfigError as exc:
+        payload = {"code": "CONFIG_INVALID", "family": "config", "message": str(exc),
+                   "field": exc.field, "details": {}}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print("CONFIG_INVALID: " + str(exc), file=sys.stderr)
         return 2
 
 

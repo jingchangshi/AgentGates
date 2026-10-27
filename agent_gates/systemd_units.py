@@ -40,6 +40,7 @@ Environment=PYTHONPATH=__PACKAGE_ROOT__
 # environment because systemd starts this unit from the manager.
 Environment=AGENT_GATES_CONFIG=__CONFIG_PATH__
 Environment=AGENT_GATES_ADAPTERS_ROOT=__ADAPTERS_ROOT__
+__EXTRA_ENV__
 """
 
 
@@ -108,9 +109,28 @@ def package_root() -> str:
     return str(Path(agent_gates.__file__).resolve().parent.parent)
 
 
+def _render_env(extra: dict) -> str:
+    """Render fixed machine facts as unit Environment= lines.
+
+    The name must be a plain environment identifier and the value must be a
+    single line: a newline in a value would let it escape into a new directive,
+    which is a unit-injection path even when only an operator sets it.
+    """
+    lines = []
+    for name in sorted(extra):
+        value = str(extra[name])
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+            raise ValueError("invalid environment name for the worker unit: " + name)
+        if chr(10) in value or chr(13) in value or chr(0) in value:
+            raise ValueError("environment value for " + name + " must be a single line")
+        lines.append("Environment=" + name + "=" + value)
+    return "\n".join(lines)
+
+
 def install(python: str, *, timeout_seconds: int, workdir: str = "/", root: Path | None = None,
             package: str | None = None, config_path: str | None = None,
-            adapters_root: str | None = None) -> Path:
+            adapters_root: str | None = None,
+            extra_env: dict | None = None) -> Path:
     """Write the unit template and reload the user manager.
 
     @param python - absolute interpreter that has agent_gates importable.
@@ -121,6 +141,14 @@ def install(python: str, *, timeout_seconds: int, workdir: str = "/", root: Path
     @param config_path - the configuration the worker must read; defaults to the
         documented per-user location.
     @param adapters_root - adapter directory override, for fixture installs.
+    @param extra_env - additional fixed machine facts an adapter reads from its
+        process environment (an adapter that takes container identity from the
+        environment rather than from a file). Values are written as unit
+        Environment= lines, so they are fixed at install time and cannot be
+        overridden by a caller.
+
+    Every value here is a machine fact recorded by an operator running the
+    installer. None of them can arrive from a tool call.
     """
     directory = Path(root) if root is not None else unit_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -133,7 +161,8 @@ def install(python: str, *, timeout_seconds: int, workdir: str = "/", root: Path
                 .replace("__WORKDIR__", workdir)
                 .replace("__PACKAGE_ROOT__", package or package_root())
                 .replace("__CONFIG_PATH__", str(resolved_config))
-                .replace("__ADAPTERS_ROOT__", str(resolved_adapters)))
+                .replace("__ADAPTERS_ROOT__", str(resolved_adapters))
+                .replace("__EXTRA_ENV__", _render_env(extra_env or {})))
     path = directory / UNIT_NAME
     path.write_text(rendered)
     os.chmod(path, 0o644)
