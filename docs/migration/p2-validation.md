@@ -135,7 +135,7 @@ Consequence for the P2 claim: **the plugin's execution mode, receipt reading and
 ## What remains unproven
 
 - No Opus-model independent review. The earlier Opus reviewer failed with `model_not_found` for `claude-opus-5`, and the exact-name retry session `333e2661-73d9-4bed-b7f8-eaaca366281a` produced no completed verdict.
-- The `TaskCompleted` hook was never fired by a real task-completion event: neither session completed a task, so no `TaskCompleted` event occurred in either round. It is covered by `tests/test_plugin_receipts.py` and was manually invoked against a round-2 PASS receipt (exit 0) and a round-2 `BLOCKED_ENV` receipt (exit 2).
+- The `TaskCompleted` hook was never fired by a real task-completion event: neither session completed a task, so no `TaskCompleted` event occurred in either round. It is covered by `tests/test_plugin_receipts.py` and was invoked directly, with `PATH` pointing at the installed CLI, on three events: a round-2 plugin PASS receipt (exit 0), a round-2 `BLOCKED_ENV` receipt (exit 2, "agent-gates rejected the requested receipt"), and an event with no receipt block (exit 0, hook inactive).
 - A full isolated-worktree development loop, as described above.
 
 ## Observed harness behaviour worth recording

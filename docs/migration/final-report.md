@@ -85,7 +85,7 @@ Both `verify` results were `valid: false`. Neither run was redirected to the ori
 - **Local trust only.** Receipts are per-user HMAC (`local-user-integrity`), not externally signed, and cannot resist a same-OS-user process.
 - **Occupancy is a snapshot** and cannot see a job starting after the probe.
 - **The plugin's full isolated-worktree loop was not demonstrated** — both exercises stopped at missing build configuration.
-- **The `TaskCompleted` hook was never fired by a real task-completion event.** It is covered by offline tests and by two manual invocations against real receipts — a round-2 PASS (exit 0) and a round-2 `BLOCKED_ENV` receipt (exit 2) — but no `TaskCompleted` event occurred in any recorded session.
+- **The `TaskCompleted` hook was never fired by a real task-completion event.** It is covered by offline tests and by direct invocation against real receipts — a round-2 plugin PASS (exit 0), a round-2 `BLOCKED_ENV` receipt (exit 2) and an event with no receipt block (exit 0, inactive) — but no `TaskCompleted` event occurred in any recorded session.
 - Also unestablished: compiler semantic correctness, coordination with other users' jobs, and a completed Opus review. Equivalence does not extend to Harness scheduling, approvals or model routing.
 
 ## Reproduction
