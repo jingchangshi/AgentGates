@@ -99,7 +99,7 @@ The fixes changed the adapter scripts, which correctly turned every round-1 rece
 
 ## Delivery
 
-Branch `migration/p0-p2` is pushed to `origin` (`git@github.com:jingchangshi/AgentGates.git`) at `67d29f3`. Both pushes this session were ordinary fast-forwards after re-proving the repository is PRIVATE immediately beforehand (the four-fact check above, re-run and appended to `.evidence/private-check.log` at 12:14:38 +08:00: anonymous API 404 for the target, 200 for the `git/git` control; authenticated `ls-remote` exit 0; nonexistent-repo control exit 128). No force push was used and none was needed.
+Branch `migration/p0-p2` is pushed to `origin` (`git@github.com:jingchangshi/AgentGates.git`); the tip is the commit that carries this file. Both pushes this session were ordinary fast-forwards after re-proving the repository is PRIVATE immediately beforehand (the four-fact check above, re-run and appended to `.evidence/private-check.log` at 12:14:38 +08:00: anonymous API 404 for the target, 200 for the `git/git` control; authenticated `ls-remote` exit 0; nonexistent-repo control exit 128). No force push was used and none was needed.
 
 `main` was **not** merged or pushed. It remains at the initial inventory commit `cc573c7`, and the remote has no `main` ref. The goal permits a fast-forward to `main` only when P0–P2 have all passed; the `tilelang-hivm-npu` Gate is still `BLOCKED_ENV` because no device was ever assigned, so a required Gate has no passing evidence. The branch is retained with that fact stated rather than a completion claim.
 
