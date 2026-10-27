@@ -1,6 +1,6 @@
 # Migration final report
 
-Repository `jingchangshi/AgentGates`, branch `migration/p0-p2` (the tip of that branch is the commit that carries this file), execution date 2026-10-27. Prior commits: `cc573c7` (inventory), `3994c69` (audited baseline and extraction semantics). `main` was deliberately not advanced; see [the delivery note](progress.md#delivery).
+Repository `jingchangshi/AgentGates`, branch `migration/p0-p2` (resolve its current tip with `git rev-parse origin/migration/p0-p2`; later documentation commits move it), execution date 2026-10-27. Prior commits: `cc573c7` (inventory), `3994c69` (audited baseline and extraction semantics). `main` was deliberately not advanced; see [the delivery note](progress.md#delivery).
 
 ## Objective and scope
 
