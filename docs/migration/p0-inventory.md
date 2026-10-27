@@ -15,7 +15,7 @@ Versions: Claude Code 2.1.296, Python 3.11.14, Node 24.20.0, Git 2.55.0, Docker 
 
 ## Environment and device boundaries
 
-The existing user build container is running. Its image content identity and bind mounts were inspected; `/home` and `/data` are mounted, allowing a future isolated worktree under those roots without remounting. No container was created, stopped, or rebuilt. The actual device model is Ascend950PR (A5), driver/npu-smi 25.7.rc1. Two device IDs are visible. At the current check neither lists a running process, but availability changes and idle state does not constitute assignment. No task-specific authorized device ID was present in the launching environment. NPU execution remains blocked until assignment is established.
+The existing user build container is running. Its image content identity and bind mounts were inspected; `/home` and `/data` are mounted, allowing a future isolated worktree under those roots without remounting. No container was created, stopped, or rebuilt. The actual device model is Ascend950PR (A5), driver/npu-smi 25.7.rc1. Two device IDs are visible. No task-specific authorized device ID was present in the launching environment, so NPU execution remained blocked regardless of occupancy. Occupancy is volatile and the two snapshots taken on this day disagree: this inventory recorded no process on either card, while the ledger recorded device 0 held by a Python process, and the later real probe runs found both cards held by other users' jobs (2 and 5 processes). Neither snapshot was ever treated as authorization, and no gate relied on the inventory reading.
 
 TileLang's existing machine file was parsed as data, using only adapter allowlisted keys. It specifies existing CANN 9.2.0 setup, an existing shared Conda installation and user environment, existing container identity, an existing installed `bishengir-compile`, and `Ascend950PR_9579` as target. The setup files and compiler executable exist inside the container. No private configuration file is committed. `TILELANG_HIVM_ENV_FILE`, `ASCENDNPU_ENV_FILE`, and `TILELANG_HIVM_DEVICE_ID` were unset in the launching environment. No Ascend adapter machine file was present beside its template; a local derived configuration may reuse verified existing toolchain/container values without modifying original files.
 
@@ -23,7 +23,7 @@ Both source trees have existing `build/build.ninja`. Ascend's configured C/C++ c
 
 ## Remote delivery prerequisite
 
-`gh` is not installed. No `GH_TOKEN`/`GITHUB_TOKEN` or usable HTTPS credential-helper password was found. Anonymous GitHub repository API lookup returned 404; the SSH remote is readable and empty, which cannot prove visibility. Consequently private visibility cannot currently be established and all pushes are prohibited. Local development and commits remain authorized. Do not infer private status from anonymous 404.
+`gh` is not installed. No `GH_TOKEN`/`GITHUB_TOKEN` or usable HTTPS credential-helper password was found. Anonymous GitHub repository API lookup returned 404; the SSH remote is readable and empty, which cannot prove visibility. Consequently private visibility could not be established at inventory time and all pushes were prohibited then. Do not infer private status from anonymous 404. Visibility was proven PRIVATE later with control tests; see the [execution ledger](progress.md#github-visibility).
 
 ## Source and installed pack audit
 
