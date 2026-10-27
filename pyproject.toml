@@ -7,7 +7,13 @@ name = "agent-gates"
 version = "0.1.0"
 description = "Standalone deterministic compiler engineering gates"
 requires-python = ">=3.11"
-dependencies = []
+# pydantic carries the versioned agent-facing API contract; mcp is the stdio
+# server that exposes the same contract to DSH. Both are pinned by major
+# version: the API models and the MCP schemas are a published contract.
+dependencies = [
+  "pydantic>=2.6,<3",
+  "mcp>=1.10,<3",
+]
 
 [project.scripts]
 agent-gates = "agent_gates.cli:main"
