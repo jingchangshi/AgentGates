@@ -67,6 +67,8 @@ These are the round-2 runs, taken after the review fixes changed the adapter scr
 
 `claude plugin validate ./integrations/claude-code` passes with no warnings. A fresh `claude -p --plugin-dir` session exercises the three skills against the installed CLI; the results, including honest worktree blockers, are recorded in [P2 validation](migration/p2-validation.md).
 
+A fresh clone of the branch is also checked before delivery: `python3 -m pytest -q` and `claude plugin validate ./integrations/claude-code` both pass there, and `git diff --check` reports no whitespace errors.
+
 ## What this suite does not establish
 
 - Compiler semantic correctness. The gates bind identities and outcomes; they do not prove the compiler is right.
