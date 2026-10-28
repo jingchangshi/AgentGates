@@ -61,8 +61,15 @@ the mechanism behind "do not release a lock still in use".
 ### `RuntimeMaxSec` as the wedge backstop
 
 A recipe owns its own timeout. `RuntimeMaxSec` is the second layer for a worker
-whose own supervisor never returns. Measured: a real TileLang build gate and a
-real regression gate both completed well inside it.
+whose own supervisor never returns.
+
+It is derived, not chosen: `systemd_units.backstop_seconds()` returns the largest
+installed recipe timeout plus a 300 s margin, and `install()` refuses a smaller
+explicit value. The current value is 23700 s, because `ascend-build` can take a
+from-zero full build (LLVM, BiShengIR, triton and the shmem template) bounded at
+21600 s container-side inside a 23400 s recipe. A hard-coded 7200 s — the previous
+value — would have killed such a build in its second hour while the manifest
+declared it legitimate.
 
 ### Environment: fixed, not inherited
 
@@ -78,11 +85,17 @@ starts failed with `ModuleNotFoundError` under `-I` and `-E`.
 
 ### Adapter-specific machine facts
 
-An adapter that reads container identity from its process environment (as
-`ascendnpu-ir` does) needs those values in the unit. `install()` takes an
-`extra_env` mapping, written as `Environment=` lines. Names are validated against
-`[A-Z_][A-Z0-9_]*` and values must be single-line, so a value cannot inject a new
-unit directive.
+Every adapter now reads its machine parameters from its `env.sh`, so no container
+identity belongs in the unit. `install()` still accepts an `extra_env` mapping,
+written as `Environment=` lines, for switches that are genuinely properties of the
+worker environment. Names are validated against `[A-Z_][A-Z0-9_]*` and values must
+be single-line, so a value cannot inject a new unit directive.
+
+An `Environment=ASCENDNPU_CONTAINER_*` left over from an older unit is refused by
+the bridge, because the key is absent from the file while present in the
+environment. Migrate by writing the `env.sh` first, checking it with
+`--check-config`, then reinstalling the unit and stopping any worker still
+carrying the old environment.
 
 ## Lifecycle
 
@@ -116,7 +129,8 @@ does not describe.
 ```python
 from agent_gates import systemd_units
 systemd_units.available()            # (usable, reason) - never raises
-systemd_units.install(python, timeout_seconds=7200, extra_env={...})
+systemd_units.install(python)        # RuntimeMaxSec derived from the manifests
+systemd_units.install(python, timeout_seconds=24000)   # larger is allowed
 ```
 
 `install()` writes the template, sets mode 0644 and runs `systemctl --user

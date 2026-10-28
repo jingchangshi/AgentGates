@@ -18,16 +18,21 @@ Keep machine files outside the package and pass an absolute `--env-file`. Files 
 
 `--env-file` maps to `ASCENDNPU_ENV_FILE` for Ascend and `TILELANG_HIVM_ENV_FILE` for both TileLang adapters. Without an explicit selection, bridges look beside the packaged adapter template, retaining the legacy owning-checkout search for installed pack compatibility. They never search a user's home for machine files. An explicitly selected missing file fails.
 
-Ascend permits only `ASCENDNPU_CANN_SETUP`, `ASCENDNPU_CONDA_SH`, `ASCENDNPU_CONDA_ENV`, and optional `ASCENDNPU_CCEC_BIN`. CCEC is used by the manual full-build helper, not incremental gates. The launching environment must supply `ASCENDNPU_CONTAINER_NAME`, `ASCENDNPU_CONTAINER_USER`, and absolute `ASCENDNPU_CONTAINER_HOME`. Optional launch values select a plain build subdirectory, positive Ninja jobs and declared container source; no compiler target can be replaced through these values.
+Ascend permits `ASCENDNPU_CANN_SETUP`, `ASCENDNPU_CONDA_SH`, `ASCENDNPU_CONDA_ENV`, optional `ASCENDNPU_CCEC_BIN`, the container identity `ASCENDNPU_CONTAINER_NAME` / `_USER` / `_HOME`, `ASCENDNPU_CONTAINER_SOURCE`, and the build selection `ASCENDNPU_BUILD_SUBDIR` / `ASCENDNPU_NINJA_JOBS`. All of them are file keys: the launching environment is not a configuration source for any adapter. `ASCENDNPU_CCEC_BIN` is needed only by the from-zero branch, and `ASCENDNPU_CONTAINER_SOURCE` confirms the container path of the checkout rather than inventing one - the bind-mount mapping is still derived and compared. Only `ASCENDNPU_GATE_TIMEOUT` remains a launch value, because it bounds an invocation rather than describing the machine.
+
+An export that the file does not define is refused, and an export that disagrees with the file is refused, so neither a stale shell nor a stale file can silently win. Sourcing `env.sh` and then running a gate is still supported, because the export then equals the file. AgentGates resolves the same file to take its `build:<dir>` lease, so a lock on one tree cannot cover a run writing another.
+
+`ascend-build` selects its mode from the build directory inside the container: `build.ninja` present means incremental Ninja, neither `build.ninja` nor `CMakeCache.txt` means a from-zero full build through the pinned `scripts/full-build.sh` followed by product checks, and `CMakeCache.txt` without `build.ninja` is refused. The full build never deletes a tree, refuses `-r`/`--rebuild`, and never overwrites an existing `build.log`. `ascend-regression` runs an existing tree and carries no full-build branch.
 
 TileLang's shared file permits:
 
-- `TILELANG_HIVM_CONTAINER_NAME`, `TILELANG_HIVM_CONTAINER_USER`, `TILELANG_HIVM_CONTAINER_HOME`;
+- `TILELANG_HIVM_CONTAINER_NAME`, `TILELANG_HIVM_CONTAINER_USER`, `TILELANG_HIVM_CONTAINER_HOME`, `TILELANG_HIVM_CONTAINER_SOURCE`;
 - `TILELANG_HIVM_CANN_SETUP`, `TILELANG_HIVM_CONDA_SH`, `TILELANG_HIVM_CONDA_ENV`, `TILELANG_HIVM_CONDA_ENVS_PATH`;
 - `TILELANG_HIVM_HIVM_COMPILER`, `TILELANG_HIVM_HIVM_TARGET`;
+- the build selection `TILELANG_HIVM_BUILD_SUBDIR`, `TILELANG_HIVM_NINJA_JOBS`;
 - manual provisioning keys `TILELANG_HIVM_WHEEL_DIR`, `TILELANG_HIVM_PIP_INDEX`, `TILELANG_HIVM_PYTHON_VERSION`, `TILELANG_HIVM_SOURCE_ROOT`.
 
-The file's container identity overrides stale launching exports. The NPU gate accepts the user key but runs as root, preserving the upstream `uda_occupy_dev_by_ns` workaround. A configured HIVM compiler must be an absolute executable container path. Its optional target can only be `Ascend950PR_9579`; compiler and target are explicitly forwarded as `HIVM_COMPILER` and `HIVM_TARGET`.
+The file's container identity overrides stale launching exports, and `TILELANG_HIVM_CONTAINER_SOURCE` follows the same rule: it confirms the container path of the checkout when that differs from the derived bind-mount mapping, and because the mapping is still computed and compared, the key can confirm a path but never invent one. The NPU gate accepts the user key but runs as root, preserving the upstream `uda_occupy_dev_by_ns` workaround. A configured HIVM compiler must be an absolute executable container path. Its optional target can only be `Ascend950PR_9579`; compiler and target are explicitly forwarded as `HIVM_COMPILER` and `HIVM_TARGET`.
 
 ## Commands and checks
 

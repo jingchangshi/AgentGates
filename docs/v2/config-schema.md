@@ -31,7 +31,8 @@ evidence_root = "/home/agent/.local/state/agent-gates/v2/evidence"
 env_file = "/home/agent/work/AgentGates/agent_gates/adapters/tilelang-hivm/env.sh"
 
 [adapters.ascendnpu-ir]
-# no env_file: this adapter takes container identity from the worker environment
+# the same kind of file: container identity, build directory and toolchain
+env_file = "/home/agent/work/AgentGates/agent_gates/adapters/ascendnpu-ir/env.sh"
 
 [workspaces.tilelang]
 source_root = "/home/agent/work/tilelang"

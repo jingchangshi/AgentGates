@@ -7,6 +7,7 @@ import re
 from .evaluator import evaluate
 from .evidence import EvidenceStore, aggregate
 from .executor import execute, executable_identity, file_reference, now
+from . import machine_env
 from .locking import acquire
 from .manifest import Manifest, ManifestError, SHA256
 from .registry import Registry
@@ -105,6 +106,32 @@ def configuration(manifest, env):
             "inheritedEnvironmentSha256": hashlib.sha256(inherited.encode()).hexdigest()}
 
 
+def build_directory(source: Path, manifest: Manifest, env) -> Path:
+    """The build tree a run will write, resolved from the Adapter's machine file.
+
+    The build directory is a machine fact that lives in the same `env.sh` the
+    Adapter reads. Resolving it here from the same file is what keeps the lease
+    consistent with the work: reading `ASCENDNPU_BUILD_SUBDIR` from the launching
+    shell while the Adapter read the file let one run hold a lock on `build`
+    while building `build-fast`, so two runs could write one tree.
+
+    The Adapter's own file wins, and an inherited export is used only when no
+    file defines the key - the same rule the Adapter applies, so the two cannot
+    disagree about which directory is leased.
+    """
+    if manifest.id not in machine_env.ADAPTERS:
+        # A fixture or third-party adapter keeps its own convention: it was never
+        # migrated to a machine file, so the launching environment is all it has.
+        return (source / env.get(manifest.id.upper().replace("-", "_") + "_BUILD_SUBDIR",
+                                 "build")).resolve()
+    try:
+        machine = machine_env.read(manifest.id, env, env_file=None)
+        name = machine.build_subdir
+    except machine_env.MachineEnvError as exc:
+        raise ValueError(str(exc)) from exc
+    return (source / name).resolve()
+
+
 def artifact_inputs(source, manifest, env):
     """Known existing compiler products, before an observation-only regression."""
     paths = []
@@ -116,7 +143,7 @@ def artifact_inputs(source, manifest, env):
             dirs[:] = [name for name in dirs if name != ".git"]
             paths.extend(Path(directory) / name for name in files if ".so" in name and (name.endswith(".so") or ".so." in name))
     elif manifest.id == "ascendnpu-ir":
-        build = source / env.get("ASCENDNPU_BUILD_SUBDIR", "build")
+        build = build_directory(source, manifest, env)
         paths.extend(build / "bin" / name for name in ("bishengir-opt", "bishengir-compile"))
     result = {}
     for path in paths:
@@ -200,8 +227,10 @@ class Engine:
         try:
             receipt["configuration"] = configuration(manifest, env)
             resources = ["source:" + str(source)]
-            build_prefix = "ASCENDNPU" if manifest.id == "ascendnpu-ir" else "TILELANG_HIVM"
-            build = (source / env.get(build_prefix + "_BUILD_SUBDIR", "build")).resolve()
+            # The lease names the directory the Adapter will actually write. Both
+            # sides resolve it from the Adapter's machine file, so a lock and its
+            # build cannot describe two different trees.
+            build = build_directory(source, manifest, env)
             resources.append("build:" + str(build))
             if manifest.id == "tilelang-hivm-npu":
                 device = env.get("TILELANG_HIVM_DEVICE_ID", "")

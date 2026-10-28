@@ -151,6 +151,35 @@ TILELANG_HIVM_CONTAINER_USER=
 # HOME inside the container. Normally covered by the /home bind mount.
 TILELANG_HIVM_CONTAINER_HOME=
 
+# The container path of this checkout, when the container sees it at a different
+# path than the bind-mount mapping derives. Leave the line out to use the derived
+# mapping, which is what a /home:/home mount needs.
+#
+# It confirms a path; it cannot invent one. The mapping is still computed from
+# `docker inspect` and compared, so a value that disagrees with the mounts is
+# refused. It lives here rather than in the launching shell because it decides
+# which tree both Gates run in.
+#
+# TILELANG_HIVM_CONTAINER_SOURCE=/workspace/tilelang
+
+# ---------------------------------------------------------------------------
+# Build selection
+# ---------------------------------------------------------------------------
+# Which tree this Adapter builds in, and how wide. Both are machine facts for the
+# same reason the container is: AgentGates takes its build lock and records its
+# artifacts from this same file, so a lock on 'build' never covers a Gate writing
+# 'build-fast'.
+#
+# BUILD_SUBDIR is one plain directory name under the source root; a path
+# separator, '.' or '..' is refused, and so is an empty value -- unset it by
+# leaving the line out, which gives 'build'.
+#
+# NINJA_JOBS is a positive integer. Left out, the container uses its own CPU
+# count and cgroup limits.
+#
+# TILELANG_HIVM_BUILD_SUBDIR=build
+# TILELANG_HIVM_NINJA_JOBS=64
+
 # ---------------------------------------------------------------------------
 # Provisioning — read only by scripts/setup-python-env.sh
 # ---------------------------------------------------------------------------

@@ -42,17 +42,28 @@ usable, reason = systemd_units.available()
 assert usable, reason
 
 c = load()
-systemd_units.install(
-    c.worker.python,
-    timeout_seconds=7200,
-    # Adapter-specific machine facts an adapter reads from its environment
-    extra_env={
-        "ASCENDNPU_CONTAINER_NAME": "s00653124-tilelang-hivm",
-        "ASCENDNPU_CONTAINER_USER": "s00653124",
-        "ASCENDNPU_CONTAINER_HOME": "/home/s00653124",
-    },
-)
+systemd_units.install(c.worker.python)
 ```
+
+`timeout_seconds` 省略时按已安装的 manifest 推导 `RuntimeMaxSec`
+（`systemd_units.backstop_seconds()`，当前是「最长配方超时 + 300s」）。不要写死 7200：
+ascend-build 现在可以从空目录做全量构建，72 分钟会把它腰斩；显式传一个小于推导值的数
+会被拒绝并告诉你最小值。
+
+容器身份、构建目录、并行度这些机器参数**不再**通过 `extra_env` 写进单元：
+它们只来自各 adapter 的 `env.sh`（见 `docs/v2/env-sh-guide.md`）。`extra_env` 现在只
+用于确实由 worker 环境决定的开关。
+
+### 从旧单元迁移
+
+旧单元里可能有 `Environment=ASCENDNPU_CONTAINER_*`。新版本会把它当作「文件里没有、
+环境里有」的配置而拒绝启动，所以迁移顺序是：
+
+1. 先写好 `agent_gates/adapters/ascendnpu-ir/env.sh`（含三个 `ASCENDNPU_CONTAINER_*`）。
+2. 运行 `.venv/bin/python -B agent_gates/adapters/ascendnpu-ir/scripts/docker_gate.py --check-config`，
+   确认输出 `configuration valid`。
+3. 再重新 `install()` 覆盖单元（不带 `extra_env`），并 `systemctl --user daemon-reload`。
+4. 停掉正在跑的 `agent-gates-worker@*`，否则它们仍带着旧环境。
 
 ### 自检
 

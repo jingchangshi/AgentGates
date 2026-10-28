@@ -79,16 +79,23 @@ class ManifestCase(unittest.TestCase):
             self.assertEqual(recipe['cwd'], 'source')
             self.assertEqual(recipe['argv'][:3], ['python3', '-B', '{pack}/scripts/docker_gate.py'])
             self.assertEqual(recipe['argv'][3], '--timeout')
-        # Outer Harness bound must exceed the container-side ceiling.
-        self.assertEqual(build['timeout'], 900)
+        # Outer Harness bound must exceed the container-side ceiling. It is the
+        # full-build ceiling that sets it: the same Gate takes either path, and a
+        # bound smaller than a cold full build would make the from-zero branch
+        # unreachable rather than supported.
+        self.assertEqual(build['timeout'], 23400)
         self.assertEqual(int(build['argv'][4]) < build['timeout'], True)
+        self.assertEqual(build['argv'][5], '--full-build-timeout')
+        self.assertLess(int(build['argv'][6]) + bridge.KILL_AFTER_SECONDS, build['timeout'])
         # Measured by a real run: 1142 tests across 256 lit workers in 2.7s wall
         # clock (1009 passed, 0 failed). The original bound is ample, so a larger
         # timeout would only delay noticing a genuine hang.
         self.assertEqual(regression['timeout'], 1200)
         self.assertEqual(int(regression['argv'][4]) < regression['timeout'], True)
-        self.assertEqual(build['argv'][5:], ['bishengir-opt', 'bishengir-compile',
-                                            'install-bishengir-publish-products'])
+        self.assertEqual(build['argv'][5:7], ['--full-build-timeout', '21600'])
+        self.assertEqual(build['argv'][7], '--allow-full-build')
+        self.assertEqual(build['argv'][8:], ['bishengir-opt', 'bishengir-compile',
+                                             'install-bishengir-publish-products'])
         self.assertEqual(regression['argv'][5:], ['check-bishengir'])
         # The Adapter is a fixed bridge: no recipe may interpolate goal text.
         for recipe in (build, regression):
@@ -101,16 +108,31 @@ class ManifestCase(unittest.TestCase):
         manifest = load_manifest(ADAPTER / 'manifest.json')
         recipes = {item['id']: item for item in manifest['recipes']}
         self.assertEqual(bridge.KILL_AFTER_SECONDS, 15)
-        for recipe_id, outer, inner in ((('ascendnpu-ir.incremental-build'), 900, 840),
-                                        (('ascendnpu-ir.regression'), 1200, 1140)):
-            recipe = recipes[recipe_id]
-            self.assertEqual(recipe['timeout'], outer, recipe_id)
+        # Both container-side bounds of the build recipe nest inside its outer
+        # bound, and the regression recipe keeps its measured pair.
+        build = recipes['ascendnpu-ir.incremental-build']
+        regression = recipes['ascendnpu-ir.regression']
+        for inner in (int(build['argv'][4]), int(build['argv'][6])):
+            self.assertLess(inner + bridge.KILL_AFTER_SECONDS, build['timeout'])
+        self.assertEqual(regression['timeout'], 1200)
+        self.assertLess(int(regression['argv'][4]) + bridge.KILL_AFTER_SECONDS,
+                        regression['timeout'])
+        for recipe in (build, regression):
             self.assertEqual(recipe['argv'][3], '--timeout')
-            self.assertEqual(int(recipe['argv'][4]), inner, recipe_id)
-            # `timeout` must expire, and its SIGKILL grace must elapse, before the
-            # Process Supervisor's own bound: otherwise the Harness kills the
-            # supervisor and the Gate never reports the container's exit code.
-            self.assertLess(inner + bridge.KILL_AFTER_SECONDS, outer, recipe_id)
+
+    def test_the_worker_backstop_outlives_every_installed_recipe(self):
+        # The unit's RuntimeMaxSec is derived, not guessed: a backstop shorter
+        # than a recipe's own bound would kill work the manifest declares
+        # legitimate, which is exactly what would happen to a from-zero build
+        # under the old fixed 7200 s.
+        from agent_gates import systemd_units
+        from agent_gates.registry import Registry
+        backstop = systemd_units.backstop_seconds(Registry())
+        longest = max(float(recipe['timeout'])
+                      for manifest in Registry().list()
+                      for recipe in manifest.recipes.values())
+        self.assertGreater(backstop, longest)
+        self.assertEqual(backstop, int(longest) + systemd_units.BACKSTOP_MARGIN_SECONDS)
 
     def test_container_script_pins_the_short_kill_after(self):
         script = bridge.container_script('/src', 'build', '64', 840, None, None, None)
@@ -167,19 +189,59 @@ class ManifestCase(unittest.TestCase):
 
     def test_explicit_timeout_wins_over_the_environment(self):
         os.environ['ASCENDNPU_GATE_TIMEOUT'] = '5'
-        timeout, targets = bridge.timeout_seconds(['--timeout', '840', 'check-bishengir'])
+        timeout, full, targets, allow_full = bridge.timeout_seconds(
+            ['--timeout', '840', 'check-bishengir'])
         self.assertEqual(timeout, 840)
         self.assertEqual(targets, ['check-bishengir'])
+        # A full build is opt-in per recipe; the default is "existing tree only".
+        self.assertFalse(allow_full)
+        # The from-zero bound is separate: one number cannot serve an incremental
+        # Ninja run and a cold full build.
+        self.assertEqual(full, bridge.FULL_BUILD_TIMEOUT)
         # A bare invocation is the only path that reads the environment.
         self.assertEqual(bridge.timeout_seconds(['check-bishengir'])[0], 5)
         os.environ.pop('ASCENDNPU_GATE_TIMEOUT', None)
         self.assertEqual(bridge.timeout_seconds(['check-bishengir'])[0], 1500)
 
+    def test_the_full_build_bound_is_explicit_and_separately_bounded(self):
+        # The manifest passes both bounds. A full build cannot be expressed by the
+        # incremental one, so it is a distinct flag with its own value, and the
+        # environment can only supply it when the caller passes nothing.
+        os.environ['ASCENDNPU_FULL_BUILD_TIMEOUT'] = '77'
+        with self.assertRaises(bridge.BridgeError):
+            bridge.timeout_seconds(['--full-build-timeout', '0', 'bishengir-opt'])
+        with self.assertRaises(bridge.BridgeError):
+            bridge.timeout_seconds(['--timeout', '840', '--timeout', '900', 'bishengir-opt'])
+        self.assertEqual(bridge.timeout_seconds(['bishengir-opt'])[1], 77)
+        os.environ.pop('ASCENDNPU_FULL_BUILD_TIMEOUT', None)
+        _, full, _, _ = bridge.timeout_seconds(['--timeout', '840', 'bishengir-opt'])
+        self.assertEqual(full, bridge.FULL_BUILD_TIMEOUT)
+
+    def test_only_the_build_recipe_may_build_from_an_empty_tree(self):
+        # The regression gate is a test of an existing tree. If it could trigger a
+        # full build, an unbuilt checkout would report PASS for a command naming
+        # targets that never ran.
+        manifest = load_manifest(ADAPTER / 'manifest.json')
+        recipes = {item['id']: item for item in manifest['recipes']}
+        self.assertIn('--allow-full-build', recipes['ascendnpu-ir.incremental-build']['argv'])
+        self.assertNotIn('--allow-full-build', recipes['ascendnpu-ir.regression']['argv'])
+        self.assertFalse(bridge.timeout_seconds(['--timeout', '1140', 'check-bishengir'])[3])
+
+    def test_the_regression_script_refuses_to_build_from_scratch(self):
+        script = bridge.container_script('/src', 'build', '4', 840, None, None, None)
+        self.assertIn('runs an existing build tree and never builds from scratch', script)
+        self.assertNotIn('full_build /src', script)
+        # The build gate's own script does carry the branch.
+        allowed = bridge.container_script('/src', 'build', '4', 840, None, None, None,
+                                          allow_full_build=True)
+        self.assertIn('full_build /src', allowed)
+        self.assertNotIn('never builds from scratch', allowed)
+
     def test_manifest_recipes_never_rely_on_the_environment_default(self):
         manifest = load_manifest(ADAPTER / 'manifest.json')
         for recipe in manifest['recipes']:
             with patch.dict(os.environ, {'ASCENDNPU_GATE_TIMEOUT': '1'}):
-                timeout, _ = bridge.timeout_seconds(recipe['argv'][3:])
+                timeout = bridge.timeout_seconds(recipe['argv'][3:])[0]
             self.assertEqual(timeout, int(recipe['argv'][4]), recipe['id'])
             self.assertNotEqual(timeout, 1, recipe['id'])
 
@@ -200,62 +262,80 @@ class ManifestCase(unittest.TestCase):
 
 
 class EnvironmentCase(unittest.TestCase):
+    """Machine values come from an explicit temporary file, never the shell.
+
+    Every case names its own `ASCENDNPU_ENV_FILE`, so the outcome cannot depend
+    on whether the machine running the suite happens to keep a real, git-ignored
+    `env.sh` beside the packaged adapter.
+    """
+
     def setUp(self):
         self.saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.saved)))
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.machine = self.root / 'env.sh'
+        for name in list(os.environ):
+            if name.startswith('ASCENDNPU_'):
+                os.environ.pop(name)
+
+    def use_machine_file(self, **values):
+        text = ''.join(f'{key}={value}' + chr(10) for key, value in values.items())
+        self.machine.write_text(text)
+        os.environ['ASCENDNPU_ENV_FILE'] = str(self.machine)
+        return self.machine
 
     def test_build_subdir_traversal_is_refused(self):
-        for value in ('..', '../build', 'a/b', '/build', '.', '', 'build/..'):
-            os.environ['ASCENDNPU_BUILD_SUBDIR'] = value
-            with self.assertRaises(bridge.BridgeError):
+        for value in ('..', '../build', 'a/b', '/build', '.', 'build/..'):
+            self.use_machine_file(ASCENDNPU_BUILD_SUBDIR=value)
+            with self.assertRaises(bridge.BridgeError, msg=repr(value)):
                 bridge.build_subdir()
+        # An empty key is a typo, not "use the default".
+        self.use_machine_file(ASCENDNPU_BUILD_SUBDIR='')
+        with self.assertRaises(bridge.BridgeError):
+            bridge.build_subdir()
 
     def test_build_subdir_default_and_plain_names(self):
-        os.environ.pop('ASCENDNPU_BUILD_SUBDIR', None)
+        self.use_machine_file(ASCENDNPU_CANN_SETUP='')
         self.assertEqual(bridge.build_subdir(), 'build')
-        os.environ['ASCENDNPU_BUILD_SUBDIR'] = 'build-release'
+        self.use_machine_file(ASCENDNPU_BUILD_SUBDIR='build-release')
         self.assertEqual(bridge.build_subdir(), 'build-release')
 
     def test_jobs_defaults_to_container_nproc(self):
-        os.environ.pop('ASCENDNPU_NINJA_JOBS', None)
+        self.use_machine_file(ASCENDNPU_CANN_SETUP='')
         self.assertEqual(bridge.ninja_jobs(), '$(nproc)')
-        os.environ['ASCENDNPU_NINJA_JOBS'] = '0'
+        self.use_machine_file(ASCENDNPU_NINJA_JOBS='0')
         with self.assertRaises(bridge.BridgeError):
             bridge.ninja_jobs()
-        os.environ['ASCENDNPU_NINJA_JOBS'] = '64'
+        self.use_machine_file(ASCENDNPU_NINJA_JOBS='64')
         self.assertEqual(bridge.ninja_jobs(), '64')
 
-    def test_required_container_variables_fail_closed(self):
-        for name in ('ASCENDNPU_CONTAINER_NAME', 'ASCENDNPU_CONTAINER_USER',
-                     'ASCENDNPU_CONTAINER_HOME'):
-            os.environ.pop(name, None)
-            with self.assertRaises(bridge.BridgeError):
-                bridge.env_value(name, required=True)
-
-    def test_relative_tool_paths_are_refused(self):
-        for name in ('ASCENDNPU_CANN_SETUP', 'ASCENDNPU_CONDA_SH'):
-            os.environ[name] = 'relative/path.sh'
-            with self.assertRaises(bridge.BridgeError):
-                bridge.env_path(name)
-            os.environ.pop(name, None)
-
-    def test_ascendnpu_cmake_bin_is_no_longer_a_supported_variable(self):
-        # The dedicated CMake override was removed; the Adapter resolves cmake
-        # from the container PATH instead. Nothing in the source may read it.
-        self.assertNotIn('ASCENDNPU_CMAKE_BIN', BRIDGE.read_text())
-
-    def test_partial_conda_configuration_is_refused(self):
-        # Only CONDA_SH or only CONDA_ENV is a configuration error, and it must
-        # fail closed rather than silently skipping activation.
+    def test_a_non_empty_export_is_never_a_configuration_source(self):
+        # The user's requirement: only `env.sh` configures a machine. An export
+        # the file does not define looks like configuration but would have no
+        # effect, so it is refused rather than obeyed or silently dropped.
+        self.use_machine_file(ASCENDNPU_CANN_SETUP='')
+        os.environ['ASCENDNPU_BUILD_SUBDIR'] = 'build-fast'
         with self.assertRaises(bridge.BridgeError) as error:
-            bridge.require_conda_pair(Path('/c/conda.sh'), None)
-        self.assertIn('together', str(error.exception))
-        with self.assertRaises(bridge.BridgeError):
-            bridge.require_conda_pair(None, 'env311')
+            bridge.build_subdir()
+        self.assertIn('read only from', str(error.exception))
 
-    def test_absent_conda_configuration_is_allowed(self):
-        bridge.require_conda_pair(None, None)  # must not raise
+    def test_a_contradicting_export_is_refused(self):
+        self.use_machine_file(ASCENDNPU_BUILD_SUBDIR='build')
+        os.environ['ASCENDNPU_BUILD_SUBDIR'] = 'build-fast'
+        with self.assertRaises(bridge.BridgeError) as error:
+            bridge.build_subdir()
+        self.assertIn('two values', str(error.exception))
 
+    def test_an_export_that_agrees_with_the_file_is_accepted(self):
+        # Sourcing `env.sh` and then running a Gate is a supported workflow: the
+        # export duplicates the file, so nothing is ambiguous.
+        self.use_machine_file(ASCENDNPU_BUILD_SUBDIR='build-release',
+                              ASCENDNPU_NINJA_JOBS='8')
+        os.environ['ASCENDNPU_BUILD_SUBDIR'] = 'build-release'
+        self.assertEqual(bridge.build_subdir(), 'build-release')
+        self.assertEqual(bridge.ninja_jobs(), '8')
 
 class EnvFileCase(unittest.TestCase):
     """CANN/Conda come from the toolchain file, which is authoritative.
@@ -373,11 +453,20 @@ class EnvFileCase(unittest.TestCase):
 
     def test_the_sample_template_is_valid_and_has_no_values(self):
         # The committed template must parse and must not configure this machine.
-        # ASCENDNPU_CCEC_BIN belongs there with the rest: full-build.sh reads it,
-        # and the Gate ignores it.
+        # It names every machine fact the Adapter reads - the toolchain, the
+        # container it enters and the build selection - and leaves each one for
+        # the operator. The build selection is shown commented out, because an
+        # empty value there is a typo rather than "use the default".
         sample = ADAPTER / 'env.example.sh'
         values = bridge._parse_env_file(sample.read_text(), sample)
-        self.assertEqual(set(values), set(bridge.TOOLCHAIN_KEYS) | {'ASCENDNPU_CCEC_BIN'})
+        self.assertEqual(set(values),
+                         set(bridge.FILE_KEYS) - set(bridge.BUILD_KEYS) - set(bridge.SOURCE_KEYS))
+        for name in bridge.CONTAINER_KEYS + ('ASCENDNPU_CCEC_BIN',):
+            self.assertEqual(values[name], '', name)
+        # Optional selections are shown commented out: an empty key there is a
+        # typo, and leaving the line out is how the file says "use the default".
+        for name in bridge.BUILD_KEYS + bridge.SOURCE_KEYS:
+            self.assertIn(f'# {name}=', sample.read_text(), name)
         self.assertEqual(set(values.values()), {''})
 
     def test_a_key_the_gate_does_not_use_is_ignored_not_rejected(self):
@@ -503,21 +592,22 @@ class RunCase(unittest.TestCase):
         origin = os.getcwd()
         self.addCleanup(os.chdir, origin)
         os.chdir(self.source)
-        os.environ.update({
-            'ASCENDNPU_CONTAINER_NAME': 'fake-container',
-            'ASCENDNPU_CONTAINER_USER': 'u',
-            'ASCENDNPU_CONTAINER_HOME': '/home/u',
-        })
-        for name in ('ASCENDNPU_CONTAINER_SOURCE', 'ASCENDNPU_CANN_SETUP',
-                     'ASCENDNPU_CONDA_SH', 'ASCENDNPU_CONDA_ENV', 'ASCENDNPU_BUILD_SUBDIR',
-                     'ASCENDNPU_NINJA_JOBS', 'ASCENDNPU_GATE_TIMEOUT', 'ASCENDNPU_ENV_FILE'):
-            os.environ.pop(name, None)
-        # These cases exercise the Docker bridge, not the toolchain file, and the
-        # default file may exist on the machine running the suite. Point the
-        # loader at an empty file so the run sees an unconfigured toolchain.
-        empty = self.root / 'no-toolchain.env'
-        empty.write_text('# no toolchain on this machine\n')
-        os.environ['ASCENDNPU_ENV_FILE'] = str(empty)
+        for name in list(os.environ):
+            if name.startswith('ASCENDNPU_'):
+                os.environ.pop(name)
+        # These cases exercise the Docker bridge, so they name their own machine
+        # file. Reading the packaged one would make the suite depend on whether
+        # this particular machine keeps a real, git-ignored `env.sh`.
+        self.machine = self.root / 'env.sh'
+        self.write_machine({'ASCENDNPU_CONTAINER_NAME': 'fake-container',
+                            'ASCENDNPU_CONTAINER_USER': 'u',
+                            'ASCENDNPU_CONTAINER_HOME': '/home/u'})
+        os.environ['ASCENDNPU_ENV_FILE'] = str(self.machine)
+
+    def write_machine(self, values):
+        self.machine.write_text(''.join(f'{key}={value}' + chr(10)
+                                        for key, value in values.items()))
+        return self.machine
 
     def fake_docker(self, *, mounts, inspect_ok=True, identity=None, ninja_exit=0, calls=None):
         stat = self.source.stat()
@@ -608,11 +698,46 @@ class RunCase(unittest.TestCase):
 
     def test_declared_container_source_must_match_the_mapping(self):
         mounts = [{'Type': 'bind', 'Source': str(self.root), 'Destination': str(self.root)}]
-        os.environ['ASCENDNPU_CONTAINER_SOURCE'] = '/a/different/path'
+        self.write_machine({'ASCENDNPU_CONTAINER_NAME': 'fake-container',
+                            'ASCENDNPU_CONTAINER_USER': 'u',
+                            'ASCENDNPU_CONTAINER_HOME': '/home/u',
+                            'ASCENDNPU_CONTAINER_SOURCE': '/a/different/path'})
         with patch('subprocess.run', side_effect=self.fake_docker(mounts=mounts)):
             with self.assertRaises(bridge.BridgeError) as error:
                 bridge.main(['bishengir-opt'])
         self.assertIn('does not match the bind-mount mapping', str(error.exception))
+
+    def test_the_declared_container_source_is_machine_configuration(self):
+        # It decides which tree the Gate runs in, so it belongs in the file with
+        # the container identity - not in the launching shell, where a stale
+        # export would gate a directory nobody recorded.
+        mounts = [{'Type': 'bind', 'Source': str(self.root), 'Destination': str(self.root)}]
+        os.environ['ASCENDNPU_CONTAINER_SOURCE'] = str(self.source)
+        with patch('subprocess.run', side_effect=self.fake_docker(mounts=mounts)) as run:
+            with self.assertRaises(bridge.BridgeError) as error:
+                bridge.main(['bishengir-opt'])
+        self.assertIn('read only from', str(error.exception))
+        self.assertFalse(any(call[:2] == ['docker', 'exec'] for call in run.call_args_list))
+
+    def test_a_file_declared_container_source_is_honoured_when_it_matches(self):
+        # A checkout mounted at a different container path: the file confirms the
+        # path, and the derived mapping must still agree with it.
+        visible = self.root / 'visible'
+        visible.mkdir()
+        self.source.rename(visible / 'source')
+        self.source = visible / 'source'
+        self.write_machine({'ASCENDNPU_CONTAINER_NAME': 'fake-container',
+                            'ASCENDNPU_CONTAINER_USER': 'u',
+                            'ASCENDNPU_CONTAINER_HOME': '/home/u',
+                            'ASCENDNPU_CONTAINER_SOURCE': str(self.source)})
+        mounts = [{'Type': 'bind', 'Source': str(self.root), 'Destination': str(self.root)}]
+        calls = []
+        with patch('subprocess.run', side_effect=self.fake_docker(mounts=mounts, calls=calls)):
+            self.assertEqual(bridge.main(['bishengir-opt']), 0)
+        exec_calls = [c for c in calls if c[:2] == ['docker', 'exec']]
+        self.assertTrue(exec_calls)
+        self.assertIn(f'-w', exec_calls[0])
+        self.assertIn(str(self.source), exec_calls[0])
 
     def test_no_source_logs_are_written(self):
         mounts = [{'Type': 'bind', 'Source': str(self.root), 'Destination': str(self.root)}]
@@ -788,13 +913,106 @@ class ScriptExecutionCase(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(marker.exists(), 'the conda-provided ninja was not used')
 
-    def test_missing_build_ninja_does_not_create_the_directory(self):
+    def stage_a_fake_build_script(self, status=0, products=True):
+        """A fake build.sh that records its argv and leaves the real products."""
+        recorded = self.root / 'build-args'
+        tools = self.source / 'build-tools'
+        tools.mkdir(exist_ok=True)
+        script = ['#!/bin/bash', 'printf "%s\\n" "$@" > ' + shlex.quote(str(recorded))]
+        if products:
+            # Mirror where build-tools/build.sh actually installs: under the
+            # directory named by --build, never at the source root.
+            script += [
+                'build=.',
+                'while [ $# -gt 0 ]; do',
+                '  if [ "$1" = --build ]; then build=$2; fi',
+                '  shift',
+                'done',
+                'mkdir -p "$build/bin"',
+                'for name in bishengir-opt bishengir-compile; do',
+                '  printf "#!/bin/bash\\nexit 0\\n" > "$build/bin/$name"',
+                '  chmod 755 "$build/bin/$name"',
+                'done',
+            ]
+        script.append(f'exit {status}')
+        (tools / 'build.sh').write_text('\n'.join(script) + '\n')
+        return recorded
+
+    def test_an_empty_tree_is_built_from_scratch_and_the_products_are_checked(self):
+        # The branch the user asked for: a build directory with neither
+        # build.ninja nor CMakeCache.txt is configured and built by the pinned
+        # command, and the Gate passes only when the products exist afterwards.
         shutil.rmtree(self.source / 'build')
+        recorded = self.stage_a_fake_build_script()
+        script = bridge.container_script(
+            str(self.source), 'build', '64', 840, None, None, None,
+            full_timeout=21600, ccec_bin=Path('/opt/ccec/bin'), allow_full_build=True)
+        done = self.run_script(script, f'{self.tools}:/usr/bin:/bin', 'bishengir-opt')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # Ninja is never run against a tree that has no build.ninja.
+        self.assertFalse(self.ninja_log.exists())
+        # The command is the operator's, with the flags this Adapter owns.
+        argv = recorded.read_text().splitlines()
+        self.assertEqual(argv, [
+            '--c-compiler', 'clang', '--cxx-compiler', 'clang++', '--enable-lld',
+            '--build-type', 'Release', '--enable-assertion', '-t',
+            '--bisheng-compiler', '/opt/ccec/bin', '--disable-werror',
+            '--disable-bishengir-werror', '--build-triton', '--build-shmem-template',
+            '--build', './build', '-j', '64',
+        ])
+        # Nothing destructive, and the machine file is not rewritten.
+        for forbidden in ('-r', '--rebuild', '--clean'):
+            self.assertNotIn(forbidden, argv)
+        self.assertTrue((self.source / 'build/bin/bishengir-opt').is_file())
+
+    def test_a_full_build_that_produces_nothing_cannot_pass(self):
+        # "It exited zero" is not the same as "it built the compiler": a build
+        # script that returns success without installing products must fail.
+        shutil.rmtree(self.source / 'build')
+        self.stage_a_fake_build_script(products=False)
+        script = bridge.container_script(
+            str(self.source), 'build', '4', 840, None, None, None,
+            full_timeout=21600, ccec_bin=Path('/opt/ccec/bin'), allow_full_build=True)
+        done = self.run_script(script, f'{self.tools}:/usr/bin:/bin', 'bishengir-opt')
+        self.assertEqual(done.returncode, 3)
+        self.assertIn('full build did not produce build/bin/bishengir-opt', done.stderr)
+
+    def test_a_failing_full_build_is_reported_as_a_failure(self):
+        shutil.rmtree(self.source / 'build')
+        self.stage_a_fake_build_script(status=7, products=False)
+        script = bridge.container_script(
+            str(self.source), 'build', '4', 840, None, None, None,
+            full_timeout=21600, ccec_bin=Path('/opt/ccec/bin'), allow_full_build=True)
+        done = self.run_script(script, f'{self.tools}:/usr/bin:/bin', 'bishengir-opt')
+        self.assertEqual(done.returncode, 3)
+        self.assertIn('full build failed', done.stderr)
+        self.assertFalse(self.ninja_log.exists())
+
+    def test_a_full_build_into_another_directory_checks_that_directory(self):
+        # The build directory is a machine fact, and the product check has to
+        # follow it: a Gate that always looked at `build` would pass a run that
+        # wrote `build-release`.
+        shutil.rmtree(self.source / 'build')
+        self.stage_a_fake_build_script()
+        script = bridge.container_script(
+            str(self.source), 'build-release', '4', 840, None, None, None,
+            full_timeout=21600, ccec_bin=Path('/opt/ccec/bin'), allow_full_build=True)
+        done = self.run_script(script, f'{self.tools}:/usr/bin:/bin', 'bishengir-opt')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.source / 'build-release/bin/bishengir-opt').is_file())
+        self.assertFalse((self.source / 'build').exists())
+
+    def test_a_half_configured_tree_is_refused_and_left_alone(self):
+        # CMakeCache.txt without build.ninja is neither incrementally buildable
+        # nor reconfigured without deleting state. The Gate must refuse rather
+        # than remove the operator's tree.
+        (self.source / 'build/CMakeCache.txt').write_text('# configured, never built\n')
+        (self.source / 'build/build.ninja').unlink()
         script = self.script(cann=None, conda_sh=None, conda_env=None)
         done = self.run_script(script, f'{self.tools}:/usr/bin:/bin', 'bishengir-opt')
         self.assertEqual(done.returncode, 3)
-        self.assertIn('build.ninja', done.stderr)
-        self.assertFalse((self.source / 'build').exists())
+        self.assertIn('CMakeCache.txt exists without build/build.ninja', done.stderr)
+        self.assertTrue((self.source / 'build/CMakeCache.txt').is_file())
         self.assertFalse(self.ninja_log.exists())
 
 
@@ -989,12 +1207,59 @@ class FullBuildCase(unittest.TestCase):
         self.assertIn('rc=7 pipefail=off', done.stdout)
         self.assertIn('build failed with status 7', self.out.read_text())
 
-    def test_an_unexpected_argument_is_refused(self):
+    def test_a_missing_source_root_is_refused(self):
         self.write_build_script(0)
-        done = self.call(args='full_build one two')
+        done = self.call(args=f'full_build {shlex.quote(str(self.root / "absent"))}')
         self.assertIn('rc=1 pipefail=off', done.stdout)
-        self.assertIn('expected no arguments, or exactly one', self.out.read_text())
+        self.assertIn('no such source root', self.out.read_text())
         self.assertIsNone(self.recorded_argv())
+
+    def test_extra_flags_are_forwarded_after_the_owned_ones(self):
+        # A human may add a flag the Adapter does not model; the helper's own
+        # flags stay in their fixed order so the argv remains reviewable.
+        self.write_build_script(0)
+        done = self.call(args='full_build "$PWD" --skip-hivmc')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.recorded_argv(), self.EXPECTED_ARGV + ['--skip-hivmc'])
+
+    def test_a_flag_the_helper_owns_cannot_be_repeated(self):
+        for flag in ('-j', '--build', '--bisheng-compiler', '-t', '--enable-lld',
+                     '--build-triton', '--c-compiler'):
+            self.write_build_script(0)
+            done = self.call(args=f'full_build "$PWD" {flag} 99')
+            self.assertIn('rc=1 pipefail=off', done.stdout, flag)
+            self.assertIn('may not be repeated', self.out.read_text(), flag)
+            self.assertIsNone(self.recorded_argv(), flag)
+
+    def test_a_rebuild_request_is_refused_because_it_deletes_the_tree(self):
+        # `-r` makes build.sh run clean_build_dir. No Adapter may delete a tree it
+        # did not create, so the flag never reaches it from here.
+        self.write_build_script(0)
+        done = self.call(args='full_build "$PWD" -r')
+        self.assertIn('rc=1 pipefail=off', done.stdout)
+        self.assertIn('would delete', self.out.read_text())
+        self.assertIsNone(self.recorded_argv())
+
+    def test_an_existing_log_is_never_overwritten(self):
+        # A previous run's log is the only record of that run. The new log gets a
+        # timestamp instead of replacing it.
+        previous = self.source / 'build.log'
+        previous.write_text('previous run\n')
+        self.write_build_script(0)
+        done = self.call()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(previous.read_text(), 'previous run\n')
+        logs = sorted(path.name for path in self.source.glob('build-*.log'))
+        self.assertEqual(len(logs), 1, logs)
+        self.assertRegex(logs[0], r'^build-\d{8}T\d{6}Z\.log$')
+
+    def test_a_dash_log_path_writes_nothing_into_the_tree(self):
+        # The Gate uses this: a gate may not leave a file in the source tree.
+        self.write_build_script(0)
+        done = self.call(ASCENDNPU_FULL_BUILD_LOG='-')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.source / 'build.log').exists())
+        self.assertEqual(self.recorded_argv(), self.EXPECTED_ARGV)
 
 
 class CreateContainerCase(unittest.TestCase):

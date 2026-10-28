@@ -12,8 +12,10 @@ evidence_root = "/home/CHANGEME/.local/state/agent-gates/v2/evidence"
 
 # ── adapters ────────────────────────────────────────────────────────────────
 # Adapter 读取的 env 文件是机器事实，不是请求参数。
-# ascendnpu-ir 从启动环境读取容器身份，因此没有 env_file。
+# 三个 adapter 都一样：机器参数只从 env_file 读，启动环境不是配置来源。
+# env_file 可省略，此时按包内 adapters/<id>/env.sh 查找。
 [adapters.ascendnpu-ir]
+env_file = "/path/to/AgentGates/agent_gates/adapters/ascendnpu-ir/env.sh"
 
 [adapters.tilelang-hivm]
 env_file = "/path/to/AgentGates/agent_gates/adapters/tilelang-hivm/env.sh"

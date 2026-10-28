@@ -37,9 +37,13 @@ class PackagingCase(unittest.TestCase):
         module = load('ascend_preflight', ADAPTERS / 'ascendnpu-ir/scripts/docker_gate.py')
         with tempfile.TemporaryDirectory() as td:
             env_file = Path(td) / 'machine.env'
-            env_file.write_text('# no optional toolchain\n')
-            values = {'ASCENDNPU_ENV_FILE': str(env_file), 'ASCENDNPU_CONTAINER_NAME': 'fixture',
-                      'ASCENDNPU_CONTAINER_USER': 'builder', 'ASCENDNPU_CONTAINER_HOME': '/home/builder'}
+            # The container identity is a machine fact in this file, not in the
+            # launching environment: the same file the engine reads to lease the
+            # build directory.
+            env_file.write_text('ASCENDNPU_CONTAINER_NAME=fixture\n'
+                                'ASCENDNPU_CONTAINER_USER=builder\n'
+                                'ASCENDNPU_CONTAINER_HOME=/home/builder\n')
+            values = {'ASCENDNPU_ENV_FILE': str(env_file)}
             with patch.dict(os.environ, values, clear=True), patch.object(module.subprocess, 'run') as run:
                 self.assertEqual(module.main(['--check-config']), 0)
                 run.assert_not_called()
@@ -47,6 +51,24 @@ class PackagingCase(unittest.TestCase):
             with patch.dict(os.environ, values, clear=True), patch.object(module.subprocess, 'run') as run:
                 with self.assertRaises(module.BridgeError):
                     module.main(['--check-config'])
+                run.assert_not_called()
+
+    def test_a_shell_export_cannot_stand_in_for_a_missing_file_key(self):
+        # The engine leases the build directory from the machine file. If the Gate
+        # honoured an export when the file left a key out, the two could disagree
+        # and one run would hold a lock on a tree it does not build in.
+        module = load('ascend_preflight', ADAPTERS / 'ascendnpu-ir/scripts/docker_gate.py')
+        with tempfile.TemporaryDirectory() as td:
+            env_file = Path(td) / 'machine.env'
+            env_file.write_text('ASCENDNPU_CANN_SETUP=\n')
+            values = {'ASCENDNPU_ENV_FILE': str(env_file),
+                      'ASCENDNPU_CONTAINER_NAME': 'fixture',
+                      'ASCENDNPU_CONTAINER_USER': 'builder',
+                      'ASCENDNPU_CONTAINER_HOME': '/home/builder'}
+            with patch.dict(os.environ, values, clear=True), patch.object(module.subprocess, 'run') as run:
+                with self.assertRaises(module.BridgeError) as error:
+                    module.main(['--check-config'])
+                self.assertIn('read only from', str(error.exception))
                 run.assert_not_called()
 
     def test_every_manifest_declares_a_pinned_preflight(self):

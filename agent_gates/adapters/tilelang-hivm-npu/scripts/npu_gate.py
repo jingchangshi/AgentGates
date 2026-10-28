@@ -191,6 +191,13 @@ TOOLCHAIN_KEYS = (
     # file and must accept every key that file may define.
     'TILELANG_HIVM_HIVM_COMPILER',
     'TILELANG_HIVM_HIVM_TARGET',
+    # Build selection, defined for `tilelang-hivm`'s Gate and accepted here
+    # because one machine file serves both Adapters.
+    'TILELANG_HIVM_BUILD_SUBDIR',
+    'TILELANG_HIVM_NINJA_JOBS',
+    # The container path of the source root, defined for `tilelang-hivm`'s Gate
+    # and accepted here because one machine file serves both Adapters.
+    'TILELANG_HIVM_CONTAINER_SOURCE',
 )
 # The keys this Gate needs for the container it enters. The user key is excluded
 # from the requirement on purpose: the device Gate runs as root, so a machine
@@ -393,6 +400,57 @@ def env_file_values() -> dict[str, str]:
     except (OSError, UnicodeDecodeError) as exc:
         raise BridgeError(f'cannot read {path}: {exc}') from exc
     return _parse_env_file(text, path)
+
+
+def machine_value(name: str) -> str | None:
+    """One machine value, read from the machine file and nowhere else.
+
+    The container path of the source root and the build selection are machine
+    facts, so `env.sh` is their only source - the same file `tilelang-hivm`'s
+    Gate reads, which is why one machine cannot describe two different trees.
+    A contradicting export is refused, and an export the file does not define is
+    refused too: a value that looks like configuration but has no effect is
+    worse than an error.
+    """
+    values = env_file_values()
+    defined = name in values
+    from_file = values.get(name, '').strip()
+    exported = env_value(name)
+    if defined and from_file:
+        if exported and exported.strip() != from_file:
+            raise BridgeError(
+                f'{name} is {exported!r} in the launching environment but {from_file!r} in '
+                f'{resolved_env_file()}; machine values are read from that file only. '
+                f'Remove the export or edit the file, so one run cannot use two values.')
+        return from_file
+    if exported and exported.strip():
+        path = resolved_env_file()
+        where = str(path) if path is not None else 'no machine file was found'
+        raise BridgeError(
+            f'{name} is exported as {exported!r}, but machine values are read only from '
+            f'{where}. Define it in that file instead of the launching environment.')
+    if defined:
+        raise BridgeError(f'{resolved_env_file()}: {name} is set but empty')
+    return None
+
+
+def declared_container_source() -> Path | None:
+    """The container source root the machine file names, if it names one.
+
+    It confirms a path; it cannot invent one. The bind-mount mapping is still
+    derived from `docker inspect` and compared, so a value that disagrees with
+    the mounts is refused rather than trusted.
+    """
+    raw = machine_value('TILELANG_HIVM_CONTAINER_SOURCE') or ''
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise BridgeError(f'{resolved_env_file()}: TILELANG_HIVM_CONTAINER_SOURCE must be '
+                          f'an absolute container path: {raw!r}')
+    if chr(10) in raw or chr(0) in raw:
+        raise BridgeError('TILELANG_HIVM_CONTAINER_SOURCE contains an illegal character')
+    return candidate
 
 
 def container_identity() -> tuple[str, str, Path | None]:
@@ -1002,7 +1060,7 @@ def main(argv: list[str]) -> int:
     require_device_free(device)
 
     mapped = map_host_to_container(host_root, container_mounts(container), container)
-    declared = env_path('TILELANG_HIVM_CONTAINER_SOURCE')
+    declared = declared_container_source()
     if declared is not None and os.path.realpath(str(declared)) != os.path.realpath(str(mapped)):
         raise BridgeError(f'TILELANG_HIVM_CONTAINER_SOURCE {declared} does not match the bind-mount '
                           f'mapping {mapped} of host source root {host_root}')

@@ -45,8 +45,11 @@ Environment variables (all read at run time):
   TILELANG_HIVM_CONTAINER_SOURCE  optional, explicit container path of the source
                                   root; when set it must match the bind-mount
                                   mapping, when unset the mapping is used directly
-  TILELANG_HIVM_BUILD_SUBDIR      optional, build directory name (default: build)
-  TILELANG_HIVM_NINJA_JOBS        optional, ninja -j value (default: container CPUs)
+  TILELANG_HIVM_BUILD_SUBDIR      optional, build directory name (default: build),
+                                  read from the machine file; a contradicting
+                                  shell export is refused
+  TILELANG_HIVM_NINJA_JOBS        optional, ninja -j value (default: container
+                                  CPUs), read from the machine file
   TILELANG_HIVM_GATE_TIMEOUT      optional, container-side timeout in seconds; used
                                   ONLY when no `--timeout` argument is passed
 
@@ -305,6 +308,16 @@ TOOLCHAIN_KEYS = (
     'TILELANG_HIVM_CONTAINER_NAME',
     'TILELANG_HIVM_CONTAINER_USER',
     'TILELANG_HIVM_CONTAINER_HOME',
+    # Which tree is built, and how wide. These are machine facts too, and the
+    # engine resolves them from this same file to take its build lease, so a lock
+    # on `build` cannot cover a Gate building `build-fast`.
+    'TILELANG_HIVM_BUILD_SUBDIR',
+    'TILELANG_HIVM_NINJA_JOBS',
+    # The container path of the source root, when it differs from the derived
+    # bind-mount mapping. It names a location inside the container, so it is a
+    # machine fact like the identity above, not an invocation option: a stale
+    # export would gate a tree nobody recorded.
+    'TILELANG_HIVM_CONTAINER_SOURCE',
 )
 # The container identity keys. All three are required: a container name without a
 # user and HOME cannot be entered, and a user or HOME without a name names no
@@ -630,19 +643,92 @@ def provisioning_from_env_file() -> dict[str, str]:
     return {key: value for key, value in values.items() if key in PROVISIONING_KEYS}
 
 
+def machine_value(name: str) -> str | None:
+    """One machine value, read from the machine file and nowhere else.
+
+    The build directory and the Ninja width decide which tree is written and how
+    wide, so they are machine facts exactly like the container identity and the
+    CANN/Conda paths, and `env.sh` is their only source. The engine resolves the
+    same file for the same reason: a lease on `build` must not cover a run that
+    writes `build-fast`, and it would if the Gate could pick the directory up
+    from the launching shell.
+
+    Two situations are reported instead of silently resolved:
+
+    * the file defines a key and the environment exports a *different* value -
+      one of them is stale and neither precedence order would show which;
+    * the file does not define a key and the environment exports one - the
+      export looks like configuration but would have no effect, so pointing the
+      operator at the file is safer than obeying or ignoring it.
+
+    Sourcing `env.sh` and then running a Gate still works, because the export
+    then equals the file.
+    """
+    values = env_file_values()
+    defined = name in values
+    from_file = values.get(name, '').strip()
+    exported = env_value(name)
+    if defined and from_file:
+        if exported and exported.strip() != from_file:
+            raise BridgeError(
+                f'{name} is {exported!r} in the launching environment but {from_file!r} in '
+                f'{resolved_env_file()}; machine values are read from that file only. '
+                f'Remove the export or edit the file, so one run cannot use two values.')
+        return from_file
+    if exported and exported.strip():
+        path = resolved_env_file()
+        where = str(path) if path is not None else 'no machine file was found'
+        raise BridgeError(
+            f'{name} is exported as {exported!r}, but machine values are read only from '
+            f'{where}. Define it in that file instead of the launching environment.')
+    if defined:
+        # An empty value is a typo, not "use the default": the file spells "unset"
+        # by leaving the key out.
+        raise BridgeError(f'{resolved_env_file()}: {name} is set but empty')
+    return None
+
+
+def declared_container_source() -> Path | None:
+    """The container source root the machine file names, if it names one.
+
+    It confirms a path; it cannot invent one. The bind-mount mapping is still
+    derived from `docker inspect` and compared, so a value that disagrees with
+    the mounts is refused rather than trusted. It is read from the machine file
+    like the container identity, because it decides which tree the Gate runs in.
+    """
+    raw = machine_value('TILELANG_HIVM_CONTAINER_SOURCE') or ''
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise BridgeError(f'{resolved_env_file()}: TILELANG_HIVM_CONTAINER_SOURCE must be '
+                          f'an absolute container path: {raw!r}')
+    if chr(10) in raw or chr(0) in raw:
+        raise BridgeError('TILELANG_HIVM_CONTAINER_SOURCE contains an illegal character')
+    return candidate
+
+
 def build_subdir() -> str:
     """A single relative directory name; traversal and absolute paths are refused."""
-    if 'TILELANG_HIVM_BUILD_SUBDIR' in os.environ and not os.environ['TILELANG_HIVM_BUILD_SUBDIR'].strip():
+    if 'TILELANG_HIVM_BUILD_SUBDIR' in os.environ \
+            and not os.environ['TILELANG_HIVM_BUILD_SUBDIR'].strip() \
+            and 'TILELANG_HIVM_BUILD_SUBDIR' not in env_file_values():
+        # A blank export is a typo, not "use the default": the file spells
+        # "unset" by leaving the key out, and the shell by not setting it.
         raise BridgeError('TILELANG_HIVM_BUILD_SUBDIR is set but empty')
-    value = env_value('TILELANG_HIVM_BUILD_SUBDIR', default='build') or 'build'
-    if not SAFE_NAME.fullmatch(value):
+    value = machine_value('TILELANG_HIVM_BUILD_SUBDIR') or 'build'
+    if not SAFE_NAME.fullmatch(value) or value in ('.', '..'):
         raise BridgeError(f'TILELANG_HIVM_BUILD_SUBDIR is not a safe relative directory name: {value!r}')
     return value
 
 
 def ninja_jobs() -> str:
-    value = env_value('TILELANG_HIVM_NINJA_JOBS')
-    if value is None:
+    if 'TILELANG_HIVM_NINJA_JOBS' in os.environ \
+            and not os.environ['TILELANG_HIVM_NINJA_JOBS'].strip() \
+            and 'TILELANG_HIVM_NINJA_JOBS' not in env_file_values():
+        raise BridgeError('TILELANG_HIVM_NINJA_JOBS is set but empty')
+    value = machine_value('TILELANG_HIVM_NINJA_JOBS')
+    if not value:
         # Let the container decide from its own CPU count and cgroup limits.
         return '$(nproc)'
     if not value.isdigit() or int(value) < 1:
@@ -1070,7 +1156,7 @@ def main(argv: list[str]) -> int:
     hivm_compiler, hivm_target = hivm_from_env_file()
 
     mapped = map_host_to_container(host_root, container_mounts(container), container)
-    declared = env_path('TILELANG_HIVM_CONTAINER_SOURCE')
+    declared = declared_container_source()
     if declared is not None and os.path.realpath(str(declared)) != os.path.realpath(str(mapped)):
         raise BridgeError(f'TILELANG_HIVM_CONTAINER_SOURCE {declared} does not match the bind-mount '
                           f'mapping {mapped} of host source root {host_root}')

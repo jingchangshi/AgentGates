@@ -149,6 +149,37 @@ _TIMEOUT_DEVIATIONS = {
     },
 }
 
+# The build recipe keeps its original argv *shape* and gains exactly two declared
+# options, plus a larger outer bound so the new from-zero branch can finish. The
+# options are required, not cosmetic: the Adapter used to need a pre-existing
+# build tree and therefore could not run on a fresh checkout at all, and each
+# bound belongs to a different job (incremental Ninja versus a cold full build).
+# Recording the exact insertion here means any other change still fails, and the
+# insertion cannot quietly grow.
+_ARGV_DEVIATIONS = {
+    ('ascendnpu-ir', 'ascendnpu-ir.incremental-build'): {
+        'insert_at': 5,
+        'old_timeout': 900,
+        'new_timeout': 23400,
+        'inserted': ['--full-build-timeout', '21600', '--allow-full-build'],
+    },
+}
+
+
+def _accounted_argv_deviation(adapter, recipe_id, argv, old_argv, timeout, old_timeout):
+    """Return the argv/timeout to compare, substituting a declared insert back."""
+    declared = _ARGV_DEVIATIONS.get((adapter, recipe_id))
+    if declared is None:
+        return argv, timeout, old_timeout
+    # Both the bound and the insertion are compared exactly: a silent change to
+    # either one fails, and so does a second, unrecorded option.
+    assert timeout == declared['new_timeout'] and old_timeout == declared['old_timeout']
+    at = declared['insert_at']
+    inserted = declared['inserted']
+    assert argv[at:at + len(inserted)] == inserted, argv
+    assert argv[:at] + argv[at + len(inserted):] == old_argv, argv
+    return old_argv, old_timeout, declared['old_timeout']
+
 
 def _accounted_deviation(adapter, recipe_id, argv, old_argv, timeout, old_timeout):
     """Return the argv/timeout to compare, substituting a declared deviation back."""
@@ -181,9 +212,12 @@ def test_migrated_gate_retains_original_rules(adapter, gate):
     old_manifest = json.loads((FIXTURES / 'legacy' / (adapter + '.json')).read_text())
     old_recipe = next(item for item in old_manifest['recipes'] if item['id'] == gate['recipeId'])
     recipe = manifest.recipes[gate['recipeId']]
-    assert recipe['argv'] == old_recipe['argv']
+    argv, timeout, old_timeout = _accounted_argv_deviation(
+        adapter, gate['recipeId'], recipe['argv'], old_recipe['argv'],
+        recipe.get('timeout', 60), old_recipe.get('timeout', 60))
+    assert argv == old_recipe['argv']
     assert recipe.get('cwd', 'pack') == old_recipe.get('cwd', 'pack')
-    assert recipe.get('timeout', 60) == old_recipe.get('timeout', 60)
+    assert timeout == old_timeout
     # Additive preflight on Ascend is allowed, but an existing check cannot disappear.
     if old_recipe.get('configCheck'):
         assert recipe['configCheck'] == old_recipe['configCheck']

@@ -48,6 +48,36 @@ class SystemdUnavailable(RuntimeError):
     """The user systemd manager cannot be used on this machine."""
 
 
+# Margin between a recipe's own outer timeout and the worker's backstop. The
+# supervisor inside a recipe is allowed to run for `timeout + 10` s before it is
+# declared wedged, and the worker still has to publish a receipt afterwards, so a
+# backstop equal to the largest recipe bound would kill a legitimate run at the
+# moment it was about to record its result.
+BACKSTOP_MARGIN_SECONDS = 300
+
+
+def backstop_seconds(registry=None) -> int:
+    """The smallest safe RuntimeMaxSec for the adapters this machine installed.
+
+    A hard-coded number is not a policy: it silently becomes "the longest gate is
+    the one we happened to measure". The Ascend build gate can take a from-zero
+    full build (LLVM, BiShengIR, triton and the shmem template), so the worker
+    backstop is derived from the installed manifests instead. A manifest with a
+    longer recipe raises this automatically; a smaller one never lowers it below
+    the largest, which is what makes the value a property of the Adapters rather
+    than of one installer's guess.
+    """
+    from .registry import Registry
+    if registry is None:
+        root = os.environ.get("AGENT_GATES_ADAPTERS_ROOT") or None
+        registry = Registry(Path(root)) if root else Registry()
+    manifests = registry.list()
+    longest = max((float(recipe.get("timeout", 60))
+                   for manifest in manifests for recipe in manifest.recipes.values()),
+                  default=60.0)
+    return int(longest) + BACKSTOP_MARGIN_SECONDS
+
+
 def unit_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "systemd" / "user"
@@ -127,14 +157,23 @@ def _render_env(extra: dict) -> str:
     return "\n".join(lines)
 
 
-def install(python: str, *, timeout_seconds: int, workdir: str = "/", root: Path | None = None,
-            package: str | None = None, config_path: str | None = None,
-            adapters_root: str | None = None,
+def _installed_registry(adapters_root: str | None):
+    """The adapters an install can see, so the backstop matches them."""
+    from .registry import Registry
+    return Registry(Path(adapters_root)) if adapters_root else Registry()
+
+
+def install(python: str, *, timeout_seconds: int | None = None, workdir: str = "/",
+            root: Path | None = None, package: str | None = None,
+            config_path: str | None = None, adapters_root: str | None = None,
             extra_env: dict | None = None) -> Path:
     """Write the unit template and reload the user manager.
 
     @param python - absolute interpreter that has agent_gates importable.
-    @param timeout_seconds - backstop timeout for one worker.
+    @param timeout_seconds - backstop timeout for one worker. Omitted, it is
+        derived from the installed manifests (see `backstop_seconds`), so a
+        from-zero Ascend build cannot be killed by a number chosen before that
+        gate could build from scratch at all.
     @param workdir - neutral working directory for the worker.
     @param root - unit directory override, used by tests.
     @param package - PYTHONPATH root; defaults to the installer's package root.
@@ -155,6 +194,17 @@ def install(python: str, *, timeout_seconds: int, workdir: str = "/", root: Path
     resolved_config = config_path or os.environ.get("AGENT_GATES_CONFIG") or str(
         Path.home() / ".config/agent-gates/config.toml")
     resolved_adapters = adapters_root or os.environ.get("AGENT_GATES_ADAPTERS_ROOT") or ""
+    registry = _installed_registry(resolved_adapters or None)
+    minimum = backstop_seconds(registry)
+    if timeout_seconds is None:
+        timeout_seconds = minimum
+    elif int(timeout_seconds) < minimum:
+        # A backstop shorter than a recipe's own bound can only ever kill work
+        # the manifests declare legitimate. Refusing is better than installing a
+        # unit that would silently truncate a full build.
+        raise ValueError(
+            f"timeout_seconds={int(timeout_seconds)} is shorter than the largest "
+            f"installed recipe timeout plus margin; pass at least {minimum}")
     rendered = (UNIT_TEMPLATE
                 .replace("__PYTHON__", str(python))
                 .replace("__TIMEOUT__", str(int(timeout_seconds)))

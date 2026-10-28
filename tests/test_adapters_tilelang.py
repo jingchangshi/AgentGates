@@ -308,26 +308,48 @@ class EnvironmentCase(unittest.TestCase):
         self.saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.saved)))
 
+    def use_machine_file(self, **values):
+        """Name a temporary machine file, so no real git-ignored one is read."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = Path(td.name) / 'env.sh'
+        path.write_text(''.join(f'{key}={value}' + chr(10) for key, value in values.items()))
+        os.environ['TILELANG_HIVM_ENV_FILE'] = str(path)
+        self.addCleanup(os.environ.pop, 'TILELANG_HIVM_ENV_FILE', None)
+        return path
+
     def test_build_subdir_traversal_is_refused(self):
-        for value in ('..', '../build', 'a/b', '/build', '.', '', 'build/..', 'build/../..'):
-            os.environ['TILELANG_HIVM_BUILD_SUBDIR'] = value
+        for value in ('..', '../build', 'a/b', '/build', '.', 'build/..', 'build/../..', ''):
+            self.use_machine_file(TILELANG_HIVM_BUILD_SUBDIR=value)
             with self.assertRaises(base.BridgeError, msg=repr(value)):
                 base.build_subdir()
 
     def test_build_subdir_default_and_plain_names(self):
-        os.environ.pop('TILELANG_HIVM_BUILD_SUBDIR', None)
+        self.use_machine_file(TILELANG_HIVM_CANN_SETUP='')
         self.assertEqual(base.build_subdir(), 'build')
-        os.environ['TILELANG_HIVM_BUILD_SUBDIR'] = 'build-release'
+        self.use_machine_file(TILELANG_HIVM_BUILD_SUBDIR='build-release')
         self.assertEqual(base.build_subdir(), 'build-release')
 
     def test_ninja_jobs_defaults_to_container_nproc(self):
-        os.environ.pop('TILELANG_HIVM_NINJA_JOBS', None)
+        self.use_machine_file(TILELANG_HIVM_CANN_SETUP='')
         self.assertEqual(base.ninja_jobs(), '$(nproc)')
-        os.environ['TILELANG_HIVM_NINJA_JOBS'] = '0'
+        self.use_machine_file(TILELANG_HIVM_NINJA_JOBS='0')
         with self.assertRaises(base.BridgeError):
             base.ninja_jobs()
-        os.environ['TILELANG_HIVM_NINJA_JOBS'] = '64'
+        self.use_machine_file(TILELANG_HIVM_NINJA_JOBS='64')
         self.assertEqual(base.ninja_jobs(), '64')
+
+    def test_a_shell_export_is_never_a_configuration_source(self):
+        # Only `env.sh` configures a machine: the engine leases the build
+        # directory from that file, so the Gate must not take it from anywhere
+        # else. An export the file does not define is refused rather than
+        # silently ignored, because ignoring it would leave the caller believing
+        # a value took effect.
+        self.use_machine_file(TILELANG_HIVM_CANN_SETUP='')
+        os.environ['TILELANG_HIVM_BUILD_SUBDIR'] = 'build-fast'
+        self.addCleanup(os.environ.pop, 'TILELANG_HIVM_BUILD_SUBDIR', None)
+        with self.assertRaisesRegex(base.BridgeError, 'read only from'):
+            base.build_subdir()
 
     def test_required_container_variables_fail_closed(self):
         for name in ('TILELANG_HIVM_CONTAINER_NAME', 'TILELANG_HIVM_CONTAINER_USER',
@@ -1315,11 +1337,52 @@ class BaseRunCase(_FakeDockerCase):
         self.assertFalse(any(call[:2] == ['docker', 'exec'] for call in calls))
 
     def test_declared_container_source_must_match_the_mapping(self):
-        os.environ['TILELANG_HIVM_CONTAINER_SOURCE'] = '/a/different/path'
+        # The key confirms a path; it cannot invent one. A value that disagrees
+        # with the bind-mount mapping is refused rather than trusted.
+        self.identity_file = self.write_identity_file(
+            extra='TILELANG_HIVM_CONTAINER_SOURCE=/a/different/path' + chr(10))
+        os.environ['TILELANG_HIVM_ENV_FILE'] = str(self.identity_file)
         with patch('subprocess.run', side_effect=self.fake_base()):
             with self.assertRaises(base.BridgeError) as error:
                 base.main(['--timeout', '840', 'build'])
         self.assertIn('does not match the bind-mount mapping', str(error.exception))
+
+    def test_the_container_source_is_machine_configuration_not_a_shell_export(self):
+        # It decides which tree a Gate runs in, so it belongs in the shared file
+        # with the container identity. An export would let one run gate a
+        # directory nobody recorded - and both TileLang Gates read this file.
+        os.environ['TILELANG_HIVM_CONTAINER_SOURCE'] = '/a/different/path'
+        self.addCleanup(os.environ.pop, 'TILELANG_HIVM_CONTAINER_SOURCE', None)
+        for module in (base, npu):
+            # The reader is the same function in both Gates, and it is where the
+            # value is resolved, so a refusal there covers the whole run.
+            with self.assertRaises(module.BridgeError) as error:
+                module.declared_container_source()
+            self.assertIn('read only from', str(error.exception), module.__name__)
+        # And the build Gate refuses the run before it enters the container.
+        calls = []
+        with patch('subprocess.run', side_effect=self.fake_base(calls=calls)):
+            with self.assertRaises(base.BridgeError):
+                base.main(['--timeout', '840', 'build'])
+        self.assertFalse(any(call[:2] == ['docker', 'exec'] for call in calls))
+
+    def test_a_file_declared_container_source_is_honoured_when_it_matches(self):
+        # A checkout mounted at a different container path than the derived
+        # mapping: the file confirms the path both Gates then work in.
+        visible = self.root / 'visible'
+        visible.mkdir()
+        self.source.rename(visible / 'tilelang')
+        self.source = visible / 'tilelang'
+        self.identity_file = self.write_identity_file(
+            extra=f'TILELANG_HIVM_CONTAINER_SOURCE={self.source}' + chr(10))
+        os.environ['TILELANG_HIVM_ENV_FILE'] = str(self.identity_file)
+        mounts = [{'Type': 'bind', 'Source': str(self.root), 'Destination': str(self.root)}]
+        calls = []
+        with patch('subprocess.run', side_effect=self.fake_base(mounts=mounts, calls=calls)):
+            base.main(['--timeout', '840', 'build'])
+        exec_calls = [call for call in calls if call[:2] == ['docker', 'exec']]
+        self.assertTrue(exec_calls)
+        self.assertIn(str(self.source), exec_calls[0])
 
     def test_an_unknown_command_is_refused(self):
         for command in ('frobnicate', 'install', 'test', '--help'):
