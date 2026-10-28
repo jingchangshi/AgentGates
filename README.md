@@ -4,15 +4,13 @@ AgentGates is a standalone Python 3.11+ CLI for deterministic compiler build and
 
 The initial adapters are `ascendnpu-ir`, `tilelang-hivm`, and `tilelang-hivm-npu`. The NPU sanity gate exercises basic Ascend SIMD behavior; it does not prove full HIVM CodeGen correctness.
 
+`scripts/bootstrap.sh` performs the first-time configuration as one command — virtualenv, editable install, then `list`, `doctor`, a full gate run, and the receipt's `report` and `verify` — with every machine value supplied as a parameter:
+
 ```bash
-python3.11 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/agent-gates list
-.venv/bin/agent-gates doctor --adapter tilelang-hivm --source /absolute/compiler/checkout --env-file /absolute/machine/env.sh
-.venv/bin/agent-gates run --adapter tilelang-hivm --source /absolute/compiler/checkout --env-file /absolute/machine/env.sh --all --json
-.venv/bin/agent-gates report --run-id RUN_ID --json
-.venv/bin/agent-gates verify --run-id RUN_ID --json
+scripts/bootstrap.sh --source /absolute/compiler/checkout --env-file /absolute/machine/env.sh
 ```
+
+`--source` and `--env-file` are absolute paths. Optional parameters: `--adapter` (default `tilelang-hivm`), `--python` (default `python3.11`), `--venv-dir` (default `.venv`), `--evidence-root`, `--device-id`, repeatable `--gate` (selects gates instead of `--all`), and `--recreate-venv`. Run `scripts/bootstrap.sh --help` for the full list. Exit codes follow the CLI: 0 PASS, 1 recorded non-PASS, 2 invocation or environment error.
 
 `--all` applies only to the chosen adapter. It does not implicitly invoke the NPU adapter. NPU runs require an explicitly assigned device and a successful availability check; a visible idle card alone does not authorize its use. Machine configuration is parsed as data, never sourced as arbitrary shell code. Existing CANN/Conda setup scripts are initialized by the reviewed adapter inside the existing container.
 
