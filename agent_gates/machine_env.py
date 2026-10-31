@@ -71,6 +71,27 @@ TILELANG_HIVM_KEYS = (
     # bind-mount mapping. A machine fact, like the identity above.
     'TILELANG_HIVM_CONTAINER_SOURCE',
 )
+
+# The TLA Adapter has its own key set: it configures a different toolchain
+# (a vendor Triton wheel rather than a TileLang build tree), so it must not share
+# the TILELANG_HIVM_ prefix. It has no build tree of its own, but the engine
+# resolves a build directory name for every Adapter so it can take a lease, which
+# is why the BUILD_SUBDIR key is accepted even though the Gate never writes one.
+TLA_NPU_KEYS = (
+    'TLA_NPU_CANN_SETUP',
+    'TLA_NPU_CONDA_SH',
+    'TLA_NPU_CONDA_ENV',
+    'TLA_NPU_CONDA_ENVS_PATH',
+    'TLA_NPU_CONTAINER_NAME',
+    'TLA_NPU_CONTAINER_USER',
+    'TLA_NPU_CONTAINER_HOME',
+    'TLA_NPU_CONTAINER_SOURCE',
+    'TLA_NPU_PYTHON_VERSION',
+    'TLA_NPU_PIP_INDEX',
+    'TLA_NPU_WHEEL_DIR',
+    'TLA_NPU_TRITON_WHEEL',
+    'TLA_NPU_BUILD_SUBDIR',
+)
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
 ADAPTERS = {
@@ -91,6 +112,12 @@ ADAPTERS = {
         'selector': 'TILELANG_HIVM_ENV_FILE',
         'directory': 'tilelang-hivm',
         'keys': TILELANG_HIVM_KEYS,
+    },
+    'tla-npu': {
+        'prefix': 'TLA_NPU_',
+        'selector': 'TLA_NPU_ENV_FILE',
+        'directory': 'tla-npu',
+        'keys': TLA_NPU_KEYS,
     },
 }
 

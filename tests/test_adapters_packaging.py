@@ -19,18 +19,26 @@ def load(name, file):
 
 
 class PackagingCase(unittest.TestCase):
-    def test_all_three_bridges_find_their_packaged_configuration(self):
+    def test_every_bridge_finds_its_packaged_configuration(self):
+        # Each Adapter ships its own machine file beside its template. The two
+        # TileLang adapters share one file; the TLA adapter owns a separate one,
+        # so a shared-file assumption here would make it look configured when it
+        # is not.
+        shared = {'tilelang-hivm': 'tilelang-hivm', 'tilelang-hivm-npu': 'tilelang-hivm'}
+        adapters = ('ascendnpu-ir', 'tilelang-hivm', 'tilelang-hivm-npu', 'tla-npu')
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / 'agent_gates/adapters'
-            for name in ('ascendnpu-ir', 'tilelang-hivm', 'tilelang-hivm-npu'):
+            for name in adapters:
                 (root / name).mkdir(parents=True)
-            for name in ('ascendnpu-ir', 'tilelang-hivm'):
+            for name in ('ascendnpu-ir', 'tilelang-hivm', 'tla-npu'):
                 (root / name / 'env.example.sh').write_text('# template\n')
-            for name in ('ascendnpu-ir', 'tilelang-hivm', 'tilelang-hivm-npu'):
+            for name in adapters:
                 script = 'npu_gate.py' if name.endswith('-npu') else 'docker_gate.py'
+                if name == 'tla-npu':
+                    script = 'tla_gate.py'
                 module = load(name, ADAPTERS / name / 'scripts' / script)
                 with patch.object(module, 'ADAPTER_DIR', root / name):
-                    expected = 'tilelang-hivm' if name.startswith('tilelang') else name
+                    expected = shared.get(name, name)
                     self.assertEqual(module.default_env_file(), root / expected / 'env.sh')
 
     def test_ascend_check_config_validates_without_spawning_docker(self):

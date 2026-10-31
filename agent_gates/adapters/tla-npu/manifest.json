@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "tla-npu",
+  "version": "1.0.0",
+  "capabilities": [
+    "device-regression"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/tla_gate.py": "17c3e6850c0815adcb11124a210c0b446453d7af6b710d91b7748201aeb48c3d"
+  },
+  "recipes": [
+    {
+      "id": "tla-npu.e2e",
+      "cwd": "source",
+      "timeout": 1260,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tla_gate.py",
+        "--timeout",
+        "1200"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tla_gate.py",
+        "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "tla-npu-e2e",
+      "recipeId": "tla-npu.e2e",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "scriptExitZero": true,
+        "castBackOk": true,
+        "tritonCastBackOk": true,
+        "tensorMovedToDevice": true,
+        "numericalAssertionsObserved": true,
+        "npuDeviceUsed": true,
+        "compiledArtifactsPresent": true,
+        "synchronizeOk": true,
+        "npuAvailable": true,
+        "deviceCountOne": true
+      }
+    }
+  ]
+}

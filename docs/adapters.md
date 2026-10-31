@@ -1,6 +1,6 @@
 # Adapter configuration
 
-AgentGates bundles three independent, digest-pinned adapters. It runs fixed argv recipes from the selected source root. It does not import PiEngineeringHarness or require a Claude session.
+AgentGates bundles four independent, digest-pinned adapters. It runs fixed argv recipes from the selected source root. It does not import PiEngineeringHarness or require a Claude session.
 
 | Adapter | Gate | Fixed operation | Inner / outer timeout |
 | --- | --- | --- | --- |
@@ -9,6 +9,7 @@ AgentGates bundles three independent, digest-pinned adapters. It runs fixed argv
 | `tilelang-hivm` | `tilelang-hivm-build` | Ninja `tilelang` | 840 / 900 s |
 | `tilelang-hivm` | `tilelang-hivm-regression` | Two pinned host regression files, after build | 900 / 960 s |
 | `tilelang-hivm-npu` | `tilelang-hivm-npu-sanity` | Fixed SIMD vector-add device test | 900 / 960 s |
+| `tla-npu` | `tla-npu-e2e` | `test_tla.py`: TLA SIMD FP8 cast-back plus its plain-Triton reference, on one authorized device | 1200 / 1260 s |
 
 The container timeout sends TERM then allows 15 seconds before KILL. The outer timeout remains larger. Nonzero exits, interruption and timeout never become PASS. The source must have a configured `build/build.ninja`; gates do not configure a fresh build tree.
 
@@ -16,7 +17,7 @@ The container timeout sends TERM then allows 15 seconds before KILL. The outer t
 
 Keep machine files outside the package and pass an absolute `--env-file`. Files contain strict `NAME=value` data, comments and blank lines. Balanced surrounding quotes are removed. Unknown keys, duplicate keys and malformed lines fail. The gate readers never execute the file or expand substitutions. CANN and Conda paths name locations inside the container. CANN is initialized before Conda; Conda setup and environment must be supplied together.
 
-`--env-file` maps to `ASCENDNPU_ENV_FILE` for Ascend and `TILELANG_HIVM_ENV_FILE` for both TileLang adapters. Without an explicit selection, bridges look beside the packaged adapter template, retaining the legacy owning-checkout search for installed pack compatibility. They never search a user's home for machine files. An explicitly selected missing file fails.
+`--env-file` maps to `ASCENDNPU_ENV_FILE` for Ascend, `TILELANG_HIVM_ENV_FILE` for both TileLang adapters and `TLA_NPU_ENV_FILE` for the TLA adapter. Without an explicit selection, bridges look beside the packaged adapter template, retaining the legacy owning-checkout search for installed pack compatibility. They never search a user's home for machine files. An explicitly selected missing file fails.
 
 Ascend permits `ASCENDNPU_CANN_SETUP`, `ASCENDNPU_CONDA_SH`, `ASCENDNPU_CONDA_ENV`, optional `ASCENDNPU_CCEC_BIN`, the container identity `ASCENDNPU_CONTAINER_NAME` / `_USER` / `_HOME`, `ASCENDNPU_CONTAINER_SOURCE`, and the build selection `ASCENDNPU_BUILD_SUBDIR` / `ASCENDNPU_NINJA_JOBS`. All of them are file keys: the launching environment is not a configuration source for any adapter. `ASCENDNPU_CCEC_BIN` is needed only by the from-zero branch, and `ASCENDNPU_CONTAINER_SOURCE` confirms the container path of the checkout rather than inventing one - the bind-mount mapping is still derived and compared. Only `ASCENDNPU_GATE_TIMEOUT` remains a launch value, because it bounds an invocation rather than describing the machine.
 
@@ -34,6 +35,11 @@ TileLang's shared file permits:
 
 The file's container identity overrides stale launching exports, and `TILELANG_HIVM_CONTAINER_SOURCE` follows the same rule: it confirms the container path of the checkout when that differs from the derived bind-mount mapping, and because the mapping is still computed and compared, the key can confirm a path but never invent one. The NPU gate accepts the user key but runs as root, preserving the upstream `uda_occupy_dev_by_ns` workaround. A configured HIVM compiler must be an absolute executable container path. Its optional target can only be `Ascend950PR_9579`; compiler and target are explicitly forwarded as `HIVM_COMPILER` and `HIVM_TARGET`.
 
+The TLA adapter has its own file and its own prefix. It permits `TLA_NPU_CONTAINER_NAME` / `_USER` / `_HOME` / `_SOURCE`, `TLA_NPU_CANN_SETUP`, `TLA_NPU_CONDA_SH`, `TLA_NPU_CONDA_ENV`, `TLA_NPU_CONDA_ENVS_PATH`, `TLA_NPU_PYTHON_VERSION`, and the provisioning keys `TLA_NPU_WHEEL_DIR`, `TLA_NPU_TRITON_WHEEL`, `TLA_NPU_PIP_INDEX`, `TLA_NPU_BUILD_SUBDIR`. It is a device adapter, so it also requires an explicitly authorized device through `--device-id` or `TLA_NPU_DEVICE_ID`, takes an `npu:<id>` lease on it, and resolves `TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE` when the local configuration sets the exclusivity policy - the engine forwards that policy into the variable each device adapter actually parses, rather than one hardcoded variable. `TLA_NPU_BUILD_SUBDIR` exists because the engine resolves a build directory for every adapter; this adapter writes no build tree, so it declares no job count. Unlike the TileLang gates, it does not require `build/build.ninja`: its source root is a package directory holding the test, and provenance is the source's filesystem hash.
+
+The TLA adapter gates on what the process that ran the test actually measured: at least one tensor constructed on the device, a positive peak device allocation, and at least one kernel image in a fresh `TRITON_CACHE_DIR` (the Ascend backend emits `.npubin`; a `.o` is counted but not required, because requiring an artifact the backend never writes would be unsatisfiable rather than strict). The synchronization result, the two output markers and the script exit status are also gated, so a stub that prints the markers but never reaches the kernel still fails.
+
+It does **not** claim to re-derive which physical board ran. The device UUID and name are recorded in the receipt but explicitly not gated: on this host both cards report the same UUID, and the visible-device echo is a value the adapter itself exported, so gating on either would be a tautology rather than evidence. `acl.rt.get_phy_dev_id_by_logic_dev_id` is likewise not used, because it answers from the host physical table regardless of which card `ASCEND_RT_VISIBLE_DEVICES` selected. Board-level identity cannot be observed from inside the container at all: the container's `npu-smi` fails to load `libc_sec.so`, so serials and PCIe addresses are host-side facts only. What the gate proves is that a compiled TLA kernel ran on the one card the operator named by `--device-id`, not that AgentGates independently re-identified that card.
 ## Commands and checks
 
 ```bash

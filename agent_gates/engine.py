@@ -14,7 +14,26 @@ from .registry import Registry
 from .source_identity import snapshot, source_root
 
 ENV_KEYS = {"ascendnpu-ir": "ASCENDNPU_ENV_FILE", "tilelang-hivm": "TILELANG_HIVM_ENV_FILE",
-            "tilelang-hivm-npu": "TILELANG_HIVM_ENV_FILE"}
+            "tilelang-hivm-npu": "TILELANG_HIVM_ENV_FILE", "tla-npu": "TLA_NPU_ENV_FILE"}
+
+# The environment prefix each Adapter owns. An Adapter reads only its own prefix,
+# so a stray export for one Adapter cannot steer another; this map is the single
+# place that association is written.
+OWN_PREFIX = {"ascendnpu-ir": "ASCENDNPU_", "tilelang-hivm": "TILELANG_HIVM_",
+              "tilelang-hivm-npu": "TILELANG_HIVM_", "tla-npu": "TLA_NPU_"}
+
+# The Adapters that require an explicitly authorized NPU device. Each names its
+# own device variable and takes an npu:<id> lease on it, because a run that
+# touches a card must not share it with another AgentGates run.
+DEVICE_ADAPTERS = {"tilelang-hivm-npu": "TILELANG_HIVM_DEVICE_ID",
+                   "tla-npu": "TLA_NPU_DEVICE_ID"}
+
+# The Adapter that reads each Adapter variable for the exclusivity policy. The
+# engine forwards the operator choice, but the variable it writes is the one the
+# receiving Adapter actually parses; writing another Adapter prefix here would
+# look forwarded and be silently ignored by the Gate.
+EXCLUSIVE_VARIABLE = {"tilelang-hivm-npu": "TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE",
+                      "tla-npu": "TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE"}
 
 # A configuration check explains itself on stderr. Only the last line is kept,
 # bounded, and it is the Adapter's own message: no environment values, no
@@ -50,9 +69,10 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     # An adapter reads only its own prefix. Inheriting the other adapter's
     # prefix would let a stray export (a build subdirectory, a Ninja job count)
     # steer this run without being part of what `configuration()` hashes.
-    own = "ASCENDNPU_" if manifest.id == "ascendnpu-ir" else "TILELANG_HIVM_"
+    own = OWN_PREFIX.get(manifest.id, "")
     for name in [name for name in env
-                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_")) and not name.startswith(own)]:
+                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_", "TLA_NPU_"))
+                 and not name.startswith(own)]:
         del env[name]
     if env_file is not None:
         if not Path(env_file).is_absolute():
@@ -67,14 +87,20 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     if device_id is not None:
         if not re.fullmatch(r"[0-9]+", device_id):
             raise ValueError("--device-id must be a nonnegative decimal ID")
-        env["TILELANG_HIVM_DEVICE_ID"] = str(int(device_id))
+        # Only a device Adapter has a variable to write. Naming it from the map
+        # keeps one Adapter device from being handed to another.
+        variable = DEVICE_ADAPTERS.get(manifest.id)
+        if variable is not None:
+            env[variable] = str(int(device_id))
     # Exclusivity is a policy the operator chose in the local configuration, not
     # a precondition for running. Forwarding it lets the Adapter decide whether a
     # shared card is acceptable, which is the only layer that can see occupancy.
-    if require_exclusive_device:
-        env["TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE"] = "1"
-    else:
-        env.pop("TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE", None)
+    exclusive_variable = EXCLUSIVE_VARIABLE.get(manifest.id)
+    if exclusive_variable is not None:
+        if require_exclusive_device:
+            env[exclusive_variable] = "1"
+        else:
+            env.pop(exclusive_variable, None)
     return env
 
 
@@ -92,7 +118,7 @@ def configuration(manifest, env):
         if candidate.is_file():
             references.append(file_reference(candidate.resolve()))
     # No secrets are copied to the receipt. Configuration files are hashed as data.
-    prefix = "ASCENDNPU_" if manifest.id == "ascendnpu-ir" else "TILELANG_HIVM_"
+    prefix = OWN_PREFIX.get(manifest.id, manifest.id.upper().replace("-", "_") + "_")
     assignments = "\0".join(f"{key}={value}" for key, value in sorted(env.items()) if key.startswith(prefix))
     # Inherited variables that select a toolchain are bound by hash only. They
     # are recorded so two runs under different toolchains cannot present the
@@ -238,10 +264,11 @@ class Engine:
             # build cannot describe two different trees.
             build = build_directory(source, manifest, env)
             resources.append("build:" + str(build))
-            if manifest.id == "tilelang-hivm-npu":
-                device = env.get("TILELANG_HIVM_DEVICE_ID", "")
+            variable = DEVICE_ADAPTERS.get(manifest.id)
+            if variable is not None:
+                device = env.get(variable, "")
                 if not re.fullmatch(r"[0-9]+", device):
-                    raise ValueError("explicit TILELANG_HIVM_DEVICE_ID or --device-id authorization required")
+                    raise ValueError(f"explicit {variable} or --device-id authorization required")
                 resources.append("npu:" + str(int(device)))
                 receipt["authorizedDeviceId"] = str(int(device))
             with acquire(resources, root=self.lock_root) as lease_fds:

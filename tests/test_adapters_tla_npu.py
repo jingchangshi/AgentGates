@@ -1,0 +1,314 @@
+"""Host-only regressions for the TLA Adapter.
+
+These pin the properties that make the gate honest without a device: the
+observations it publishes, the conditions it will not pass on, and the machine
+file grammar it shares with the engine. Nothing here touches Docker or an NPU.
+"""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+ADAPTER = ROOT / 'agent_gates/adapters/tla-npu'
+
+
+def load(name, file):
+    spec = importlib.util.spec_from_file_location(name, file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+GATE = load('tla_gate', ADAPTER / 'scripts/tla_gate.py')
+
+# A report that describes a run which really reached the device. Every negative
+# case below is this dict with exactly one thing broken, so a test failure names
+# the one property that stopped working.
+GOOD = {
+    'npuAvailable': True,
+    'scriptExit': 0,
+    'scriptStdout': 'CAST_BACK OK tmax 8 hid 256\nTRITON_CAST_BACK OK num_mismatch: 0\npass\n',
+    'tensorMovesToDevice': 6,
+    'npuPeakMemoryBytes': 50366464,
+    'artifacts': {'object': 0, 'npubin': 2},
+    'synchronizeOk': True,
+    'synchronizeError': None,
+    'npuDeviceCount': 1,
+    'visibleDevices': '1',
+    'deviceUuid': '0008d80a-d200-0000-0000-008a4ec00000',
+    'deviceName': 'Ascend950PR_9579',
+}
+
+
+class ObservationCase(unittest.TestCase):
+    def observed(self, **changes):
+        report = dict(GOOD)
+        report.update(changes)
+        return GATE.observations(report, '1')
+
+    def test_a_device_run_passes_every_declared_check(self):
+        result = self.observed()
+        self.assertTrue(GATE.passed(result), [k for k, v in result.items() if v is not True])
+        manifest = json.loads((ADAPTER / 'manifest.json').read_text())
+        declared = set(manifest['gates'][0]['observationChecks'])
+        # exitCodeZero is supplied by the evaluator from the host process status,
+        # so it is the one declared check the bridge does not publish itself.
+        self.assertEqual(declared - set(result), {'exitCodeZero'})
+        for name in declared - {'exitCodeZero'}:
+            self.assertIs(result[name], True, name)
+
+    def test_the_scripts_own_conditions_agree_with_the_manifest(self):
+        # If this script gated on fewer conditions than the manifest declares, it
+        # could exit 0 on a run the evaluator then records as FAIL. exitCodeZero is
+        # the only declared check it cannot compute, because that one describes the
+        # host process.
+        manifest = json.loads((ADAPTER / 'manifest.json').read_text())
+        declared = set(manifest['gates'][0]['observationChecks'])
+        self.assertEqual(declared - set(GATE.REQUIRED), {'exitCodeZero'})
+        self.assertEqual(set(GATE.REQUIRED) - declared, set())
+        # And every one of them must actually be consulted.
+        for name in GATE.REQUIRED:
+            broken = self.observed()
+            broken[name] = False
+            self.assertFalse(GATE.passed(broken), name)
+
+    def test_no_tensor_on_the_device_fails(self):
+        self.assertFalse(GATE.passed(self.observed(tensorMovesToDevice=0)))
+
+    def test_no_positive_allocation_fails(self):
+        self.assertFalse(GATE.passed(self.observed(npuPeakMemoryBytes=0)))
+
+    def test_no_compiled_kernel_fails(self):
+        self.assertFalse(GATE.passed(self.observed(artifacts={'object': 0, 'npubin': 0})))
+
+    def test_an_object_file_alone_is_not_required(self):
+        # The Ascend backend emits .npubin and no .o. Requiring both would make
+        # the check unsatisfiable on a correct run, which is worse than useless.
+        result = self.observed(artifacts={'object': 0, 'npubin': 1})
+        self.assertTrue(GATE.passed(result))
+
+    def test_silent_stdout_fails_even_with_a_zero_exit(self):
+        self.assertFalse(GATE.passed(self.observed(scriptStdout='')))
+
+    def test_the_cast_back_marker_alone_fails(self):
+        # The two markers are independent evidence: one route passing must not
+        # stand in for both.
+        self.assertFalse(GATE.passed(self.observed(scriptStdout='CAST_BACK OK tmax 8 hid 256\n')))
+
+    def test_the_triton_marker_alone_fails(self):
+        self.assertFalse(GATE.passed(self.observed(scriptStdout='TRITON_CAST_BACK OK num_mismatch: 0\n')))
+
+    def test_a_nonzero_script_exit_fails(self):
+        self.assertFalse(GATE.passed(self.observed(scriptExit=1)))
+
+    def test_a_missing_script_exit_fails(self):
+        self.assertFalse(GATE.passed(self.observed(scriptExit=None)))
+
+    def test_a_failed_synchronize_fails(self):
+        self.assertFalse(GATE.passed(self.observed(synchronizeOk=False)))
+
+    def test_two_visible_devices_fails(self):
+        self.assertFalse(GATE.passed(self.observed(npuDeviceCount=2)))
+
+    def test_the_device_identity_echo_is_recorded_but_not_gated(self):
+        # These values are echoes of configuration this Gate supplied, so they
+        # cannot fail for a hardware reason. Recording them is useful; gating on
+        # them would be a tautology dressed as proof, which is why they are
+        # excluded from passed() and from the manifest.
+        manifest = json.loads((ADAPTER / 'manifest.json').read_text())
+        declared = set(manifest['gates'][0]['observationChecks'])
+        self.assertNotIn('deviceMatchesAuthorized', declared)
+        self.assertNotIn('visibleDeviceEcho', declared)
+        self.assertNotIn('deviceModelUuid', declared)
+        self.assertEqual(self.observed(visibleDevices='0')['visibleDeviceEcho'], '0')
+        self.assertIsNone(self.observed(visibleDevices=None)['visibleDeviceEcho'])
+
+    def test_a_boolean_in_place_of_a_counter_is_refused(self):
+        # A report that claims success as a bare true where the contract wants a
+        # count must not be read as a count.
+        result = self.observed(tensorMovesToDevice=True, npuPeakMemoryBytes=True)
+        self.assertEqual(result['tensorMovesToDevice'], 0)
+        self.assertEqual(result['npuPeakMemoryBytes'], 0)
+        self.assertFalse(GATE.passed(result))
+
+    def test_a_negative_counter_is_refused(self):
+        result = self.observed(tensorMovesToDevice=-1, npuPeakMemoryBytes=-1)
+        self.assertEqual(result['tensorMovesToDevice'], 0)
+        self.assertEqual(result['npuPeakMemoryBytes'], 0)
+
+
+class ReportCase(unittest.TestCase):
+    def test_a_report_without_a_marker_prefix_is_refused(self):
+        with self.assertRaises(GATE.BridgeError):
+            GATE.read_report('no report here\n')
+
+    def test_a_duplicate_key_is_refused(self):
+        with self.assertRaises(GATE.BridgeError):
+            GATE.read_report('{"command": "tla", "command": "tla"}\n')
+
+    def test_a_non_finite_number_is_refused(self):
+        with self.assertRaises(GATE.BridgeError):
+            GATE.read_report('{"command": "tla", "npuPeakMemoryBytes": NaN}\n')
+
+    def test_the_wrong_command_is_refused(self):
+        with self.assertRaises(GATE.BridgeError):
+            GATE.read_report('{"command": "something-else"}\n')
+
+
+class ContainerScriptCase(unittest.TestCase):
+    """The container-side sources must be complete, compilable programs.
+
+    They are carried as embedded text, so a truncated or mangled literal would
+    only be discovered by a real run. These checks make that a host-only failure.
+    """
+
+    def test_the_runner_and_watcher_are_complete_scripts(self):
+        match = re.search(r'WATCHER = (".*")', GATE.RUNNER)
+        self.assertIsNotNone(match)
+        watcher = eval(match.group(1))
+        self.assertNotIn('truncated', watcher)
+        compile(watcher, 'watcher', 'exec')
+        self.assertIn('runpy.run_path', watcher)
+        self.assertIn("'uuid'", watcher)
+        # The watcher is what counts device use, so both ways the test reaches
+        # the device have to be observed.
+        self.assertIn('torch.Tensor.npu = observed_move', watcher)
+        self.assertIn("device.split(':')[0] == 'npu'", watcher)
+
+    def test_the_runner_compiles_as_the_container_receives_it(self):
+        compile(GATE.RUNNER, 'runner', 'exec')
+        # The wrapper is written into the container from the runner, so a
+        # quoting fault in the handoff is a runtime-only failure without this.
+        self.assertIn('handle.write(WATCHER)', GATE.RUNNER)
+
+    def test_the_container_script_names_every_toolchain_step(self):
+        script = GATE.container_script('/src', 60, '1', Path('/cann/set_env.sh'),
+                                       Path('/conda/etc/profile.d/conda.sh'), 'an-env',
+                                       Path('/envs'))
+        for fragment in ('. /cann/set_env.sh', 'conda activate an-env',
+                         'export TRITON_CACHE_DIR=$(mktemp -d)', 'test_tla.py',
+                         'CONDA_ENVS_PATH=/envs'):
+            self.assertIn(fragment, script)
+        # The embedded programs are Python; the surrounding Bash is not, so the
+        # runner is compiled and the shell is checked for the quoting that
+        # would break it.
+        compile(GATE.RUNNER, 'runner', 'exec')
+
+
+class SourceTreeSafetyCase(unittest.TestCase):
+    """A run must not deposit artifacts into the bytes it is testing."""
+
+    def test_the_instrumented_run_does_not_use_the_source_directory_as_cwd(self):
+        # CANN writes a crash-dump tree (extra-info/) into the process working
+        # directory when a kernel faults. Observed for real: a contended-card run
+        # left a root-owned extra-info/ inside the source directory, which both
+        # violated sourceWrite=false and made the source snapshot depend on
+        # whether an earlier run had failed.
+        match = re.search(r'WATCHER = (".*")', GATE.RUNNER)
+        self.assertIsNotNone(match)
+        watcher = eval(match.group(1))
+        self.assertIn('runpy.run_path', watcher)
+        runner = GATE.RUNNER
+        self.assertIn('tempfile.mkdtemp', runner)
+        self.assertIn('cwd=work', runner)
+        self.assertNotIn('cwd=os.path.dirname(os.path.abspath(test))', runner)
+        # The dump location is pinned explicitly rather than left to the runtime.
+        self.assertIn('ASCEND_WORK_PATH=work', runner)
+
+    def test_the_container_script_enters_the_source_root_read_only(self):
+        script = GATE.container_script('/src', 60, '1', Path('/cann/set_env.sh'),
+                                       Path('/conda/etc/profile.d/conda.sh'), 'an-env',
+                                       Path('/envs'))
+        # The test is addressed by absolute path, so the shell never has to write
+        # there; entering it is only for the existence check.
+        self.assertIn('cd /src', script)
+        self.assertIn('TLA_NPU', script)
+
+
+class MachineFileCase(unittest.TestCase):
+    def test_the_script_and_the_engine_accept_the_same_keys(self):
+        from agent_gates import machine_env
+        self.assertEqual(tuple(sorted(GATE.TOOLCHAIN_KEYS)),
+                         tuple(sorted(machine_env.TLA_NPU_KEYS)))
+
+    def test_the_adapter_owns_its_own_prefix(self):
+        from agent_gates import machine_env
+        self.assertEqual(machine_env.ADAPTERS['tla-npu']['prefix'], 'TLA_NPU_')
+        self.assertEqual(machine_env.ADAPTERS['tla-npu']['selector'], 'TLA_NPU_ENV_FILE')
+
+    def test_exclusivity_is_the_variable_this_adapter_reads(self):
+        # The engine forwards the operator policy into this exact name. A
+        # hardcoded TileLang variable would look forwarded and be ignored.
+        from agent_gates import engine
+        self.assertEqual(engine.EXCLUSIVE_VARIABLE['tla-npu'],
+                         'TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE')
+        with patch.dict(os.environ, {'TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE': '1'}, clear=False):
+            self.assertTrue(GATE.exclusive_requested())
+        with patch.dict(os.environ, {'TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE': '0'}, clear=False):
+            self.assertFalse(GATE.exclusive_requested())
+
+    def test_the_device_variable_is_the_one_the_engine_leases(self):
+        from agent_gates import engine
+        self.assertEqual(engine.DEVICE_ADAPTERS['tla-npu'], 'TLA_NPU_DEVICE_ID')
+
+    def test_half_a_conda_pair_is_refused(self):
+        with self.assertRaises(GATE.BridgeError):
+            GATE.require_conda_pair(Path('/bin/true'), None)
+        with self.assertRaises(GATE.BridgeError):
+            GATE.require_conda_pair(None, 'some-env')
+        GATE.require_conda_pair(None, None)
+
+    def test_an_empty_machine_file_is_refused_rather_than_guessed(self):
+        with machine_file('') as values, patch.dict(os.environ, values, clear=True):
+            with self.assertRaises(GATE.BridgeError):
+                GATE.main(['--check-config'])
+
+
+def machine_file(text=''):
+    import contextlib
+    import tempfile
+
+    @contextlib.contextmanager
+    def manager():
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'machine.env'
+            path.write_text(text)
+            yield {'TLA_NPU_ENV_FILE': str(path)}
+    return manager()
+
+
+class ManifestCase(unittest.TestCase):
+    def test_every_pinned_file_matches_its_digest(self):
+        manifest = json.loads((ADAPTER / 'manifest.json').read_text())
+        self.assertEqual(manifest['schemaVersion'], 1)
+        self.assertEqual(manifest['id'], 'tla-npu')
+        self.assertIs(manifest['permissions']['hostExecution'], True)
+        self.assertIs(manifest['permissions']['sourceWrite'], False)
+        for name, digest in manifest['files'].items():
+            self.assertEqual(hashlib.sha256((ADAPTER / name).read_bytes()).hexdigest(), digest, name)
+
+    def test_the_recipe_pins_a_fixed_argv_and_blocks_a_temporary_failure(self):
+        manifest = json.loads((ADAPTER / 'manifest.json').read_text())
+        recipe = manifest['recipes'][0]
+        self.assertEqual(recipe['cwd'], 'source')
+        self.assertEqual(recipe['argv'][:3], ['python3', '-B', '{pack}/scripts/tla_gate.py'])
+        self.assertIn(75, recipe['blockedExitCodes'])
+        # The outer timeout has to exceed the inner one plus the kill grace, or a
+        # slow container would be killed by the harness before it could report.
+        self.assertGreater(recipe['timeout'], 1200 + GATE.KILL_AFTER_SECONDS)
+
+    def test_the_entrypoint_is_the_reviewed_bytes(self):
+        # The container entrypoint is shared with the Ascend IR adapter. A local
+        # edit would mean two different entrypoints ship under one review.
+        ours = (ADAPTER / 'docker/entry.sh').read_bytes()
+        sibling = (ROOT / 'agent_gates/adapters/ascendnpu-ir/docker/entry.sh').read_bytes()
+        self.assertEqual(ours, sibling)
+
+
+if __name__ == '__main__':
+    unittest.main()

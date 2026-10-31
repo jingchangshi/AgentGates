@@ -37,6 +37,7 @@ def load_script(path, name):
 ASCEND = load_script(ADAPTERS / 'ascendnpu-ir/scripts/docker_gate.py', 'machine_env_ascend')
 TILELANG = load_script(ADAPTERS / 'tilelang-hivm/scripts/docker_gate.py', 'machine_env_tilelang')
 NPU = load_script(ADAPTERS / 'tilelang-hivm-npu/scripts/npu_gate.py', 'machine_env_npu')
+TLA = load_script(ADAPTERS / 'tla-npu/scripts/tla_gate.py', 'machine_env_tla')
 
 
 class EnvironmentCase(unittest.TestCase):
@@ -49,7 +50,7 @@ class EnvironmentCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         for name in list(os.environ):
-            if name.startswith(('ASCENDNPU_', 'TILELANG_HIVM_')):
+            if name.startswith(('ASCENDNPU_', 'TILELANG_HIVM_', 'TLA_NPU_')):
                 os.environ.pop(name)
 
     def write_env(self, name, values):
@@ -68,14 +69,28 @@ class KeySetParityCase(EnvironmentCase):
     def test_each_adapter_key_set_matches_the_engine(self):
         # tilelang-hivm and tilelang-hivm-npu share one file, so both scripts must
         # accept every key that file may define - including keys they never read.
-        for module in (TILELANG, NPU):
+        # tla-npu owns its own file and its own prefix, so it is compared against
+        # its own engine key set rather than being folded into the TileLang one.
+        for module, expected in ((TILELANG, machine_env.TILELANG_HIVM_KEYS),
+                                 (NPU, machine_env.TILELANG_HIVM_KEYS),
+                                 (TLA, machine_env.TLA_NPU_KEYS)):
             self.assertEqual(tuple(sorted(module.TOOLCHAIN_KEYS)),
-                             tuple(sorted(machine_env.TILELANG_HIVM_KEYS)), module.__name__)
+                             tuple(sorted(expected)), module.__name__)
 
     def test_the_build_keys_are_machine_configuration_in_every_adapter(self):
+        # Every Adapter that owns a build tree declares both the directory the
+        # engine leases and the job count the build uses. tla-npu writes no build
+        # tree - it compiles through a prebuilt vendor wheel - so it declares the
+        # directory (the engine resolves one for every Adapter) but not a job
+        # count, and asserting one would demand a setting nothing consumes.
         for keys in (machine_env.ASCENDNPU_KEYS, machine_env.TILELANG_HIVM_KEYS):
             self.assertTrue([key for key in keys if key.endswith('_BUILD_SUBDIR')])
             self.assertTrue([key for key in keys if key.endswith('_NINJA_JOBS')])
+        self.assertTrue([key for key in machine_env.TLA_NPU_KEYS
+                         if key.endswith('_BUILD_SUBDIR')])
+        self.assertEqual([key for key in machine_env.TLA_NPU_KEYS
+                          if key.endswith('_NINJA_JOBS')], [],
+                         'tla-npu has no build tree, so it must not declare a job count')
 
     def test_the_adapter_parsers_accept_exactly_what_the_engine_accepts(self):
         # Key-name parity is not enough: the two sides have separate parsers, so a
@@ -85,7 +100,7 @@ class KeySetParityCase(EnvironmentCase):
         # could accept a key the engine never leases.
         for adapter, spec in machine_env.ADAPTERS.items():
             module = {'ascendnpu-ir': ASCEND, 'tilelang-hivm': TILELANG,
-                      'tilelang-hivm-npu': NPU}[adapter]
+                      'tilelang-hivm-npu': NPU, 'tla-npu': TLA}[adapter]
             path = self.root / f'{adapter}.env'
             text = ''.join(f'{key}=' + chr(10) for key in spec['keys'])
             path.write_text(text)
