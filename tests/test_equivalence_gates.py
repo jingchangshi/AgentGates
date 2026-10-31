@@ -48,7 +48,34 @@ def test_isolated_cli_lists_all_five_gates_without_harness_runtime(tmp_path):
     result = subprocess.run([sys.executable, '-I', str(runner), str(tmp_path)], cwd=tmp_path, capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
-    assert {gate for adapter in report['adapters'] for gate in adapter['gates']} == {gate['id'] for _, gate in CONTRACTS}
+    listed = {gate for adapter in report['adapters'] for gate in adapter['gates']}
+    # Two separate properties, deliberately kept separate.
+    #
+    # First: the CLI enumerates exactly the gates that are installed, with no
+    # Harness runtime present. This is what the test is named for.
+    installed = {gate for manifest in Registry().list() for gate in manifest.gates}
+    assert listed == installed
+    # Second, and this is the part that must not become self-fulfilling: every
+    # frozen contract is still published, under its exact id, by its exact
+    # Adapter. A registry edit that dropped or renamed a migrated gate satisfies
+    # the comparison above - it compares the CLI to the registry, so it agrees
+    # with whatever the registry says - and fails here instead.
+    published = {adapter['id']: set(adapter['gates']) for adapter in report['adapters']}
+    for adapter, gate in CONTRACTS:
+        assert adapter in published, adapter
+        assert gate['id'] in published[adapter], (adapter, gate['id'])
+    # The frozen ids are exactly what the registry publishes for the migrated
+    # Adapters plus whatever newer Adapters add. A migrated gate that was renamed
+    # would leave its frozen id missing, which the loop above catches; a migrated
+    # Adapter that vanished entirely would fail the membership test. Asserting the
+    # reverse direction too keeps this from being satisfied by publishing the ids
+    # somewhere unrelated: the migrated Adapter set must be the same set.
+    migrated = {adapter for adapter, _ in CONTRACTS}
+    assert migrated <= set(published)
+    for adapter in migrated:
+        # No migrated Adapter may lose every gate the fixtures recorded for it.
+        frozen = {gate['id'] for a, gate in CONTRACTS if a == adapter}
+        assert frozen <= published[adapter], (adapter, published[adapter])
     assert not (tmp_path / 'engineering').exists()
 
 
