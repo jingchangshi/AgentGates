@@ -73,7 +73,20 @@ def snapshot(root: Path, *, _nested=False) -> dict:
     else:
         revision = "NO_GIT"
         names = []
-        for directory, dirs, files in os.walk(root, followlinks=False):
+        unreadable = []
+
+        def _record(error):
+            # os.walk swallows PermissionError by default, so an unreadable
+            # directory contributes nothing to the digest or to fileCount. That is
+            # fail-open in the worst way: a root-owned 0700 dump tree inside the
+            # source root would leave every later receipt verifying as current
+            # while its contents went unhashed. Observed for real - a CANN
+            # extra-info/ tree landed in a source directory and was invisible to
+            # this function. Recording the path forces the digest to move.
+            unreadable.append(error.filename or '?')
+
+        for directory, dirs, files in os.walk(root, followlinks=False,
+                                            onerror=_record):
             for name in dirs[:]:
                 path = Path(directory) / name
                 if path.is_symlink():
@@ -83,6 +96,13 @@ def snapshot(root: Path, *, _nested=False) -> dict:
         names.sort()
         mode = "filesystem"
     digest = hashlib.sha256(revision.encode() + b"\0")
+    # Bind the identity of anything the walk could not list. Without this, an
+    # unreadable directory is simply absent from the enumeration and the digest
+    # is unchanged - so a source tree that gained a root-owned 0700 tree would
+    # keep verifying as current. Recording the path forces the hash to move.
+    if mode == "filesystem":
+        for name in sorted(unreadable):
+            digest.update(json.dumps(["unreadable", name]).encode() + b"\0")
     if own_git:
         # Bind initialized or empty gitlink directories to their index object IDs.
         staged = git(root, "ls-files", "--stage", "-z")

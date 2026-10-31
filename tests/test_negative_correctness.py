@@ -356,6 +356,31 @@ def test_git_exclusion_rules_are_bound_into_source_identity(tmp_path):
     assert snapshot(repo)['hash'] != base['hash'], 'core.excludesFile change was invisible'
 
 
+def test_an_unreadable_directory_cannot_hide_from_source_identity(tmp_path):
+    # os.walk swallows PermissionError, so before this was handled a directory the
+    # snapshot could not list contributed nothing: not to fileCount, not to the
+    # digest. Observed for real when a root-owned CANN extra-info/ dump tree landed
+    # inside a source directory and every receipt still verified as current. A tree
+    # nobody can enumerate must move the hash, not vanish from it.
+    work = tmp_path / 'src'
+    work.mkdir()
+    (work / 'a.py').write_text('value = 1\n')
+    base = snapshot(work)
+    hidden = work / 'extra-info'
+    hidden.mkdir()
+    (hidden / 'dump.bin').write_bytes(b'\0' * 8)
+    original_mode = hidden.stat().st_mode
+    try:
+        os.chmod(hidden, 0o000)
+        changed = snapshot(work)
+        assert changed['hash'] != base['hash'], 'an unreadable directory was invisible to the digest'
+    finally:
+        os.chmod(hidden, original_mode)
+    (hidden / 'dump.bin').unlink()
+    hidden.rmdir()
+    assert snapshot(work)['hash'] == base['hash'], 'the digest did not return to its original value'
+
+
 def test_an_unknown_gate_status_can_never_aggregate_to_pass():
     # `aggregate` used to block a fixed list of failure literals and return
     # PASS for everything else, so a gate that recorded SKIPPED or ERROR - a

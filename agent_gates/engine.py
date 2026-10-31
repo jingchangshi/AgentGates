@@ -139,7 +139,13 @@ def artifact_inputs(source, manifest, env):
         paths.append(source / "tilelang/__init__.py")
         # Native search paths may point outside the default build directory.
         # Snapshot all shared products under this checkout before testing.
-        for directory, dirs, files in os.walk(source, followlinks=False):
+        def _refuse(error):
+            # A shared product this walk cannot see is one whose identity cannot
+            # be bound, so refuse rather than silently narrow the snapshot.
+            raise error
+
+        for directory, dirs, files in os.walk(source, followlinks=False,
+                                            onerror=_refuse):
             dirs[:] = [name for name in dirs if name != ".git"]
             paths.extend(Path(directory) / name for name in files if ".so" in name and (name.endswith(".so") or ".so." in name))
     elif manifest.id == "ascendnpu-ir":
