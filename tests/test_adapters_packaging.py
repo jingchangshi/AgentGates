@@ -25,17 +25,19 @@ class PackagingCase(unittest.TestCase):
         # so a shared-file assumption here would make it look configured when it
         # is not.
         shared = {'tilelang-hivm': 'tilelang-hivm', 'tilelang-hivm-npu': 'tilelang-hivm'}
-        adapters = ('ascendnpu-ir', 'tilelang-hivm', 'tilelang-hivm-npu', 'tla-npu')
+        adapters = ('ascendnpu-ir', 'tilelang-hivm', 'tilelang-hivm-npu', 'tla-npu',
+                    'forgekernel-ascend-npu')
+        # Each Adapter's bridge file, named explicitly. A suffix rule cannot work
+        # here: two Adapter IDs end in '-npu' but ship differently named scripts.
+        bridges = {'tla-npu': 'tla_gate.py', 'forgekernel-ascend-npu': 'fk_gate.py'}
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / 'agent_gates/adapters'
             for name in adapters:
                 (root / name).mkdir(parents=True)
-            for name in ('ascendnpu-ir', 'tilelang-hivm', 'tla-npu'):
+            for name in ('ascendnpu-ir', 'tilelang-hivm', 'tla-npu', 'forgekernel-ascend-npu'):
                 (root / name / 'env.example.sh').write_text('# template\n')
             for name in adapters:
-                script = 'npu_gate.py' if name.endswith('-npu') else 'docker_gate.py'
-                if name == 'tla-npu':
-                    script = 'tla_gate.py'
+                script = bridges.get(name, 'npu_gate.py' if name.endswith('-npu') else 'docker_gate.py')
                 module = load(name, ADAPTERS / name / 'scripts' / script)
                 with patch.object(module, 'ADAPTER_DIR', root / name):
                     expected = shared.get(name, name)
@@ -80,11 +82,16 @@ class PackagingCase(unittest.TestCase):
                 run.assert_not_called()
 
     def test_every_manifest_declares_a_pinned_preflight(self):
+        # The property is "every recipe is preceded by a preflight run by the
+        # pinned script", not "the flag is literally --check-config". An Adapter
+        # whose recipes need different preflights - a device smoke run needs far
+        # less than a build - declares one per recipe, and all of them are still
+        # preflights driven by a file the manifest pins.
         for path in ADAPTERS.glob('*/manifest.json'):
             manifest = json.loads(path.read_text())
             for recipe in manifest['recipes']:
                 check = recipe['configCheck']
-                self.assertEqual(check[-1], '--check-config')
+                self.assertTrue(check[-1].startswith('--check-config'), (path, check))
                 self.assertIn(check[2].removeprefix('{pack}/'), manifest['files'])
 
     def test_the_distribution_declares_the_deployment_files_it_ships(self):
@@ -108,6 +115,19 @@ class PackagingCase(unittest.TestCase):
             for adapter in ('ascendnpu-ir', 'tilelang-hivm'):
                 self.assertTrue((ADAPTERS / adapter / 'docker' / name).is_file(),
                                 f'{adapter}/docker/{name}')
+
+    def test_the_packaging_list_covers_the_new_adapters_payload(self):
+        # An installed Pack must carry the patches it applies and the task it
+        # runs, or the wheel ships an Adapter that cannot do its job. These are
+        # directory patterns rather than one file at a time because the patch
+        # series is expected to grow; unlike docker/, neither directory can hold
+        # machine data.
+        listing = (ROOT / 'pyproject.toml').read_text().split('[tool.setuptools.package-data]', 1)[1]
+        for pattern in ('"adapters/*/patches/*"', '"adapters/*/tasks/*/*"'):
+            self.assertIn(pattern, listing, f'{pattern} is not packaged')
+        adapter = ADAPTERS / 'forgekernel-ascend-npu'
+        self.assertTrue((adapter / 'patches/series.json').is_file())
+        self.assertTrue((adapter / 'tasks/rmsnorm-ascend').is_dir())
 
     def test_the_packaging_list_covers_every_shipped_deployment_file(self):
         # The explicit list is only safe while it is complete: a new deployment
@@ -134,6 +154,13 @@ class PackagingCase(unittest.TestCase):
             for value in machine:
                 self.assertNotIn(value, text, f'{template}: {value}')
             self.assertNotRegex(text, r'ASCEND_RT_VISIBLE_DEVICES=[0-9]')
+        # The ForgeKernel template is host-local, so it ships no container file;
+        # the same rule still applies to it, through its own name.
+        template = ADAPTERS / 'forgekernel-ascend-npu' / 'env.example.sh'
+        text = template.read_text()
+        for value in machine:
+            self.assertNotIn(value, text, f'{template}: {value}')
+        self.assertNotRegex(text, r'FK_ASCEND_DEVICE_ID=[0-9]')
 
     def test_the_container_helper_has_no_literal_device_default(self):
         # `ASCEND_VISIBLE_DEVICES=0,1` as a fallback made a configuration file

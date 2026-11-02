@@ -1,0 +1,5 @@
+{
+  "comment": "Ordered patch series this Adapter applies to a ForgeKernel checkout. Empty until the P1/P2/P3 patch task lands its files; prepare applies exactly these, in this order, and records each digest.",
+  "baseCommit": null,
+  "patches": []
+}

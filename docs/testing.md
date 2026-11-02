@@ -8,7 +8,7 @@ Two layers are tested separately: the offline suite (no Docker, compiler or devi
 python3 -m pytest -q tests/
 ```
 
-Current result: **470 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
+Current result: **708 passed, 88 subtests passed**, exit 0. No network, Docker, compiler or NPU access is required. Some tests spawn real local subprocesses (`sys.executable`) to exercise timeout, signal and process-tree behaviour; none of them build anything.
 
 | File | Tests | Subtests | Covers |
 | --- | ---: | ---: | --- |
@@ -18,7 +18,10 @@ Current result: **470 passed, 88 subtests passed**, exit 0. No network, Docker, 
 | `test_adapters_ascend.py` | 90 | 3 | Ascend bridge: argv, timeouts, bind-mount mapping, host/container identity, preflight |
 | `test_adapters_tilelang.py` | 183 | 4 | TileLang and NPU bridges, statistics contract, JUnit handling, device authorization, occupancy probe (including unreadable driver layouts), blocked-exit-code declaration, container-script quoting, toolchain load status |
 | `test_adapters_raw_reports.py` | 7 | 70 | Malformed container facts cannot become a PASS |
-| `test_adapters_packaging.py` | 7 | — | Adapter data layout, `--check-config` presence, shipped deployment files, template neutrality, no literal device default |
+| `test_adapters_packaging.py` | 9 | — | Adapter data layout, `--check-config` presence, shipped deployment files, template neutrality, no literal device default, the ForgeKernel Adapter's packaged patch series and task |
+| `test_forgekernel_adapter.py` | 38 | — | The ForgeKernel Adapter: machine-key parity with the engine, preflight acceptance and its refusals, the device window's lease semantics, occupancy reporting, the smoke Gate's device authorization and its BLOCKED_ENV / FAIL split, manifest pins |
+| `test_device_window_lease.py` | 4 | — | Two real subprocesses sharing one card: neither is blocked, their windows do not overlap, the lease is free between them, a held lease ends as `BLOCKED_ENV` |
+| `test_device_window_engine.py` | 20 | — | The engine side of the window: it holds no lease for a windowed recipe, validates the reported window, refuses a mixed declaration, keeps a blocked gate a BLOCKED_ENV rather than bad evidence, and leaves an undeclared recipe on the whole-recipe lease |
 | `test_equivalence_gates.py` | 54 | — | Frozen original contracts for all five gates versus the migrated evaluator |
 | `test_plugin_receipts.py` | 10 | 11 | Claude Code skills and the opt-in `TaskCompleted` receipt hook |
 
@@ -32,6 +35,8 @@ Current result: **470 passed, 88 subtests passed**, exit 0. No network, Docker, 
 - **Unknown states cannot aggregate to PASS.** `aggregate()` returns PASS only when every gate is literally `PASS`; an empty run is `NOT_RUN` and an unrecognised status is `INVALID_EVIDENCE`, so a receipt written by a bug cannot verify as valid.
 - **Machine-file values are data inside the container script.** Values that reach `bash -c` are emitted as single-quoted literals, because inside double quotes a `$(...)` would execute in the container.
 - **Leases are per resource, not per spelling.** Lock keys resolve their path component, so two spellings of one build directory cannot take two leases.
+- **A blocked device run is not bad evidence.** A windowed gate that the Adapter classifies `BLOCKED_ENV` ran nothing, so it has no window to show; it is recorded as a window that never opened rather than being upgraded to `INVALID_EVIDENCE`, which would claim the evidence was wrong instead of that nothing ran. Its lease is still accounted for, so a blocked run cannot silently keep holding the card.
+- **A device lease is a window, not a reservation.** A recipe that declares `deviceWindow` opens `npu:<id>` itself, around the work that uses the card, and the engine holds nothing; a recipe that declares nothing keeps the whole-recipe lease unchanged. The two modes are mutually exclusive within one adapter and a manifest mixing them is refused, because holding the lease while handing it to a child deadlocks on the lock the child waits for. A window waits for a bounded time instead of failing immediately — two of our own runs wanting one card a second apart is coordination, not an environment fault — and a wait that expires exits 75, which the runner records as `BLOCKED_ENV`. Another tenant on the card is never a refusal: occupancy is measured and reported as `free`, `shared(n)` or `unknown`, and a window that publishes nothing at all is `INVALID_EVIDENCE`, because an unshown window is not a short one.
 - **Receipts are revalidated.** Mutating the receipt, logs, source, manifest, script or a product downgrades a recorded PASS to `INVALID_EVIDENCE` or `STALE`. A receipt that no longer verifies never reports an individual gate as `PASS` either, so a reader iterating `gates` cannot see a passing claim the top-level status denies, and a receipt with no recorded status is reported as `BLOCKED_ENV` instead of crashing the command.
 - **Host execution needs explicit consent.** A manifest without `"permissions": {"hostExecution": true}` never runs a command; a missing block is not read as permission.
 - **Ignore rules are part of the source identity.** Editing `.git/info/exclude` or `core.excludesFile` changes the snapshot digest, so a rule cannot hide bytes while an already-issued `PASS` keeps verifying as current.

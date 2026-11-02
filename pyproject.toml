@@ -29,8 +29,15 @@ include = ["agent_gates*"]
 # also matched a real machine `config.env` sitting beside the template, and
 # git-ignore rules do not keep a file out of package-data. Keep this list in
 # step with the files the Adapters actually ship.
+#
+# The ForgeKernel Adapter ships a patch series and a task definition as well as
+# its gate: an installed Pack must carry the patches it applies and the task it
+# runs, or the wheel would install an Adapter that cannot do its job. Those are
+# named by directory pattern (not one file at a time) because the series is
+# expected to grow; they contain no machine data, unlike a real `config.env`.
 agent_gates = ["adapters/*/manifest.json", "adapters/*/scripts/*", "adapters/*/env.example.sh",
                "adapters/*/README.md",
+               "adapters/*/patches/*", "adapters/*/tasks/*/*",
                "adapters/*/docker/Dockerfile", "adapters/*/docker/entry.sh",
                "adapters/*/docker/create-container.sh", "adapters/*/docker/config.example.env",
                "adapters/*/docker/README.md"]

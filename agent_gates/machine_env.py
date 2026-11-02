@@ -94,6 +94,32 @@ TLA_NPU_KEYS = (
     'TLA_NPU_CACHE_DIR',
     'TLA_NPU_BUILD_SUBDIR',
 )
+# The FK-Ascend Adapter configures a ForgeKernel checkout plus a REUSED
+# TileLang build, not a build tree of its own: the engine resolves a BUILD_SUBDIR
+# for every Adapter so it can take a lease, but this one installs into a private
+# virtual environment and never runs Ninja in the source.
+#
+# The keys are deliberately split by who reads them. `env.sh` holds the machine
+# (paths, interpreter, toolchain); the device id is NOT here, because it
+# authorizes one run rather than describing a machine.
+FK_ASCEND_KEYS = (
+    'FK_ASCEND_CANN_SETUP',
+    'FK_ASCEND_PYTHON',
+    'FK_ASCEND_TILELANG_SOURCE',
+    'FK_ASCEND_TILELANG_BUILD',
+    'FK_ASCEND_WORK_ROOT',
+    'FK_ASCEND_BUILD_SUBDIR',
+    'FK_ASCEND_VENV',
+    'FK_ASCEND_PIP_INDEX',
+    'FK_ASCEND_CLAUDE_BIN',
+    'FK_ASCEND_PROVIDER_ENDPOINT',
+    'FK_ASCEND_PROVIDER_MODEL',
+    'FK_ASCEND_PROVIDER_KEY_VARIABLE',
+    'FK_ASCEND_AGENT_SANDBOX',
+    'FK_ASCEND_AGENT_NETWORK',
+    'FK_ASCEND_DEPENDENCY_POLICY',
+    'FK_ASCEND_TILELANG_CACHE_DIR',
+)
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
 ADAPTERS = {
@@ -120,6 +146,12 @@ ADAPTERS = {
         'selector': 'TLA_NPU_ENV_FILE',
         'directory': 'tla-npu',
         'keys': TLA_NPU_KEYS,
+    },
+    'forgekernel-ascend-npu': {
+        'prefix': 'FK_ASCEND_',
+        'selector': 'FK_ASCEND_ENV_FILE',
+        'directory': 'forgekernel-ascend-npu',
+        'keys': FK_ASCEND_KEYS,
     },
 }
 
