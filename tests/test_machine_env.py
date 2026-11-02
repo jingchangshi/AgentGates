@@ -38,6 +38,7 @@ ASCEND = load_script(ADAPTERS / 'ascendnpu-ir/scripts/docker_gate.py', 'machine_
 TILELANG = load_script(ADAPTERS / 'tilelang-hivm/scripts/docker_gate.py', 'machine_env_tilelang')
 NPU = load_script(ADAPTERS / 'tilelang-hivm-npu/scripts/npu_gate.py', 'machine_env_npu')
 TLA = load_script(ADAPTERS / 'tla-npu/scripts/tla_gate.py', 'machine_env_tla')
+FK = load_script(ADAPTERS / 'forgekernel-ascend-npu/scripts/fk_gate.py', 'machine_env_fk')
 
 
 class EnvironmentCase(unittest.TestCase):
@@ -50,7 +51,7 @@ class EnvironmentCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         for name in list(os.environ):
-            if name.startswith(('ASCENDNPU_', 'TILELANG_HIVM_', 'TLA_NPU_')):
+            if name.startswith(('ASCENDNPU_', 'TILELANG_HIVM_', 'TLA_NPU_', 'FK_ASCEND_')):
                 os.environ.pop(name)
 
     def write_env(self, name, values):
@@ -73,7 +74,8 @@ class KeySetParityCase(EnvironmentCase):
         # its own engine key set rather than being folded into the TileLang one.
         for module, expected in ((TILELANG, machine_env.TILELANG_HIVM_KEYS),
                                  (NPU, machine_env.TILELANG_HIVM_KEYS),
-                                 (TLA, machine_env.TLA_NPU_KEYS)):
+                                 (TLA, machine_env.TLA_NPU_KEYS),
+                                 (FK, machine_env.FK_ASCEND_KEYS)):
             self.assertEqual(tuple(sorted(module.TOOLCHAIN_KEYS)),
                              tuple(sorted(expected)), module.__name__)
 
@@ -91,6 +93,14 @@ class KeySetParityCase(EnvironmentCase):
         self.assertEqual([key for key in machine_env.TLA_NPU_KEYS
                           if key.endswith('_NINJA_JOBS')], [],
                          'tla-npu has no build tree, so it must not declare a job count')
+        # forgekernel-ascend-npu installs into a private venv and never runs
+        # Ninja in the source, so it declares the lease directory but no job
+        # count, for the same reason tla-npu does.
+        self.assertTrue([key for key in machine_env.FK_ASCEND_KEYS
+                         if key.endswith('_BUILD_SUBDIR')])
+        self.assertEqual([key for key in machine_env.FK_ASCEND_KEYS
+                          if key.endswith('_NINJA_JOBS')], [],
+                         'forgekernel-ascend-npu has no Ninja build tree')
 
     def test_the_adapter_parsers_accept_exactly_what_the_engine_accepts(self):
         # Key-name parity is not enough: the two sides have separate parsers, so a
@@ -100,7 +110,8 @@ class KeySetParityCase(EnvironmentCase):
         # could accept a key the engine never leases.
         for adapter, spec in machine_env.ADAPTERS.items():
             module = {'ascendnpu-ir': ASCEND, 'tilelang-hivm': TILELANG,
-                      'tilelang-hivm-npu': NPU, 'tla-npu': TLA}[adapter]
+                      'tilelang-hivm-npu': NPU, 'tla-npu': TLA,
+                      'forgekernel-ascend-npu': FK}[adapter]
             path = self.root / f'{adapter}.env'
             text = ''.join(f'{key}=' + chr(10) for key in spec['keys'])
             path.write_text(text)

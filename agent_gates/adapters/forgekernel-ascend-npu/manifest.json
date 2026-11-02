@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "id": "forgekernel-ascend-npu",
+  "version": "0.1.0",
+  "capabilities": [
+    "build"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/fk_gate.py": "04bbcd7140d03129a4e1b8f12c57fdcdef08365b711421073752f671cb6e34ae",
+    "scripts/fk_device_probe.py": "119b27292ede031d92325829dee468fb7bfe87bcb37f1c7d3be61a4401f3d052"
+  },
+  "recipes": [
+    {
+      "id": "forgekernel-ascend-npu.smoke",
+      "cwd": "source",
+      "timeout": 420,
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/fk_gate.py",
+        "--smoke"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/fk_gate.py",
+        "--check-config-smoke"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "forgekernel-ascend-npu.build",
+      "cwd": "source",
+      "timeout": 1260,
+      "device": "none",
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/fk_gate.py",
+        "--build"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/fk_gate.py",
+        "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "forgekernel-ascend-npu-smoke",
+      "recipeId": "forgekernel-ascend-npu.smoke",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "npuAvailable": true,
+        "tensorOnDevice": true,
+        "numericalOk": true,
+        "synchronizeOk": true,
+        "deviceMemoryPositive": true,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true
+      }
+    },
+    {
+      "id": "forgekernel-ascend-npu-build",
+      "recipeId": "forgekernel-ascend-npu.build",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "venvCreated": true,
+        "forgekernelInstalled": true,
+        "importOk": true,
+        "versionReported": true,
+        "forgeEntryPointOk": true,
+        "tilelangReused": true,
+        "tilelangSourceUnchanged": true
+      }
+    }
+  ]
+}

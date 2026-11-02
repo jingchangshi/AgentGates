@@ -56,6 +56,18 @@ class Recipe:
     timeout: float
     config_check: tuple[str, ...] = ()
     blocked_exit_codes: tuple[int, ...] = ()
+    # Seconds this Recipe will wait for its own device window, or None when the
+    # engine holds the device lease for the whole recipe. A declared window means
+    # the Recipe opens the lease itself, immediately around the work that touches
+    # the card, so thinking, compiling and writing files never hold it. It is a
+    # wait bound, not a duration: the Recipe releases the lease when its work
+    # ends, and a window that never opens is a refusal, not a hang.
+    device_window: float | None = None
+    # Whether this Recipe drives the card at all. Absent in a manifest means yes,
+    # which is what every migrated Adapter's gate already assumes. A host-only
+    # Recipe of a device Adapter declares `"device": "none"` so that building it
+    # does not demand a device id for work that never touches one.
+    uses_device: bool = True
 
 
 class Manifest:
@@ -166,7 +178,55 @@ class Manifest:
                 or len(set(blocked)) != len(blocked):
             raise ManifestError("blockedExitCodes must be distinct exit codes between 1 and 255")
         return Recipe(recipe_id, self._argv(item.get("argv")), str(Path(source).resolve() if cwd == "source" else self.root),
-                      float(timeout), self._argv(check, check=True) if check else (), tuple(blocked))
+                      float(timeout), self._argv(check, check=True) if check else (), tuple(blocked),
+                      self._device_window(item, recipe_id), self._uses_device(item, recipe_id))
+
+    @staticmethod
+    def _uses_device(item, recipe_id):
+        """Whether a Recipe drives the card; the default is yes.
+
+        The default is the old behaviour, and it is the safe direction: a
+        manifest that says nothing about a device Adapter's recipe still gets a
+        device lease and still requires an authorized id. Opting out is explicit
+        (`"device": "none"`) so a host-only step, such as installing a build, can
+        run without pretending to own a card.
+        """
+        value = item.get("device")
+        if value is None:
+            return True
+        if value == "none":
+            return False
+        raise ManifestError(f"recipe {recipe_id} device must be omitted or \"none\": {value!r}")
+
+    @staticmethod
+    def _device_window(item, recipe_id):
+        """The declared device window, or None when the engine must hold the lease.
+
+        The default is the old behaviour - the engine leases the card for the
+        whole recipe - so a manifest that says nothing is unchanged. A Recipe
+        that declares a window opts out of that, and the engine then hands it
+        the lease path instead of taking the lease itself.
+
+        The value is a BOUNDED WAIT in seconds, not a hold time. It has to be a
+        positive finite number: a bare true would read as one second, and a
+        negative value would never expire. A window nobody can open must end as
+        a refusal rather than wedge the run.
+        """
+        window = item.get("deviceWindow")
+        if window is None:
+            return None
+        if not isinstance(window, dict):
+            raise ManifestError(f"recipe {recipe_id} deviceWindow must be an object")
+        unknown = set(window) - {"waitSeconds"}
+        if unknown:
+            raise ManifestError(f"recipe {recipe_id} deviceWindow has unknown key(s): "
+                                f"{', '.join(sorted(unknown))}")
+        seconds = window.get("waitSeconds")
+        # type(...) rather than isinstance: a bool is an int, so true would
+        # otherwise silently mean a one-second window.
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+            raise ManifestError(f"recipe {recipe_id} deviceWindow.waitSeconds must be a positive number")
+        return float(seconds)
 
     def order(self, selected: list[str]) -> list[str]:
         ordered, active, done = [], set(), set()

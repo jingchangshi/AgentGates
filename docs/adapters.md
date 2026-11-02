@@ -1,6 +1,6 @@
 # Adapter configuration
 
-AgentGates bundles four independent, digest-pinned adapters. It runs fixed argv recipes from the selected source root. It does not import PiEngineeringHarness or require a Claude session.
+AgentGates bundles five independent, digest-pinned adapters. It runs fixed argv recipes from the selected source root. It does not import PiEngineeringHarness or require a Claude session.
 
 | Adapter | Gate | Fixed operation | Inner / outer timeout |
 | --- | --- | --- | --- |
@@ -10,6 +10,8 @@ AgentGates bundles four independent, digest-pinned adapters. It runs fixed argv 
 | `tilelang-hivm` | `tilelang-hivm-regression` | Two pinned host regression files, after build | 900 / 960 s |
 | `tilelang-hivm-npu` | `tilelang-hivm-npu-sanity` | Fixed SIMD vector-add device test | 900 / 960 s |
 | `tla-npu` | `tla-npu-e2e` | `test_tla.py`: TLA SIMD FP8 cast-back plus its plain-Triton reference, on one authorized device | 1200 / 1260 s |
+| `forgekernel-ascend-npu` | `forgekernel-ascend-npu-smoke` | Real device work inside a lease window: FP32 and BF16 elementwise arithmetic and a reduction against a CPU reference | 300 / 420 s |
+| `forgekernel-ascend-npu` | `forgekernel-ascend-npu-build` | Host-local install of the adapted ForgeKernel tree into a private venv, plus an import/version/entry-point probe. No Docker, no root, no device | 900 / 1260 s |
 
 The container timeout sends TERM then allows 15 seconds before KILL. The outer timeout remains larger. Nonzero exits, interruption and timeout never become PASS. The source must have a configured `build/build.ninja`; gates do not configure a fresh build tree.
 
@@ -17,7 +19,7 @@ The container timeout sends TERM then allows 15 seconds before KILL. The outer t
 
 Keep machine files outside the package and pass an absolute `--env-file`. Files contain strict `NAME=value` data, comments and blank lines. Balanced surrounding quotes are removed. Unknown keys, duplicate keys and malformed lines fail. The gate readers never execute the file or expand substitutions. CANN and Conda paths name locations inside the container. CANN is initialized before Conda; Conda setup and environment must be supplied together.
 
-`--env-file` maps to `ASCENDNPU_ENV_FILE` for Ascend, `TILELANG_HIVM_ENV_FILE` for both TileLang adapters and `TLA_NPU_ENV_FILE` for the TLA adapter. Without an explicit selection, bridges look beside the packaged adapter template, retaining the legacy owning-checkout search for installed pack compatibility. They never search a user's home for machine files. An explicitly selected missing file fails.
+`--env-file` maps to `ASCENDNPU_ENV_FILE` for Ascend, `TILELANG_HIVM_ENV_FILE` for both TileLang adapters, `TLA_NPU_ENV_FILE` for the TLA adapter and `FK_ASCEND_ENV_FILE` for the ForgeKernel adapter. Without an explicit selection, bridges look beside the packaged adapter template, retaining the legacy owning-checkout search for installed pack compatibility. They never search a user's home for machine files. An explicitly selected missing file fails.
 
 Ascend permits `ASCENDNPU_CANN_SETUP`, `ASCENDNPU_CONDA_SH`, `ASCENDNPU_CONDA_ENV`, optional `ASCENDNPU_CCEC_BIN`, the container identity `ASCENDNPU_CONTAINER_NAME` / `_USER` / `_HOME`, `ASCENDNPU_CONTAINER_SOURCE`, and the build selection `ASCENDNPU_BUILD_SUBDIR` / `ASCENDNPU_NINJA_JOBS`. All of them are file keys: the launching environment is not a configuration source for any adapter. `ASCENDNPU_CCEC_BIN` is needed only by the from-zero branch, and `ASCENDNPU_CONTAINER_SOURCE` confirms the container path of the checkout rather than inventing one - the bind-mount mapping is still derived and compared. Only `ASCENDNPU_GATE_TIMEOUT` remains a launch value, because it bounds an invocation rather than describing the machine.
 
@@ -40,6 +42,20 @@ The TLA adapter has its own file and its own prefix. It permits `TLA_NPU_CONTAIN
 The TLA adapter gates on what the process that ran the test actually measured: at least one tensor constructed on the device, a positive peak device allocation, and at least one kernel image in a fresh `TRITON_CACHE_DIR` (the Ascend backend emits `.npubin`; a `.o` is counted but not required, because requiring an artifact the backend never writes would be unsatisfiable rather than strict). The synchronization result, the two output markers and the script exit status are also gated, so a stub that prints the markers but never reaches the kernel still fails.
 
 It does **not** claim to re-derive which physical board ran. The device UUID and name are recorded in the receipt but explicitly not gated: on this host both cards report the same UUID, and the visible-device echo is a value the adapter itself exported, so gating on either would be a tautology rather than evidence. `acl.rt.get_phy_dev_id_by_logic_dev_id` is likewise not used, because it answers from the host physical table regardless of which card `ASCEND_RT_VISIBLE_DEVICES` selected. Board-level identity cannot be observed from inside the container at all: the container's `npu-smi` fails to load `libc_sec.so`, so serials and PCIe addresses are host-side facts only. What the gate proves is that a compiled TLA kernel ran on the one card the operator named by `--device-id`, not that AgentGates independently re-identified that card.
+The ForgeKernel adapter is host-local and owns the `FK_ASCEND_` prefix. Its smoke gate is deliberately cheap to configure — it needs only the interpreter and a per-run device id — so a device can be proved usable before any ForgeKernel or TileLang build exists. Its file permits `FK_ASCEND_CANN_SETUP`, `FK_ASCEND_PYTHON`, `FK_ASCEND_TILELANG_SOURCE`, `FK_ASCEND_TILELANG_BUILD`, `FK_ASCEND_TILELANG_CACHE_DIR`, `FK_ASCEND_WORK_ROOT`, `FK_ASCEND_BUILD_SUBDIR`, `FK_ASCEND_VENV`, `FK_ASCEND_PIP_INDEX`, `FK_ASCEND_DEPENDENCY_POLICY`, and the agent keys `FK_ASCEND_CLAUDE_BIN`, `FK_ASCEND_PROVIDER_ENDPOINT`, `FK_ASCEND_PROVIDER_MODEL`, `FK_ASCEND_PROVIDER_KEY_VARIABLE`, `FK_ASCEND_AGENT_SANDBOX`, `FK_ASCEND_AGENT_NETWORK`. Its device id is `FK_ASCEND_DEVICE_ID` and, like every device adapter's, it is a launch value rather than a machine key. TileLang is a REUSED dependency here: the adapter verifies the existing checkout and its `libtilelang*.so` and records their digests, and never configures, compiles or pip-installs TileLang. The build installs with `--no-deps` into a `--system-site-packages` venv, so the shared toolchain another run depends on is not upgraded. The provider API key is never a file key: the file names the environment variable that holds it.
+
+## Device leases
+
+A device adapter names a card and leases `npu:<id>`; the id is always explicit, because an omitted id is a refusal rather than a default. The lease coordinates AgentGates runs with each other. It cannot exclude other tenants of a shared machine, and no reading of a receipt should treat it as if it did.
+
+The lease is taken for the whole recipe unless the recipe declares a window. A recipe with `"deviceWindow": {"waitSeconds": N}` opens the lease itself, around the work that actually drives the card, and the engine holds nothing: the engine passes the lease path, the resource name and the wait bound in `AGENT_GATES_DEVICE_LEASE_PATH` / `_RESOURCE` / `_WAIT_SECONDS`, and the recipe flocks that exact file. Handing over the path rather than re-deriving it is deliberate — the lease file is a hash of the resource name, and a second implementation of that hash is how two locks get taken on one card.
+
+The two modes cannot mix inside one run. Holding the lease while handing the same lease to a child deadlocks on the lock the child waits for, so an adapter that declares both kinds of device recipe is refused as a manifest error instead of running one of its gates unprotected.
+
+A window waits for at most its declared bound and then exits 75, which the runner records as `BLOCKED_ENV`: a resource refusal where nothing ran, never a failed test. An occupied card produces no such refusal. Occupancy is measured and recorded as `free`, `shared(n)` or `unknown` — a count only, never another tenant's process id or command line — and it is never gated, because on a shared machine another user's process is the normal case. A windowed gate that reports no window is `INVALID_EVIDENCE`: an unshown window is not a short one. The one exception is a gate the Adapter classified `BLOCKED_ENV`: it ran nothing, so there is no window to show, and it is recorded as a window that never opened rather than upgraded to bad evidence.
+
+A window should cover work, not setup. On a host where importing the backend and creating the device context takes tens of seconds, an Adapter warms up first and takes the lease afterwards; the receipt then carries the split (`warmupSeconds` outside, `heldSeconds` / `probeSeconds` inside) so the claim is checkable. Those durations are recorded and never gated, because a slow machine is not a failed test. The engine caps a reported window whose resource or path differs from the one it granted, whose end precedes its start, or whose occupancy is not a defined value.
+
 ## Commands and checks
 
 ```bash

@@ -8,32 +8,50 @@ from .evaluator import evaluate
 from .evidence import EvidenceStore, aggregate
 from .executor import execute, executable_identity, file_reference, now
 from . import machine_env
-from .locking import acquire
+from .locking import acquire, lock_path
 from .manifest import Manifest, ManifestError, SHA256
 from .registry import Registry
 from .source_identity import snapshot, source_root
 
 ENV_KEYS = {"ascendnpu-ir": "ASCENDNPU_ENV_FILE", "tilelang-hivm": "TILELANG_HIVM_ENV_FILE",
-            "tilelang-hivm-npu": "TILELANG_HIVM_ENV_FILE", "tla-npu": "TLA_NPU_ENV_FILE"}
+            "tilelang-hivm-npu": "TILELANG_HIVM_ENV_FILE", "tla-npu": "TLA_NPU_ENV_FILE",
+            "forgekernel-ascend-npu": "FK_ASCEND_ENV_FILE"}
 
 # The environment prefix each Adapter owns. An Adapter reads only its own prefix,
 # so a stray export for one Adapter cannot steer another; this map is the single
 # place that association is written.
 OWN_PREFIX = {"ascendnpu-ir": "ASCENDNPU_", "tilelang-hivm": "TILELANG_HIVM_",
-              "tilelang-hivm-npu": "TILELANG_HIVM_", "tla-npu": "TLA_NPU_"}
+              "tilelang-hivm-npu": "TILELANG_HIVM_", "tla-npu": "TLA_NPU_",
+              "forgekernel-ascend-npu": "FK_ASCEND_"}
 
 # The Adapters that require an explicitly authorized NPU device. Each names its
-# own device variable and takes an npu:<id> lease on it, because a run that
-# touches a card must not share it with another AgentGates run.
+# own device variable and leases an npu:<id> on it, so two AgentGates runs cannot
+# drive one card at the same time. The lease coordinates OUR runs with each
+# other; it does not, and cannot, exclude other tenants of a shared machine.
 DEVICE_ADAPTERS = {"tilelang-hivm-npu": "TILELANG_HIVM_DEVICE_ID",
-                   "tla-npu": "TLA_NPU_DEVICE_ID"}
+                   "tla-npu": "TLA_NPU_DEVICE_ID",
+                   "forgekernel-ascend-npu": "FK_ASCEND_DEVICE_ID"}
+
+# The variables a windowed Recipe reads to open the device lease itself. The
+# engine writes them only for a recipe that declares `deviceWindow`; every other
+# recipe keeps the whole-recipe lease it always had, so a manifest that says
+# nothing about windows behaves exactly as before.
+#
+# The path is passed rather than derived by the Adapter: the lease file is a
+# hash of the resource name, and a second implementation of that hash is how two
+# different locks get taken on one card. The recipe flocks this exact file.
+DEVICE_LEASE_PATH = "AGENT_GATES_DEVICE_LEASE_PATH"
+DEVICE_LEASE_RESOURCE = "AGENT_GATES_DEVICE_LEASE_RESOURCE"
+DEVICE_LEASE_WAIT = "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS"
+LEASE_ENVIRONMENT = (DEVICE_LEASE_PATH, DEVICE_LEASE_RESOURCE, DEVICE_LEASE_WAIT)
 
 # The Adapter that reads each Adapter variable for the exclusivity policy. The
 # engine forwards the operator choice, but the variable it writes is the one the
 # receiving Adapter actually parses; writing another Adapter prefix here would
 # look forwarded and be silently ignored by the Gate.
 EXCLUSIVE_VARIABLE = {"tilelang-hivm-npu": "TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE",
-                      "tla-npu": "TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE"}
+                      "tla-npu": "TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE",
+                      "forgekernel-ascend-npu": "FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE"}
 
 # A configuration check explains itself on stderr. Only the last line is kept,
 # bounded, and it is the Adapter's own message: no environment values, no
@@ -71,7 +89,7 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     # steer this run without being part of what `configuration()` hashes.
     own = OWN_PREFIX.get(manifest.id, "")
     for name in [name for name in env
-                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_", "TLA_NPU_"))
+                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_", "TLA_NPU_", "FK_ASCEND_"))
                  and not name.startswith(own)]:
         del env[name]
     if env_file is not None:
@@ -95,6 +113,11 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     # Exclusivity is a policy the operator chose in the local configuration, not
     # a precondition for running. Forwarding it lets the Adapter decide whether a
     # shared card is acceptable, which is the only layer that can see occupancy.
+    # A lease handle is handed to one specific recipe for one specific window.
+    # Inheriting it would let a stale export point a recipe at a lease file the
+    # engine never took, so every run starts from "no lease was published".
+    for name in LEASE_ENVIRONMENT:
+        env.pop(name, None)
     exclusive_variable = EXCLUSIVE_VARIABLE.get(manifest.id)
     if exclusive_variable is not None:
         if require_exclusive_device:
@@ -209,6 +232,92 @@ def collect_artifacts(observed, source):
     return references
 
 
+def device_lease_plan(manifest, order, source):
+    """How this run holds its device card: whole-recipe, per-window, or not at all.
+
+    Returns ``(variable, windows)``. ``variable`` is the Adapter's device
+    variable (None for an Adapter that never names a card), and ``windows`` maps
+    a gate id to the recipe that opens the lease itself.
+
+    A recipe that declares ``deviceWindow`` is handed the lease instead of
+    having it held for it. Holding the whole-recipe lease *and* handing the same
+    lease to a child would deadlock: the engine owns the flock, the child waits
+    for it, and no window ever opens. So the two modes are mutually exclusive in
+    one run, and a manifest that mixes them is refused as a manifest error
+    rather than silently running one of its device gates unprotected.
+    """
+    variable = DEVICE_ADAPTERS.get(manifest.id)
+    if variable is None:
+        return None, {}
+    # Only a selected gate that actually drives the card needs a lease. A
+    # device Adapter may also ship host-only steps - installing a build, reading
+    # a configuration - and demanding a device allocation for those would make
+    # work that never touches a card impossible to run on a busy machine.
+    windows, whole = {}, []
+    for gate_id in order:
+        recipe = manifest.resolve_recipe(manifest.gates[gate_id]["recipeId"], source)
+        if not recipe.uses_device:
+            continue
+        if recipe.device_window is None:
+            whole.append(gate_id)
+        else:
+            windows[gate_id] = recipe
+    if not windows and not whole:
+        # Nothing selected touches the card: no id, no lease, no window.
+        return None, {}
+    if windows and whole:
+        held, handed = ", ".join(sorted(whole)), ", ".join(sorted(windows))
+        raise ManifestError(
+            f"adapter declares both whole-recipe and windowed device gates ({held} vs {handed}); "
+            "one run cannot hold the card and also hand the same lease to a recipe")
+    return variable, windows
+
+
+def device_window(observations, lease):
+    """The window facts a windowed Recipe must publish, checked against the plan.
+
+    The engine cannot see when the child held the flock, so the child states it
+    and this function decides whether that statement is admissible. What is
+    checked is that the child names the lease it was given - not one it chose -
+    that both ends of the window exist in order, and that occupancy is a value
+    this contract defines. A run that publishes nothing is refused: an unshown
+    window is not a short window.
+
+    Occupancy is recorded, never gated: another tenant on the card is normal on a
+    shared machine and must not turn into a failure.
+    """
+    reported = observations.get("deviceWindow")
+    if not isinstance(reported, dict):
+        return None, "DEVICE_WINDOW_MISSING"
+    if reported.get("resource") != lease["resource"]:
+        return None, "DEVICE_WINDOW_RESOURCE_MISMATCH"
+    if reported.get("path") != lease["path"]:
+        return None, "DEVICE_WINDOW_PATH_MISMATCH"
+    started, released = reported.get("startedAt"), reported.get("releasedAt")
+    if not isinstance(started, str) or not isinstance(released, str) or started > released:
+        return None, "DEVICE_WINDOW_TIMES_INVALID"
+    occupancy = reported.get("occupancy")
+    if not isinstance(occupancy, str) or not (occupancy == "free" or occupancy == "unknown"
+                                              or re.fullmatch(r"shared\([0-9]+\)", occupancy)):
+        return None, "DEVICE_WINDOW_OCCUPANCY_INVALID"
+    waited = reported.get("waited")
+    if type(waited) not in (int, float) or waited < 0:
+        return None, "DEVICE_WINDOW_WAIT_INVALID"
+    window = {"resource": reported["resource"], "path": reported["path"],
+              "startedAt": started, "releasedAt": released, "occupancy": occupancy,
+              "waited": float(waited)}
+    # Optional durations, carried through so a receipt can show that the window
+    # was dominated by work rather than by setup. They are RECORDED, never gated:
+    # a slow machine is not a failed test, and a bound on elapsed time would make
+    # the verdict depend on what else the host was doing. A value of the wrong
+    # type is dropped rather than trusted.
+    for name in ("heldSeconds", "probeSeconds", "warmupSeconds"):
+        value = reported.get(name)
+        if type(value) in (int, float) and value >= 0:
+            window[name] = float(value)
+    return window, None
+
+
 class Engine:
     def __init__(self, *, registry=None, store=None, lock_root=None):
         self.registry = registry or Registry()
@@ -264,13 +373,24 @@ class Engine:
             # build cannot describe two different trees.
             build = build_directory(source, manifest, env)
             resources.append("build:" + str(build))
-            variable = DEVICE_ADAPTERS.get(manifest.id)
+            variable, windows = device_lease_plan(manifest, order, source)
             if variable is not None:
                 device = env.get(variable, "")
                 if not re.fullmatch(r"[0-9]+", device):
                     raise ValueError(f"explicit {variable} or --device-id authorization required")
-                resources.append("npu:" + str(int(device)))
                 receipt["authorizedDeviceId"] = str(int(device))
+                if not windows:
+                    # Nothing declared a window, so the engine holds the card for
+                    # the whole recipe exactly as it always has.
+                    resources.append("npu:" + str(int(device)))
+                else:
+                    # The card is NOT leased here: each windowed recipe takes it
+                    # itself, immediately around the work that touches it. The
+                    # grant is recorded so a receipt states the same card the
+                    # window would have to name.
+                    receipt["deviceLease"] = {"mode": "windowed",
+                                              "resource": "npu:" + str(int(device)),
+                                              "gates": sorted(windows)}
             with acquire(resources, root=self.lock_root) as lease_fds:
                 # Capture after acquiring locks; another AgentGates run may just have finished.
                 receipt["source"] = snapshot(source)
@@ -285,7 +405,8 @@ class Engine:
                         gate["failures"] = ["DEPENDENCY_NOT_PASSED"]
                         continue
                     try:
-                        self._gate(manifest, source, recipe, gate, receipt, env, directory, lease_fds)
+                        self._gate(manifest, source, recipe, gate, receipt, env, directory, lease_fds,
+                                   windows.get(gate_id))
                     except KeyboardInterrupt:
                         gate.update(status="FAIL", failures=["INTERRUPTED"])
                         break
@@ -339,7 +460,8 @@ class Engine:
                                f"run evidence retained in {directory}") from exc
         return {**receipt, "receiptPath": str(path)}
 
-    def _gate(self, manifest, source, recipe, gate, receipt, env, directory, lease_fds):
+    def _gate(self, manifest, source, recipe, gate, receipt, env, directory, lease_fds,
+              window_recipe=None):
         manifest.validate_files()
         gate["sourceBefore"] = snapshot(source)
         if gate["sourceBefore"] != receipt["source"]:
@@ -371,7 +493,19 @@ class Engine:
             return
         inputs = artifact_inputs(source, manifest, env)
         gate["artifactInputs"] = list(inputs.values())
-        process = execute(recipe.argv, cwd=recipe.cwd, env=env, timeout=recipe.timeout,
+        recipe_env = env
+        lease = None
+        if window_recipe is not None:
+            # The recipe opens the lease itself, so it is given the exact file the
+            # engine would have locked. The whole-recipe lease is deliberately not
+            # held: holding it here would deadlock the child that waits for it.
+            lease = {"resource": "npu:" + receipt["authorizedDeviceId"],
+                     "path": str(lock_path("npu:" + receipt["authorizedDeviceId"], self.lock_root))}
+            recipe_env = dict(env)
+            recipe_env.update({DEVICE_LEASE_PATH: lease["path"],
+                               DEVICE_LEASE_RESOURCE: lease["resource"],
+                               DEVICE_LEASE_WAIT: repr(float(window_recipe.device_window))})
+        process = execute(recipe.argv, cwd=recipe.cwd, env=recipe_env, timeout=recipe.timeout,
                           log_dir=directory / gate["gateId"] / "recipe", lease_fds=lease_fds)
         gate["process"] = process
         gate.update(evaluate(process, gate["checks"]))
@@ -391,6 +525,35 @@ class Engine:
             # been killed mid-run after starting work, so it stays a failure.
             gate.update(status="BLOCKED_ENV", failures=[f"BLOCKED_EXIT_CODE: {process['exitCode']}"],
                         configReason=config_reason(process))
+        if lease is not None:
+            # A windowed gate must SHOW its window. The engine cannot observe when
+            # the child held the flock, so the child states it and this decides
+            # whether the statement is admissible: the lease it names must be the
+            # one it was given, both ends must exist in order, and occupancy must
+            # be a defined value. Nothing published means no window was opened,
+            # which is a failure - an unshown window is not a short one. Occupancy
+            # itself is recorded and never gated: another tenant on the card is
+            # normal, and must not become a failure.
+            #
+            # A gate already classified BLOCKED_ENV is the one exception, and it
+            # is not an exemption from the rule: the Adapter reported that the
+            # work could not start, so no window exists to be shown. Demanding one
+            # would rewrite an honest resource refusal into INVALID_EVIDENCE, which
+            # claims the evidence was bad rather than that nothing ran. The lease
+            # is still accounted for: it must have been released, or a blocked run
+            # would silently keep holding the card.
+            if gate["status"] == "BLOCKED_ENV":
+                gate["deviceWindow"] = {"resource": lease["resource"], "path": lease["path"],
+                                        "startedAt": None, "releasedAt": None,
+                                        "occupancy": "unknown", "waited": 0.0,
+                                        "notOpened": True}
+            else:
+                window, failure = device_window(gate["observations"], lease)
+                if failure is not None:
+                    gate.update(status="INVALID_EVIDENCE", failures=gate["failures"] + [failure])
+                else:
+                    gate["deviceWindow"] = window
+                    receipt.setdefault("deviceLeaseWindows", []).append({"gateId": gate["gateId"], **window})
         gate["sourceAfter"] = snapshot(source)
         if gate["sourceAfter"] != gate["sourceBefore"]:
             gate.update(status="STALE", failures=gate["failures"] + ["SOURCE_IDENTITY_CHANGED"])

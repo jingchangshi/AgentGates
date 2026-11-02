@@ -1,9 +1,23 @@
-"""Process-wide leases retained by the supervisor until descendants are reaped."""
+"""Process-wide leases retained by the supervisor until descendants are reaped.
+
+A lease is either **immediate** (the default, and what every non-device resource
+uses) or **bounded-wait**. The wait mode exists for the device window: on a
+shared machine two of our own runs may legitimately want the same card a second
+apart, and a window that is refused instead of awaited turns ordinary
+coordination into a spurious BLOCKED_ENV. Waiting is bounded by the recipe's own
+declaration, so a lease that never opens still ends as a refusal rather than a
+hang.
+
+A window is cooperative: it coordinates AgentGates runs with each other. It does
+not, and cannot, exclude other tenants of the machine - another user's process on
+the same card is normal and is reported as occupancy, never as a refusal.
+"""
 from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import os
 from pathlib import Path
+import time
 
 
 class LockBusy(RuntimeError):
@@ -24,26 +38,56 @@ def normalise(resource: str) -> str:
     return resource
 
 
+def lock_root(root: Path | None = None) -> Path:
+    """The lease namespace shared by the engine and by Adapter scripts."""
+    return Path(root) if root else Path.home() / ".local/state/agent-gates/locks"
+
+
+def lock_path(resource: str, root: Path | None = None) -> Path:
+    """The file one resource's lease lives in.
+
+    Exposed because the engine publishes it to a Recipe that opens its own
+    window: the Adapter script must flock the *same* file the engine would,
+    and re-deriving the hash from a second implementation is how two leases
+    for one card appear.
+    """
+    return lock_root(root) / (hashlib.sha256(normalise(resource).encode()).hexdigest() + ".lock")
+
+
 class ResourceLock:
-    def __init__(self, resource: str, root: Path | None = None):
+    def __init__(self, resource: str, root: Path | None = None, timeout: float = 0.0):
         # One namespace per host user, independent of evidence-directory selection.
-        self.root = Path(root) if root else Path.home() / ".local/state/agent-gates/locks"
+        self.root = lock_root(root)
         resource = normalise(resource)
-        self.path = self.root / (hashlib.sha256(resource.encode()).hexdigest() + ".lock")
+        self.path = lock_path(resource, self.root)
         self.resource = resource
+        # 0 means "take it now or never"; a positive value is a bounded wait.
+        self.timeout = max(0.0, float(timeout))
+        self.waited = 0.0
         self.fd = None
 
     def __enter__(self):
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
         self.fd = os.open(self.path, flags, 0o600)
-        try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(self.fd)
-            self.fd = None
-            raise LockBusy(f"resource busy: {self.resource}") from exc
-        return self
+        started = time.monotonic()
+        deadline = started + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.waited = time.monotonic() - started
+                return self
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    os.close(self.fd)
+                    self.fd = None
+                    waited = round(time.monotonic() - started, 3)
+                    raise LockBusy(f"resource busy: {self.resource} "
+                                   f"(waited {waited}s of {self.timeout}s)") from None
+                # Poll rather than block: a signal-interrupted flock would raise
+                # into the runner's cleanup path, and the deadline must be ours.
+                time.sleep(min(0.05, remaining))
 
     def fileno(self):
         if self.fd is None:
@@ -58,7 +102,8 @@ class ResourceLock:
 
 
 @contextmanager
-def acquire(resources: list[str], *, root: Path | None = None):
+def acquire(resources: list[str], *, root: Path | None = None, timeout: float = 0.0):
     with ExitStack() as stack:
-        locks = [stack.enter_context(ResourceLock(resource, root)) for resource in sorted(set(resources))]
+        locks = [stack.enter_context(ResourceLock(resource, root, timeout=timeout))
+                 for resource in sorted(set(resources))]
         yield tuple(lock.fileno() for lock in locks)
