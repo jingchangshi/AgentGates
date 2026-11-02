@@ -518,13 +518,20 @@ class WindowClassificationCase(unittest.TestCase):
         self.assertEqual(ACCEPTANCE.classify_window(
             {'aicoreUtilBefore': 0, 'aicoreUtilAfter': 0}), 'quiet')
 
-    def test_a_co_tenant_seen_in_the_process_table_makes_the_window_contended(self):
-        # The utilisation counter is a coarse, sampled reading; the driver's process
-        # table is not. A neighbour that a 1 Hz sample misses entirely still shows up
-        # here, which is why it is a witness in its own right.
+    def test_a_co_tenant_that_left_the_card_idle_does_not_void_the_window(self):
+        # A co-tenant PID is recorded but no longer voids on its own: on a shared machine
+        # idle or transient tenants are everywhere, and with the AICore trajectory flat the
+        # card was not actually busy. Voiding on mere presence made nothing judgeable.
         self.assertEqual(ACCEPTANCE.classify_window(
             {'aicoreUtilBefore': 0, 'aicoreUtilAfter': 0,
-             'coTenants': [4066195]}), 'contended')
+             'coTenants': [4066195]}), 'quiet')
+
+    def test_a_co_tenant_we_cannot_assess_is_void(self):
+        # A co-tenant present with no AICore reading at all: the card's use cannot be
+        # assessed, so the window is void rather than assumed quiet.
+        self.assertEqual(ACCEPTANCE.classify_window(
+            {'aicoreUtilBefore': None, 'aicoreUtilAfter': None,
+             'coTenants': [4066195]}), 'unclassifiable')
 
     def test_an_empty_co_tenant_list_does_not_make_a_window_contended(self):
         self.assertEqual(ACCEPTANCE.classify_window(
