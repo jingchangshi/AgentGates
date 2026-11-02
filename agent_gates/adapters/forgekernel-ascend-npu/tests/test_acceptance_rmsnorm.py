@@ -193,6 +193,40 @@ def run(x, w, eps=1e-6):
         self.assertEqual(verdict['verdict'], 'fail')
         self.assertIn('no TileLang-generated kernel', json.dumps(verdict['reasons']))
 
+    def test_a_run_that_measured_nothing_is_inconclusive_not_a_delegation_charge(self):
+        # A contended device can refuse the launch: no window, no kernel of any kind.
+        # Silence is not evidence of delegation, so this must not read as a fail.
+        scan, artifact = ACCEPTANCE.scan_artifact(self.artifact(self.GENUINE))
+        verdict = ACCEPTANCE.judge_authenticity(
+            scan, artifact, {'kernelNames': ['AscendCL@aclrtLaunchKernelWithHostArgs'],
+                             'launchedTilelangKernel': False, 'vendorOpObserved': False},
+            {'aibinCount': 2}, measured=False)
+        self.assertEqual(verdict['verdict'], 'inconclusive', verdict['reasons'])
+        self.assertIn('no measurement', json.dumps(verdict['reasons']))
+
+    def test_an_unmeasured_run_that_launched_the_vendor_operator_still_fails(self):
+        scan, artifact = ACCEPTANCE.scan_artifact(self.artifact(self.GENUINE))
+        verdict = ACCEPTANCE.judge_authenticity(
+            scan, artifact, {'launchedTilelangKernel': False, 'vendorOpObserved': True,
+                             'vendorOperatorNames': ['AscendCL@aclnnRmsNorm']},
+            {'aibinCount': 1}, measured=False)
+        self.assertEqual(verdict['verdict'], 'fail')
+        self.assertIn('aclnnRmsNorm', json.dumps(verdict['reasons']))
+
+    def test_a_delegating_source_is_still_a_fail_even_when_nothing_ran(self):
+        scan, artifact = ACCEPTANCE.scan_artifact(self.artifact(self.DELEGATING))
+        verdict = ACCEPTANCE.judge_authenticity(
+            scan, artifact, {'launchedTilelangKernel': False, 'vendorOpObserved': False},
+            {'aibinCount': 1}, measured=False)
+        self.assertEqual(verdict['verdict'], 'fail', verdict['reasons'])
+
+    def test_inconclusive_authenticity_retests_instead_of_failing(self):
+        verdict = ACCEPTANCE.decide({'authenticity': {'verdict': 'inconclusive',
+                                                      'reasons': ['nothing ran']}},
+                                    check_only=False)
+        self.assertEqual(verdict['status'], 'RETEST')
+        self.assertEqual(verdict['stage'], 'authenticity')
+
 
 class NegativeControlTwoBf16Accumulation(unittest.TestCase):
     """#2: deliberate bf16 accumulation must really be refused.

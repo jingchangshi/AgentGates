@@ -545,7 +545,7 @@ def scan_artifact(root):
     }
 
 
-def judge_authenticity(scan, artifact, runtime, compile_evidence):
+def judge_authenticity(scan, artifact, runtime, compile_evidence, measured=True):
     """Did the candidate compute RMSNorm in its own TileLang kernel?
 
     Three independent legs, all required. Either alone is defeatable:
@@ -577,15 +577,30 @@ def judge_authenticity(scan, artifact, runtime, compile_evidence):
         reasons.append('no new device binary (.aibin) appeared in the empty kernel '
                        'cache while the archived source was compiled, so no kernel of '
                        'the candidate own was produced during acceptance')
+    # A hard failure (delegation evidence) always wins. "Inconclusive" is only for the
+    # case where nothing of the candidate ran AND nothing else ran either: the timed run
+    # failed before any kernel existed, so delegation cannot be inferred from silence.
+    inconclusive_reason = None
     if runtime is not None:
         if runtime.get('vendorOpObserved'):
             reasons.append('the candidate timed run launched the vendor operator: '
                            + ', '.join(runtime.get('vendorOperatorNames') or [])[:200])
         elif not runtime.get('launchedTilelangKernel'):
-            reasons.append('the candidate timed run launched no TileLang-generated kernel')
+            if measured:
+                reasons.append('the candidate timed run launched no TileLang-generated kernel')
+            else:
+                inconclusive_reason = ('the candidate produced no measurement and no kernel '
+                                       'was observed, so authenticity could not be judged: '
+                                       'the timed run failed before launching anything')
+    verdict = ('fail' if reasons
+               else ('inconclusive' if inconclusive_reason else 'pass'))
+    if inconclusive_reason and not reasons:
+        reasons_out = [inconclusive_reason]
+    else:
+        reasons_out = reasons
     return {
-        'verdict': 'pass' if not reasons else 'fail',
-        'reasons': reasons,
+        'verdict': verdict,
+        'reasons': reasons_out,
         'static': {
             'filesScanned': scan.files,
             'delegations': scan.delegations,
@@ -1760,7 +1775,11 @@ def orchestrate(args):
     }
     runtime = next((child.get('runtime') for child in children.values()
                     if child.get('runtime')), None)
-    result['authenticity'] = judge_authenticity(scan, artifact, runtime, compile_evidence)
+    measured = any((window or {}).get('candidate_ms') is not None
+                   for child in children.values()
+                   for window in (child.get('windows') or []))
+    result['authenticity'] = judge_authenticity(scan, artifact, runtime, compile_evidence,
+                                                measured=measured)
 
     rows = [row for child in children.values() for row in (child.get('precision') or [])
             if row.get('candidate')]
@@ -1820,6 +1839,10 @@ def _ratio_workloads(specs):
 def decide(result, check_only):
     """The single verdict, from the judged sections and nothing else."""
     authenticity = result.get('authenticity') or {}
+    if authenticity.get('verdict') == 'inconclusive':
+        return {'status': 'RETEST', 'stage': 'authenticity',
+                'reasons': authenticity.get('reasons')
+                or ['authenticity could not be judged on this run']}
     if authenticity.get('verdict') != 'pass':
         return {'status': 'FAIL', 'stage': 'authenticity',
                 'reasons': authenticity.get('reasons')
