@@ -485,12 +485,14 @@ class WindowClassificationCase(unittest.TestCase):
     def test_a_window_with_no_witness_is_void(self):
         self.assertEqual(ACCEPTANCE.classify_window({}), 'unclassifiable')
 
-    def test_a_window_with_one_witness_is_degraded_not_void(self):
-        # Both witnesses are preferred, but one is enough to label a window. Only
-        # when neither answers is the window meaningless.
+    def test_empty_process_table_without_utilisation_is_unclassifiable(self):
+        self.assertEqual(ACCEPTANCE.classify_window({'coTenants': []}), 'unclassifiable')
+        self.assertEqual(ACCEPTANCE.classify_window(
+            {'coTenants': [], 'canaryInflation': 1.0}), 'unclassifiable')
+        self.assertEqual(ACCEPTANCE.classify_window(
+            {'coTenants': [], 'canaryInflation': 1.2}), 'contended')
         self.assertEqual(ACCEPTANCE.classify_window(
             {'aicoreUtilBefore': 0, 'aicoreUtilAfter': 0}), 'quiet')
-        self.assertEqual(ACCEPTANCE.classify_window({'coTenants': []}), 'quiet')
 
     def test_a_trajectory_peak_makes_the_window_contended(self):
         # The before/after readings both say 0; only the samples DURING the window
@@ -763,7 +765,8 @@ class CanaryWitnessCase(unittest.TestCase):
     def test_the_canary_threshold_is_a_stated_constant(self):
         self.assertEqual(ACCEPTANCE.CANARY_INFLATION, 1.15)
         self.assertEqual(ACCEPTANCE.classify_window(
-            {'canaryInflation': 1.14, 'samplingRateHz': 2.0, 'coTenants': []}), 'quiet')
+            {'canaryInflation': 1.14, 'samplingRateHz': 2.0, 'coTenants': [],
+             'aicoreUtilTrajectory': [0, 0]}), 'quiet')
         self.assertEqual(ACCEPTANCE.classify_window(
             {'canaryInflation': 1.16, 'samplingRateHz': 2.0, 'coTenants': []}),
             'contended')

@@ -737,8 +737,8 @@ def classify_window(witness):
     # Two independent witnesses: a utilisation TRAJECTORY sampled through the
     # window (does the card actually get busy while we measure?), and the driver's
     # process table (did somebody else's process appear or vanish?). A window with
-    # neither cannot be labelled and is void; a window with either can be labelled,
-    # degraded if only one answered.
+    # positive process evidence can flag contention, but an empty process table
+    # cannot replace missing utilisation readings when assessing a window.
     canary = witness.get('canaryInflation')
     readings = []
     for value in (before, after):
@@ -766,6 +766,10 @@ def classify_window(witness):
         return 'contended'
     if canary is not None and canary >= CANARY_INFLATION:
         return 'contended'
+    # An empty process table or a flat canary cannot replace missing utilisation
+    # readings: transient activity can be missed by either witness.
+    if peak is None:
+        return 'unclassifiable'
     # Sparse and flat is not the same as quiet. A window that was barely sampled
     # cannot claim the card was idle throughout; it is reported as unproven.
     rate = witness.get('samplingRateHz')
