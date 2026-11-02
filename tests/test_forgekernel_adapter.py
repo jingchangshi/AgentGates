@@ -87,6 +87,9 @@ class CheckConfigCase(unittest.TestCase):
                   'FK_ASCEND_TILELANG_SOURCE': str(source),
                   'FK_ASCEND_TILELANG_BUILD': str(build),
                   'FK_ASCEND_VENV': str(root / 'venv/fk'),
+                  # The build installs from a verified copy, which has to live
+                  # outside both the checkout and the evidence directory.
+                  'FK_ASCEND_WORK_ROOT': str(root / 'work'),
                   **values}
         path.write_text(''.join(f'{key}={value}\n' for key, value in filled.items()))
         return path, root
@@ -452,6 +455,138 @@ class SmokeGateCase(unittest.TestCase):
         # after pinning cannot pass silently.
         self.assertEqual(GATE.smoke_probe_identity()['sha256'],
                          GATE.digest(GATE.PROBE_SCRIPT))
+
+
+class SourceCopyCase(unittest.TestCase):
+    """The build must not write into the checkout it installs from.
+
+    This is the regression for a real defect: `pip install <checkout>` made
+    setuptools write `build/` into the ForgeKernel tree, which ForgeKernel does
+    not ignore, so the source identity moved during the Gate and its own PASS
+    became SOURCE_IDENTITY_CHANGED. The fix installs from a verified copy; these
+    tests fail if anyone goes back to installing the checkout directly.
+    """
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.source = self.root / "source"
+        (self.source / "pkg").mkdir(parents=True)
+        (self.source / "pyproject.toml").write_text("[build-system]\nrequires=[]\n")
+        (self.source / "pkg" / "__init__.py").write_text("VALUE = 1\n")
+        (self.source / "README.md").write_text("readme\n")
+        subprocess.run(["git", "init", "-q", str(self.source)], check=True)
+        # A committed file, an untracked-but-not-ignored file, and an IGNORED
+        # file: the listing must take the first two and skip the third.
+        (self.source / ".gitignore").write_text("ignored.bin\n")
+        (self.source / "untracked.txt").write_text("untracked\n")
+        (self.source / "ignored.bin").write_bytes(b"ignored")
+        subprocess.run(["git", "-C", str(self.source), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.source), "commit", "-qm", "base"],
+                       check=True)
+        # Recreate the untracked file and the ignored one AFTER the commit.
+        (self.source / "untracked.txt").write_text("untracked\n")
+        (self.source / "ignored.bin").write_bytes(b"ignored")
+
+    def listing(self):
+        return GATE.git_listing(self.source)
+
+    def test_the_copy_contains_exactly_what_the_receipt_would_hash(self):
+        destination = self.root / "copy"
+        result = GATE.copy_source(self.source, destination)
+        copied = sorted(str(path.relative_to(destination))
+                        for path in destination.rglob("*") if path.is_file())
+        self.assertEqual(copied, self.listing())
+        # The ignored file is not part of the source identity, so it must not be
+        # installed either: a copy that took it would install bytes no receipt
+        # describes.
+        self.assertNotIn("ignored.bin", copied)
+        # An untracked-but-not-ignored file IS part of the identity, so it must
+        # be copied - `git archive` would have dropped it.
+        self.assertIn("untracked.txt", copied)
+        self.assertEqual(result["fileCount"], len(copied))
+
+    def test_the_copy_is_verified_against_the_source_before_it_is_used(self):
+        destination = self.root / "copy"
+        result = GATE.copy_source(self.source, destination)
+        self.assertEqual(result["sourceHash"], result["copyHash"])
+        self.assertIs(result["hashMatches"], True)
+        # Independently recomputed: the same bytes hashed the same way agree.
+        self.assertEqual(GATE.tree_hash(destination, result["sourceFiles"]),
+                         result["sourceHash"])
+
+    def test_a_copy_that_lost_a_file_is_refused_rather_than_installed(self):
+        # The check that makes the hash meaningful: if the copy is incomplete the
+        # digest differs, and the Gate must refuse instead of installing.
+        destination = self.root / "copy"
+        GATE.copy_source(self.source, destination)
+        (destination / "pkg" / "__init__.py").write_text("VALUE = 2\n")
+        self.assertNotEqual(
+            GATE.tree_hash(destination, GATE.git_listing(self.source)),
+            GATE.tree_hash(self.source, GATE.git_listing(self.source)))
+
+    def test_the_copy_carries_no_git_directory(self):
+        # If .git came along, the copy would be a repository and a later listing
+        # of it would answer a different question than the one asked.
+        destination = self.root / "copy"
+        GATE.copy_source(self.source, destination)
+        self.assertFalse((destination / ".git").exists())
+
+    def test_the_build_does_not_install_the_checkout_itself(self):
+        # The actual regression, asserted on behaviour rather than on source
+        # text: run build() with the installer stubbed out and inspect the argv
+        # it would have executed. Installing the checkout is what wrote `build/`
+        # into the ForgeKernel tree, so the install target must be a copy that
+        # lives outside it.
+        work = self.root / "work"
+        venv = self.root / "venv"
+        machine = self.root / "machine.env"
+        machine.write_text(
+            f"FK_ASCEND_PYTHON={sys.executable}\n"
+            f"FK_ASCEND_TILELANG_SOURCE={self.source}\n"
+            f"FK_ASCEND_TILELANG_BUILD={self.source}\n"
+            f"FK_ASCEND_VENV={venv}\n"
+            f"FK_ASCEND_WORK_ROOT={work}\n")
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").write_text("")
+        (venv / "forgekernel").mkdir(parents=True)
+        (venv / "forgekernel/__init__.py").write_text("")
+        (venv / "cli.py").write_text("")
+
+        commands = []
+
+        real_run = subprocess.run
+
+        def fake_run(argv, **kwargs):
+            argv = [str(item) for item in argv]
+            # git must reach the real implementation: the listing is the very
+            # thing under test, so stubbing it would test the stub.
+            if "git" in argv[0]:
+                return real_run(argv, **kwargs)
+            commands.append(argv)
+            stdout = ""
+            if "-c" in argv:
+                stdout = json.dumps({"file": str(venv / "forgekernel/__init__.py"),
+                                     "version": "0", "cli": str(venv / "cli.py")})
+            return subprocess.CompletedProcess(args=argv, returncode=0,
+                                               stdout=stdout, stderr="")
+
+        with patch.dict(os.environ, {"FK_ASCEND_ENV_FILE": str(machine)}, clear=True), \
+                patch.object(GATE, "create_venv"), \
+                patch.object(GATE, "tilelang_identity", return_value={"source": "x"}), \
+                patch.object(GATE, "digest", return_value="0" * 64), \
+                patch.object(GATE, "venv_python", return_value=venv / "bin/python"), \
+                patch.object(GATE.subprocess, "run", side_effect=fake_run):
+            GATE.build(self.source)
+
+        installs = [c for c in commands if "install" in c]
+        self.assertTrue(installs, "no pip install was executed")
+        target = Path(installs[0][-1])
+        # The installed path must be the copy, not the checkout.
+        self.assertNotEqual(target, self.source)
+        self.assertTrue(target.is_relative_to(work),
+                        f"installed {target}, which is not a copy under {work}")
 
 
 class ManifestCase(unittest.TestCase):

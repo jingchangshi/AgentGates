@@ -55,6 +55,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -88,9 +89,11 @@ TOOLCHAIN_KEYS = (
 
 # The keys this Gate cannot run without. The provider keys describe the agent
 # that will later drive the loop, not this build, so they are validated when
-# present and not demanded here.
+# present and not demanded here. The work root is required because the build
+# installs from a verified COPY of the source, and that copy has to live
+# somewhere outside both the checkout and the evidence directory.
 REQUIRED = ('FK_ASCEND_PYTHON', 'FK_ASCEND_TILELANG_SOURCE', 'FK_ASCEND_TILELANG_BUILD',
-            'FK_ASCEND_VENV')
+            'FK_ASCEND_VENV', 'FK_ASCEND_WORK_ROOT')
 
 BUILD_KEY = 'FK_ASCEND_BUILD_SUBDIR'
 
@@ -592,6 +595,141 @@ def run(argv: list, *, timeout: float = 300, log: Path | None = None) -> subproc
     return done
 
 
+# The listing command AgentGates uses to decide what a source tree IS. The copy
+# below must use the SAME command, or the copy and the recorded identity would
+# describe different sets of files. Kept as a constant so a reader can compare it
+# with agent_gates/source_identity.py:snapshot() without hunting.
+GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "-c", "core.pager=cat", "-c", "core.untrackedCache=false")
+SOURCE_LISTING = ("ls-files", "--cached", "--others", "--exclude-standard", "-z")
+
+
+def git_listing(root: Path) -> list:
+    """The files that constitute `root`, by the same rule the receipt uses.
+
+    `git ls-files --cached --others --exclude-standard` is exactly what
+    `source_identity.snapshot()` lists, so a copy made from this listing covers
+    tracked files AND untracked-but-not-ignored ones - the same bytes that were
+    hashed. `git archive` would silently drop the untracked ones, which is why it
+    is not used here.
+
+    Returned names are bytes decoded with surrogateescape, so a filename that is
+    not valid UTF-8 still round-trips instead of raising.
+    """
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("GIT_")}
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        done = subprocess.run(["git", *GIT_SAFE, "-C", str(root), *SOURCE_LISTING],
+                              capture_output=True, env=environment, timeout=120)
+    except FileNotFoundError as error:
+        raise BridgeError(f"cannot list the source tree: git is not available ({error})") from error
+    if done.returncode != 0:
+        detail = done.stderr.decode(errors="replace").strip().splitlines()
+        raise BridgeError(f"git could not list {root}: "
+                          f"{detail[-1] if detail else done.returncode}")
+    return sorted({os.fsdecode(name) for name in done.stdout.split(b"\0") if name})
+
+
+def copy_source(source: Path, destination: Path) -> dict:
+    """Copy exactly the files the receipt calls the source, and verify the copy.
+
+    The build cannot install from the checkout itself: setuptools writes
+    `build/` into the tree it builds, and ForgeKernel does not ignore that
+    directory, so `pip install <checkout>` makes the source identity move and the
+    Gate's own receipt would be STALE. Copying first keeps the checkout
+    read-only, which is what `sourceWrite: false` promises.
+
+    The stronger property is checked here rather than asserted: the copy is
+    re-hashed with the same listing rule, and only a copy whose digest equals the
+    original's is installed. That binds "what was installed" to "what the receipt
+    recorded" byte for byte, instead of proving afterwards that nothing was
+    written.
+    """
+    names = git_listing(source)
+    if not names:
+        raise BridgeError(f"the source tree lists no files: {source}")
+    if destination.exists():
+        # A previous attempt's copy is removed rather than reused: a stale copy
+        # could install bytes that were never hashed.
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in names:
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / name, target, follow_symlinks=False)
+    # The copy carries no .git, so its listing cannot come from git: the file SET
+    # is the one just copied, and what is verified is that every one of those
+    # files arrived with the same bytes. Re-listing the destination with git would
+    # fail for the wrong reason (no repository) and, worse, could mask a file that
+    # failed to copy if the listing were somehow broader.
+    missing = [name for name in names if not (destination / name).is_file()
+               and not (destination / name).is_symlink()]
+    if missing:
+        raise BridgeError(f'the copied source is missing {len(missing)} file(s), '
+                          f'first: {missing[0]}')
+    source_hash = tree_hash(source, names)
+    copy_hash = tree_hash(destination, names)
+    if source_hash != copy_hash:
+        raise BridgeError(
+            f"the copied source does not match the source identity: "
+            f"original {source_hash[:16]} vs copy {copy_hash[:16]}; refusing to "
+            f"install bytes the receipt does not describe")
+    return {"path": str(destination), "fileCount": len(names),
+            "sourceHash": source_hash, "copyHash": copy_hash,
+            # The listing is carried so the post-build check compares against the
+            # same set of files rather than re-deriving it from a tree that may
+            # have changed in the meantime.
+            "sourceFiles": names, "hashMatches": source_hash == copy_hash}
+
+
+def tree_hash(root: Path, names: list) -> str:
+    """A digest over the listed files, computed the way snapshot() frames them.
+
+    This is deliberately a second, independent implementation of the file-content
+    part of `source_identity.snapshot()`: if the two disagree about which files
+    exist, the comparison below fails instead of silently passing. It covers only
+    file CONTENT - the engine's identity also binds the commit and ignore rules -
+    so a match here means "the same bytes for the same listing", which is the
+    property `pip install` needs.
+    """
+    digest = hashlib.sha256()
+    for name in sorted(names):
+        path = root / name
+        digest.update(os.fsencode(name) + b"\0")
+        if path.is_symlink():
+            digest.update(b"symlink\0" + os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        else:
+            digest.update(b"absent\0")
+    return digest.hexdigest()
+
+def git_revision(root: Path) -> str:
+    """The commit the source is at, used to name its build copy.
+
+    A tree with no commit is not rejected: the copy is still hash-verified, and
+    naming it "NO_GIT" keeps the build runnable on an unversioned export.
+    """
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("GIT_")}
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        done = subprocess.run(["git", *GIT_SAFE, "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, env=environment, timeout=60)
+    except FileNotFoundError:
+        return "NO_GIT"
+    if done.returncode != 0:
+        return "NO_GIT"
+    revision = done.stdout.decode(errors="replace").strip()
+    return revision or "NO_GIT"
+
+
 def create_venv(python: Path, venv: Path) -> None:
     """Create the private environment, reusing the shared site packages.
 
@@ -615,8 +753,19 @@ def create_venv(python: Path, venv: Path) -> None:
 def build(source: Path) -> dict:
     """Install the adapted ForgeKernel tree into the private environment.
 
-    The source tree is READ, never written: sourceWrite is false, and a build
-    that edited the checkout would change the identity the receipt binds.
+    The checkout is READ, never written: `sourceWrite` is false, and a build that
+    edited the tree would change the identity its own receipt binds.
+
+    That promise is why the install runs against a COPY. setuptools writes
+    `build/` beside the project it builds, and ForgeKernel does not ignore that
+    directory, so `pip install <checkout>` perturbs the source identity and turns
+    the Gate's own PASS into `SOURCE_IDENTITY_CHANGED`. Copying first is not a
+    workaround for a noisy directory: it is what makes the read-only claim true.
+
+    The copy is taken from the same listing the receipt hashes, and only a copy
+    whose digest equals the original's is installed, so "what was installed" and
+    "what was recorded" are the same bytes by construction rather than by
+    after-the-fact assertion.
     """
     python = required_path('FK_ASCEND_PYTHON', file=True)
     venv_value = machine_value('FK_ASCEND_VENV')
@@ -629,6 +778,18 @@ def build(source: Path) -> dict:
         raise BridgeError(f'source root has no {PKG_FILE}: {source}')
     before = digest(pyproject)
     identity = tilelang_identity()
+
+    # The copy lives under the work root, never inside the source or the evidence
+    # directory. Naming it by the commit keeps two builds of two commits apart,
+    # and reusing the path means a rebuild of the same commit starts clean.
+    work_root_value = machine_value('FK_ASCEND_WORK_ROOT')
+    if work_root_value is None:
+        raise BridgeError('FK_ASCEND_WORK_ROOT is required; the build installs from a '
+                          'copy of the source, and that copy lives in the work root')
+    work_root = _absolute(work_root_value, 'FK_ASCEND_WORK_ROOT')
+    revision = git_revision(source)
+    copy = copy_source(source, work_root / 'build-src' / revision)
+
     create_venv(python, venv)
     install_log = venv.parent / 'build-install.log'
     if install_log.is_file():
@@ -636,13 +797,21 @@ def build(source: Path) -> dict:
     # --no-deps on purpose: resolving dependencies would upgrade the shared
     # environment this Adapter deliberately reuses.
     done = run([str(venv_python(venv)), '-m', 'pip', 'install', '--no-deps',
-                '--no-build-isolation', str(source)],
+                '--no-build-isolation', copy['path']],
                timeout=INSTALL_TIMEOUT_SECONDS, log=install_log)
     installed = done.returncode == 0
     result = {'venvCreated': venv_python(venv).is_file(), 'forgekernelInstalled': installed,
               'installLog': str(install_log) if install_log.is_file() else None,
               'installLogSha256': digest(install_log) if install_log.is_file() else None,
               'tilelangSourceUnchanged': digest(pyproject) == before,
+              'sourceCopied': True,
+              'sourceCopy': {key: value for key, value in copy.items()
+                             if key != 'sourceFiles'},
+              'installedFrom': copy['path'],
+              'installSourceHash': copy['sourceHash'],
+              'installCopyHash': copy['copyHash'],
+              'installHashMatches': copy['hashMatches'],
+              'sourceRevision': revision,
               'tilelang': identity, 'venv': str(venv)}
     if not installed:
         detail = (done.stderr or done.stdout).strip().splitlines()
@@ -676,6 +845,22 @@ def build(source: Path) -> dict:
         raise BridgeError('the reused TileLang checkout changed during the build; the '
                           'evidence would describe a build that no longer exists')
     result['tilelangReused'] = True
+    # `sourceFiles` is the probe's working set, not evidence: 463 names would put
+    # the JSON report over its size bound and would tell a reader nothing the
+    # digest does not already bind.
+    result.pop('sourceFiles', None)
+    # The build must not have written into the checkout. Re-listing the source
+    # here turns "the copy protected it" into a measured fact: if the install
+    # still perturbed the tree, this fails immediately with a named failure,
+    # instead of surfacing later as a STALE that looks like a mystery.
+    source_after = git_listing(source)
+    unchanged = source_after == copy['sourceFiles'] and         tree_hash(source, source_after) == copy['sourceHash']
+    result['sourceUnchangedAfterBuild'] = unchanged
+    if not unchanged:
+        raise BridgeError(
+            'the build wrote into the source checkout: the tree no longer matches '
+            'the identity the copy was verified against. sourceWrite is false for '
+            'this Adapter, so this is a defect in the build, not a machine fault.')
     return result
 
 

@@ -80,7 +80,24 @@ the host was doing.
 ## What the build gate proves
 
 It installs the adapted ForgeKernel tree into a private virtual environment and
-then proves the installed package is real:
+then proves the installed package is real.
+
+**It installs from a copy, never from the checkout.** This is not tidiness:
+setuptools writes `build/` beside the project it builds, ForgeKernel does not
+ignore that directory, and the engine's source identity is a `git ls-files --cached
+--others --exclude-standard` listing - so `pip install <checkout>` made the
+source move during the Gate and turned its own PASS into
+`SOURCE_IDENTITY_CHANGED`. That is the defect this design removes, and a test now
+fails if the installer's target is ever the checkout again.
+
+The copy is taken from the SAME listing command the receipt hashes (so
+untracked-but-not-ignored files come along and ignored ones do not - `git archive`
+would silently drop the former), and the copy is re-hashed and compared before it
+is used. The receipt therefore publishes `sourceHash`, `copyHash` and
+`installHashMatches`: a reader can see that what was installed is byte-identical
+to what was recorded, rather than being told afterwards that nothing was written.
+
+The checks are:
 
 * `venvCreated` - the private environment exists and has an interpreter;
 * `forgekernelInstalled` - `pip install` succeeded;
@@ -89,7 +106,11 @@ then proves the installed package is real:
 * `forgeEntryPointOk` - the CLI module the console script points at exists;
 * `tilelangReused` - the reused TileLang checkout is the same one before and
   after the install, re-read rather than assumed;
-* `tilelangSourceUnchanged` - the source tree it installed from was not edited.
+* `tilelangSourceUnchanged` - the source tree it installed from was not edited;
+* `sourceCopied` / `installHashMatches` - the install came from a verified copy
+  whose digest equals the source's;
+* `sourceUnchangedAfterBuild` - the checkout still lists and hashes the same after
+  the build, so the read-only claim is measured rather than asserted.
 
 Missing data is false, never assumed. A wheel that installs but cannot import
 fails, and an occupied device does not: this gate declares `"device": "none"`,

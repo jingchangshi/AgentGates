@@ -86,9 +86,16 @@ FK_ASCEND_TILELANG_BUILD=
 # ---------------------------------------------------------------------------
 # The runtime work root: runs, caches and artifacts live here, outside both the
 # source checkout and the evidence directory.
+#
+# Required, not optional. The build installs from a verified COPY of the source
+# (setuptools would otherwise write build/ into the checkout and move the source
+# identity), and the copy is kept at <work-root>/build-src/<commit>/. A rebuild of
+# the same commit reuses that path, so it is replaced rather than accumulated.
 FK_ASCEND_WORK_ROOT=
 
-# The private virtual environment ForgeKernel is installed into. It is created
+# The private virtual environment ForgeKernel is installed into. Deleting it
+# forces a clean reinstall; an existing one is reused, so remove it if the source
+# it was built from has changed. It is created
 # with --system-site-packages so the reused TileLang, torch and torch_npu stay
 # exactly the ones the shared environment provides: this Adapter installs
 # ForgeKernel on top, it does not install a second toolchain.
