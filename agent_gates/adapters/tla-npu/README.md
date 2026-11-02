@@ -135,12 +135,40 @@ correct until the test fails on an attribute error. If an operator moves to a
 newer build, point `TLA_NPU_TRITON_WHEEL` at it and re-run
 `setup-python-env.sh`; the check re-validates the API.
 
-## Why the source is a package directory
+## Two inputs, deliberately separate
 
-`test_tla.py` ships in a package directory, not a Git checkout. The Gate takes
-`--source` to mean "the directory holding the test", maps it into the container
-through the bind mounts, and compares the host and container device/inode pair
-before running, so the bytes tested are the bytes on disk.
+The Gate has two inputs and they are not the same directory.
+
+`--source` is the **triton-ascend checkout under test**. That is where TLA is
+implemented: `third_party/ascend/language/tla/`, which the build installs into
+`triton/language/extra/tla/` inside the environment (`setup.py` maps a backend's
+`language/` directory onto `triton.language.extra`). Because it is a Git
+checkout, provenance is its Git identity: the recorded head commit plus a hash
+over the tracked files.
+
+`TLA_NPU_TEST_DIR` is the **directory holding `test_tla.py`**. It is not part of
+the source tree, and the Gate will not accept it as one.
+
+Both are mapped into the container through the bind mounts and both sides are
+proven to be the same directory by comparing device/inode pairs before anything
+runs, so the bytes tested are the bytes on disk. Neither directory is entered as
+a working directory: the runner executes from its own scratch directory, because
+CANN deposits crash dumps into the process working directory.
+
+## Which TLA code actually ran
+
+The test imports the **installed** `tla` package, not the checkout. Recording
+only the checkout would describe source that may not be what executed, so the
+receipt also carries `tlaImplementationSha256` and `tlaImplementationFileCount`
+(a hash over the installed `tla/*.py` files), `tritonVersion`, and `tlaHasDma`.
+These are recorded, not gated: the counter observations decide the verdict. Their
+purpose is to let a reader tie a PASS to the code that produced it. A version
+string alone cannot do that, since a wheel can be rebuilt at the same version.
+
+`TLA_NPU_CACHE_DIR` names a dedicated `TRITON_CACHE_DIR`, and the Gate refuses a
+value inside either input tree: the cache is written to, and both trees are
+hashed. Letting a JIT cache land in one of them is how a provenance hash moved
+between two runs of the same Gate.
 
 See [adapter configuration](../../../../docs/adapters.md) for the general
 adapter, environment-file and receipt conventions.

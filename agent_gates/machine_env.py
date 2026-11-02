@@ -90,6 +90,8 @@ TLA_NPU_KEYS = (
     'TLA_NPU_PIP_INDEX',
     'TLA_NPU_WHEEL_DIR',
     'TLA_NPU_TRITON_WHEEL',
+    'TLA_NPU_TEST_DIR',
+    'TLA_NPU_CACHE_DIR',
     'TLA_NPU_BUILD_SUBDIR',
 )
 # The adapter ID -> the prefix it owns, the selector variable it honours and the

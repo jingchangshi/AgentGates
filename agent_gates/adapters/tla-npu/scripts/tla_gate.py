@@ -118,7 +118,9 @@ NPU_SMI = 'npu-smi'
 PROBE_TIMEOUT_SECONDS = 60
 
 # The Gate's test file: fixed in this digest-pinned file, and never read from the
-# environment. It is relative to the source root the operator passes.
+# environment. It lives in the TEST directory (TLA_NPU_TEST_DIR), which is not the
+# source root: the source root is the triton-ascend checkout whose TLA
+# implementation is under test, and the test exercising it is kept separately.
 GATE_TEST = 'test_tla.py'
 # Markers the test prints on success. Their absence is a failure, never a pass
 # by silence.
@@ -140,6 +142,12 @@ TOOLCHAIN_KEYS = (
     'TLA_NPU_PIP_INDEX',
     'TLA_NPU_WHEEL_DIR',
     'TLA_NPU_TRITON_WHEEL',
+    # The directory holding the Gate test, kept separate from the source root.
+    'TLA_NPU_TEST_DIR',
+    # A dedicated, stable cache directory. TRITON_CACHE_DIR must not point inside
+    # either input tree: a JIT cache is written to, and the whole point of the
+    # source and test roots is that a run never writes into the bytes it tests.
+    'TLA_NPU_CACHE_DIR',
     # The sibling Adapters read their build subdirectory from their file so the
     # engine leases the directory they write. This Gate writes no build tree, but
     # the engine still resolves a build directory for every adapter, so the key
@@ -336,6 +344,42 @@ def conda_envs_path_from_env_file() -> Path | None:
         raise BridgeError(f'{resolved_env_file()}: TLA_NPU_CONDA_ENVS_PATH must be an '
                           f'absolute path: {raw!r}')
     return Path(raw)
+
+
+def test_dir_from_env_file() -> Path:
+    """The directory holding the Gate test, from the machine file.
+
+    Deliberately not the source root. The source root is the triton-ascend
+    checkout under test; the test that exercises its TLA implementation lives in
+    its own directory. Keeping the two apart lets a PASS name both the
+    implementation that ran and the bytes that exercised it, instead of
+    conflating one directory with both roles.
+    """
+    value = machine_value('TLA_NPU_TEST_DIR')
+    if value is None:
+        raise BridgeError('TLA_NPU_TEST_DIR is required; it names the directory holding '
+                          f'{GATE_TEST} (the source root is the checkout under test)')
+    path = Path(value)
+    if not path.is_absolute():
+        raise BridgeError(f'TLA_NPU_TEST_DIR must be an absolute path: {value}')
+    return path
+
+
+def cache_dir_from_env_file() -> Path | None:
+    """A dedicated TRITON_CACHE_DIR, from the machine file if it names one.
+
+    A JIT cache is written to, so it must not land in either input tree. That is
+    not hypothetical: Triton wrote a cache/ tree holding npu_utils.so into the
+    former test package directory and moved that directory's provenance hash
+    between two runs of the same Gate.
+    """
+    value = machine_value('TLA_NPU_CACHE_DIR')
+    if value is None:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise BridgeError(f'TLA_NPU_CACHE_DIR must be an absolute path: {value}')
+    return path
 
 
 def declared_container_source() -> Path | None:
@@ -661,6 +705,42 @@ try:
 
         report['npuAvailable'] = bool(torch.npu.is_available())
         report['npuDeviceCount'] = int(torch.npu.device_count())
+
+        # The TLA implementation the test actually imports. A PASS must name the
+        # code that produced it, so this is hashed rather than read from a version
+        # string: the wheel and the checkout can disagree, and a wheel reinstalled
+        # at the same version with different contents would otherwise let an older
+        # PASS verify as current.
+        try:
+            import hashlib
+            import triton
+            import triton.language.extra.tla as _tla
+            _tla_dir = os.path.dirname(os.path.abspath(_tla.__file__))
+            _digest = hashlib.sha256()
+            _files = 0
+            for _root, _dirs, _names in os.walk(_tla_dir):
+                _dirs.sort()
+                for _name in sorted(_names):
+                    if not _name.endswith('.py'):
+                        continue
+                    _full = os.path.join(_root, _name)
+                    _rel = os.path.relpath(_full, _tla_dir)
+                    _digest.update(_rel.encode() + b'\0')
+                    with open(_full, 'rb') as _handle:
+                        _digest.update(_handle.read() + b'\0')
+                    _files += 1
+            report['tlaImplementationSha256'] = _digest.hexdigest()
+            report['tlaImplementationFileCount'] = _files
+            report['tlaImplementationPath'] = _tla_dir
+            report['tritonVersion'] = triton.__version__
+            report['tlaHasDma'] = hasattr(_tla, 'dma')
+        except BaseException as _error:
+            # Recorded, not gated: the counters below decide the verdict. A missing
+            # identity must still be visible in the receipt rather than silently
+            # absent, so the failure text is carried.
+            report['tlaImplementationSha256'] = None
+            report['tlaImplementationError'] = '%s: %s' % (
+                type(_error).__name__, _error)
         if report['npuAvailable']:
             report['currentDevice'] = int(torch.npu.current_device())
             report['deviceName'] = torch.npu.get_device_name(0)
@@ -728,19 +808,32 @@ sys.exit(0 if report['fatal'] is None and report['synchronizeOk'] is True
 '''
 
 
-def container_script(source_root: str, timeout: int, device: str,
+def container_script(test_dir: str, source_root: str, timeout: int, device: str,
                      cann: Path | None, conda_sh: Path | None, conda_env: str | None,
-                     conda_envs_path: Path | None = None) -> str:
-    """Fixed container-side Bash: toolchain order, then one runner."""
+                     conda_envs_path: Path | None = None,
+                     cache_dir: Path | None = None) -> str:
+    """Fixed container-side Bash: toolchain order, then one runner.
+
+    Two directories with two roles: the runner executes the test from test_dir,
+    and source_root is the checkout whose TLA implementation is under test.
+    Neither is a working directory, and neither receives the JIT cache.
+    """
     lines = [
         'set -o pipefail',
         f'fail() {{ echo "{PROG}: $*" >&2; exit 3; }}',
         'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH',
         'export PYTHONDONTWRITEBYTECODE=1',
-        # A fresh cache directory per run keeps the artifact count attributable to
-        # this run alone, rather than to whatever earlier runs left behind.
-        'export TRITON_CACHE_DIR=$(mktemp -d) || exit 3',
     ]
+    if cache_dir is not None:
+        # Created here rather than assumed, so a missing parent is a configuration
+        # fault instead of a silent fall back to the default location.
+        lines.append(f'export TRITON_CACHE_DIR={shlex.quote(str(cache_dir))}')
+        lines.append('mkdir -p "$TRITON_CACHE_DIR" '
+                     '|| fail "cannot create TRITON_CACHE_DIR=$TRITON_CACHE_DIR"')
+    else:
+        # No dedicated directory configured: a private temporary one keeps the
+        # artifact count attributable to this run and writes into neither tree.
+        lines.append('export TRITON_CACHE_DIR=$(mktemp -d) || exit 3')
     if cann is not None:
         lines.append(f'[ -r {shlex.quote(str(cann))} ] '
                      f'|| fail {shlex.quote(f"CANN setup not readable: {cann}")}')
@@ -761,11 +854,19 @@ def container_script(source_root: str, timeout: int, device: str,
                      f'|| fail {shlex.quote(f"failed to source conda.sh: {conda_sh}")}')
         lines.append(f'conda activate {shlex.quote(conda_env)} '
                      f'|| fail {shlex.quote(f"conda activate {conda_env} failed")}')
-    lines.append(f'cd {shlex.quote(source_root)} '
-                 f'|| fail {shlex.quote(f"cannot enter {source_root}")}')
-    lines.append(f'[ -f {shlex.quote(GATE_TEST)} ] || fail "Gate test file is missing: {GATE_TEST}"')
+    # The checkout under test must exist, because its TLA implementation is what
+    # the test exercises, but it is not entered: neither tree is a working
+    # directory, and chdir into one invites exactly the artifact deposit that
+    # previously moved a provenance hash.
+    lines.append(f'[ -d {shlex.quote(source_root)} ] '
+                 f'|| fail {shlex.quote(f"source root is not a directory: {source_root}")}')
+    lines.append(f'cd {shlex.quote(test_dir)} '
+                 f'|| fail {shlex.quote(f"cannot enter test directory: {test_dir}")}')
+    lines.append(f'[ -f {shlex.quote(GATE_TEST)} ] '
+                 f'|| fail {shlex.quote(f"Gate test file is missing: {test_dir}/{GATE_TEST}")}')
     lines.append(f'timeout --signal=TERM --kill-after={KILL_AFTER_SECONDS} {timeout} '
-                 f'python3 - "$PWD" {shlex.quote(device)} {shlex.quote(GATE_TEST)} '
+                 f'python3 - {shlex.quote(source_root)} {shlex.quote(device)} '
+                 f'{shlex.quote(GATE_TEST)} '
                  f'<<\'TLA_NPU\'')
     lines.extend(RUNNER.strip('\n').splitlines())
     lines.append('TLA_NPU')
@@ -859,6 +960,19 @@ def observations(report: dict, device: str) -> dict:
         # excluded from passed().
         'visibleDeviceEcho': report.get('visibleDevices')
         if isinstance(report.get('visibleDevices'), str) else None,
+        # RECORDED, NOT GATED, for the same reason as the echo above: the counter
+        # checks prove the test really ran, and these fields only let a reader tie
+        # a PASS to the TLA code that produced it.
+        'tlaImplementationSha256': report.get('tlaImplementationSha256')
+        if isinstance(report.get('tlaImplementationSha256'), str) else None,
+        'tlaImplementationFileCount': report.get('tlaImplementationFileCount')
+        if type(report.get('tlaImplementationFileCount')) is int else None,
+        'tritonVersion': report.get('tritonVersion')
+        if isinstance(report.get('tritonVersion'), str) else None,
+        'tlaHasDma': report.get('tlaHasDma')
+        if isinstance(report.get('tlaHasDma'), bool) else None,
+        'tlaImplementationError': report.get('tlaImplementationError')
+        if isinstance(report.get('tlaImplementationError'), str) else None,
         'deviceModelUuid': report.get('deviceUuid')
         if isinstance(report.get('deviceUuid'), str) else None,
         'deviceName': report.get('deviceName')
@@ -946,19 +1060,44 @@ def main(argv: list[str]) -> int:
     # stops the Gate when this run demanded exclusivity.
     require_device_free(device)
 
-    mapped = map_host_to_container(host_root, container_mounts(container), container)
+    mounts = container_mounts(container)
+    mapped = map_host_to_container(host_root, mounts, container)
     declared = declared_container_source()
     if declared is not None and os.path.realpath(str(declared)) != os.path.realpath(str(mapped)):
         raise BridgeError(f'TLA_NPU_CONTAINER_SOURCE {declared} does not match the bind-mount '
                           f'mapping {mapped} of host source root {host_root}')
     container_root = str(declared if declared is not None else mapped)
+
+    # The test directory is a separate input with its own identity: it holds the
+    # bytes that exercise the implementation. Both are mapped through the same
+    # bind mounts and both are proven identical on each side.
+    test_dir = test_dir_from_env_file()
+    if not test_dir.is_dir():
+        raise BridgeError(f'TLA_NPU_TEST_DIR does not exist: {test_dir}')
+    container_test_dir = str(map_host_to_container(test_dir, mounts, container))
+
+    # The cache is written to, so it must live outside both input trees. That is
+    # enforced, not merely documented: a cache inside the source or test root
+    # would reintroduce the pollution this Gate was changed to prevent.
+    cache_dir = cache_dir_from_env_file()
+    for label, tree in (('source root', host_root), ('test directory', test_dir)):
+        if cache_dir is not None and (cache_dir == tree or cache_dir.is_relative_to(tree)):
+            raise BridgeError(f'TLA_NPU_CACHE_DIR {cache_dir} is inside the {label} {tree}; '
+                              f'the cache is written to and would pollute an input tree')
+    container_cache_dir = None
+    if cache_dir is not None:
+        container_cache_dir = map_host_to_container(cache_dir, mounts, container)
+
     prefix = docker_exec_prefix(container, home, container_root)
     verify_same_tree(host_root, prefix, container_root)
+    verify_same_tree(test_dir, prefix, container_test_dir)
     print(f'{PROG}: identity file {identity_file}', file=sys.stderr)
     print(f'{PROG}: container={container} user=root source={container_root} '
+          f'testDir={container_test_dir} cache={container_cache_dir} '
           f'timeout={timeout}s device={device} test={GATE_TEST}', file=sys.stderr)
-    script = container_script(container_root, timeout, device, cann, conda_sh, conda_env,
-                              conda_envs_path_from_env_file())
+    script = container_script(str(container_test_dir), container_root, timeout, device, cann,
+                              conda_sh, conda_env, conda_envs_path_from_env_file(),
+                              container_cache_dir)
     completed = subprocess.run([*prefix, 'bash', '-c', script], capture_output=True, text=True)
     if completed.stderr:
         sys.stderr.write(completed.stderr)

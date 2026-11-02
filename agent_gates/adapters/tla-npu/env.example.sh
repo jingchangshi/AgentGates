@@ -137,6 +137,17 @@ TLA_NPU_CONTAINER_HOME=
 # and the torch/torch_npu pair it runs with. Required by the provisioning script.
 TLA_NPU_WHEEL_DIR=
 
+# The directory holding the Gate test file. This is NOT the source root passed to
+# --source: the source root is the triton-ascend checkout whose TLA
+# implementation is under test, and the test that exercises it lives separately.
+# Both are inputs; neither is written to.
+TLA_NPU_TEST_DIR=
+
+# A dedicated TRITON_CACHE_DIR. The cache is written to, so it must be outside
+# both the source root and the test directory, whose contents are hashed. The
+# Gate refuses a cache path inside either tree rather than trusting a comment.
+TLA_NPU_CACHE_DIR=
+
 # Index for the small pure-Python dependencies. Leave the line out to use the
 # documented public mirror; set it to an empty value to install from no index at
 # all, which is what an offline run needs.
@@ -160,3 +171,5 @@ TLA_NPU_PYTHON_VERSION=3.11
 # TLA_NPU_CONDA_ENV=py311
 # TLA_NPU_CONDA_ENVS_PATH=/home/u/.conda/envs
 # TLA_NPU_WHEEL_DIR=/opt/wheels
+# TLA_NPU_TEST_DIR=/home/u/workspace/agent_tla
+# TLA_NPU_CACHE_DIR=/home/u/.cache/tla-npu-gate

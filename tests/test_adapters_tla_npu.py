@@ -187,7 +187,7 @@ class ContainerScriptCase(unittest.TestCase):
         self.assertIn('handle.write(WATCHER)', GATE.RUNNER)
 
     def test_the_container_script_names_every_toolchain_step(self):
-        script = GATE.container_script('/src', 60, '1', Path('/cann/set_env.sh'),
+        script = GATE.container_script('/tests', '/src', 60, '1', Path('/cann/set_env.sh'),
                                        Path('/conda/etc/profile.d/conda.sh'), 'an-env',
                                        Path('/envs'))
         for fragment in ('. /cann/set_env.sh', 'conda activate an-env',
@@ -220,14 +220,115 @@ class SourceTreeSafetyCase(unittest.TestCase):
         # The dump location is pinned explicitly rather than left to the runtime.
         self.assertIn('ASCEND_WORK_PATH=work', runner)
 
-    def test_the_container_script_enters_the_source_root_read_only(self):
-        script = GATE.container_script('/src', 60, '1', Path('/cann/set_env.sh'),
+    def test_the_container_script_enters_the_test_directory_not_the_source_root(self):
+        script = GATE.container_script('/tests', '/src', 60, '1', Path('/cann/set_env.sh'),
                                        Path('/conda/etc/profile.d/conda.sh'), 'an-env',
                                        Path('/envs'))
-        # The test is addressed by absolute path, so the shell never has to write
-        # there; entering it is only for the existence check.
-        self.assertIn('cd /src', script)
+        # The runner executes the test from the test directory. The source root is
+        # the checkout under test, so the shell only checks that it exists: a chdir
+        # into it is what let a compiler cache land inside the tree being hashed.
+        self.assertIn('cd /tests', script)
+        self.assertIn('[ -d /src ]', script)
+        self.assertNotIn('cd /src', script)
         self.assertIn('TLA_NPU', script)
+
+    def test_a_configured_cache_directory_is_used_and_created(self):
+        script = GATE.container_script('/tests', '/src', 60, '1', None, None, None, None,
+                                       Path('/cache/tla'))
+        self.assertIn('export TRITON_CACHE_DIR=/cache/tla', script)
+        self.assertIn('mkdir -p "$TRITON_CACHE_DIR"', script)
+        # A dedicated directory replaces the per-run temporary one rather than
+        # being layered on top of it, so the count describes this run only.
+        self.assertNotIn('mktemp -d)', script)
+
+    def test_the_runner_records_which_tla_implementation_it_imported(self):
+        # A version string cannot distinguish a wheel rebuilt at the same version,
+        # so the implementation is hashed and reported.
+        self.assertIn('tlaImplementationSha256', GATE.RUNNER)
+        self.assertIn('import triton.language.extra.tla as _tla', GATE.RUNNER)
+        self.assertIn('tritonVersion', GATE.RUNNER)
+
+    def test_the_cache_may_not_live_inside_either_input_tree(self):
+        # Enforced in the Gate module itself, so a misconfiguration is refused
+        # before anything is dispatched rather than polluting a hashed tree.
+        source = Path(GATE.__file__).read_text()
+        self.assertIn('is inside the {label}', source)
+        self.assertIn("('source root', host_root)", source)
+        self.assertIn("('test directory', test_dir)", source)
+
+
+class SourceAndTestInputsCase(unittest.TestCase):
+    """The source root and the test directory are different inputs."""
+
+    def test_the_test_directory_is_required(self):
+        # A Gate that quietly fell back to the source root would run whatever
+        # test happened to be there, which is exactly the conflation this
+        # adapter was changed to remove.
+        with patch.object(GATE, 'machine_value', return_value=None):
+            with self.assertRaises(GATE.BridgeError):
+                GATE.test_dir_from_env_file()
+
+    def test_the_test_directory_must_be_absolute(self):
+        with patch.object(GATE, 'machine_value', return_value='relative/dir'):
+            with self.assertRaises(GATE.BridgeError):
+                GATE.test_dir_from_env_file()
+
+    def test_the_cache_directory_is_optional_but_must_be_absolute(self):
+        with patch.object(GATE, 'machine_value', return_value=None):
+            self.assertIsNone(GATE.cache_dir_from_env_file())
+        with patch.object(GATE, 'machine_value', return_value='relative/cache'):
+            with self.assertRaises(GATE.BridgeError):
+                GATE.cache_dir_from_env_file()
+
+
+class ProvisioningScriptCase(unittest.TestCase):
+    """The provisioning script is the only place the dependency set is written."""
+
+    SETUP = Path(__file__).resolve().parent.parent / 'agent_gates' / 'adapters' \
+        / 'tla-npu' / 'scripts' / 'setup-python-env.sh'
+
+    def test_a_malformed_machine_file_stops_provisioning(self):
+        # The lookup distinguishes status 2 (malformed) from status 1 (key not
+        # set). It used to conflate them: an awk `exit 2` inside the main block
+        # still runs END, and END's own exit overrode the status, so every
+        # malformed line was reported as "key missing" and silently defaulted.
+        source = self.SETUP.read_text()
+        self.assertIn('END { exit(bad ? 2 : (found ? 0 : 1)) }', source)
+        self.assertIn('bad = 1', source)
+        self.assertIn('is malformed', source)
+
+    def test_the_script_is_built_from_named_steps(self):
+        # Reading and installing are separate steps, so a typo cannot leave a
+        # half-built environment and each phase can be reviewed on its own.
+        source = self.SETUP.read_text()
+        for step in ('_config_load()', '_wheels_select()', '_env_prepare()',
+                     '_wheels_install()', '_verify_environment()'):
+            self.assertIn(step, source)
+        # main states the order and nothing else.
+        main = source.split('main() {', 1)[1].split('}', 1)[0]
+        self.assertEqual([line.strip() for line in main.strip().splitlines() if line.strip()],
+                         ['_config_load', '_wheels_select', '_env_prepare',
+                          '_wheels_install', '_verify_environment',
+                          '_setup_error "environment $CFG_CONDA_ENV is ready at $ENV_DIR"',
+                          'return 0'])
+
+    def test_the_awk_comment_holds_no_apostrophe(self):
+        # The awk program lives inside single quotes. An apostrophe in a comment
+        # closes the shell string early and the script stops parsing.
+        source = self.SETUP.read_text()
+        opening = "    awk -v want=\"$key\" '"
+        start = source.index(opening) + len(opening)
+        end = source.index("    ' \"$file\"", start)
+        self.assertNotIn("'", source[start:end])
+
+    def test_the_setup_script_and_the_gate_read_the_same_machine_file(self):
+        # Provisioning and running must agree on which file describes the
+        # machine, or an environment is built from one and exercised from another.
+        setup = self.SETUP.read_text()
+        gate = Path(GATE.__file__).read_text()
+        for name in ('TLA_NPU_ENV_FILE', 'env.sh'):
+            self.assertIn(name, setup)
+            self.assertIn(name, gate)
 
 
 class MachineFileCase(unittest.TestCase):
