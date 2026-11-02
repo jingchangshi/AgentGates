@@ -8,41 +8,46 @@
 #
 #     bash <checkout>/adapters/tla-npu/scripts/setup-python-env.sh
 #
-# The configuration is the machine file adapters/tla-npu/env.sh, the same file
-# the Gate reads. Start from the committed template:
+# Configuration is the machine file adapters/tla-npu/env.sh, the same file the
+# Gate reads. Start from the committed template:
 #
 #     cp adapters/tla-npu/env.example.sh adapters/tla-npu/env.sh
 #     chmod 600 adapters/tla-npu/env.sh
 #
-# Then set the values this script needs:
+# Keys this script reads, and what each one controls:
 #
-#     TLA_NPU_WHEEL_DIR          directory holding the vendor wheels; required
-#     TLA_NPU_CONDA_SH           conda.sh of the installation to use; required
-#     TLA_NPU_CONDA_ENV          environment to create or reuse
-#     TLA_NPU_CONDA_ENVS_PATH    extra directory Conda searches for environments
-#     TLA_NPU_PYTHON_VERSION     interpreter version; default 3.11
-#     TLA_NPU_PIP_INDEX          index for the small dependencies
-#     TLA_NPU_CANN_SETUP         CANN set_env.sh, needed by the final check
+#   TLA_NPU_CONDA_SH         conda.sh of the installation to reuse   (required)
+#   TLA_NPU_CONDA_ENV        environment to create or reuse          (required)
+#   TLA_NPU_WHEEL_DIR        directory holding the vendor wheels     (required)
+#   TLA_NPU_CANN_SETUP       CANN set_env.sh, sourced before any import
+#   TLA_NPU_CONDA_ENVS_PATH  extra directory Conda searches for environments
+#   TLA_NPU_PYTHON_VERSION   interpreter version, default 3.11
+#   TLA_NPU_PIP_INDEX        index for the small pure-Python dependencies
+#   TLA_NPU_TRITON_WHEEL     exact triton_ascend wheel to install; overrides the
+#                            newest-by-mtime search in TLA_NPU_WHEEL_DIR
 #
-# The file is the primary mechanism because a shell export leaves no record.
-# One exception, narrow: TLA_NPU_ENV_FILE selects which file to read. A bootstrap
-# value cannot come from the file it names.
+# TLA_NPU_ENV_FILE is the single exception to "the file is the only source": it
+# selects which file to read, and a bootstrap value cannot come from the file it
+# names.
 #
 # The Conda installation is reused, never created. TLA_NPU_CONDA_SH names the
-# installation the Gate sources, so the environment this script builds is the
-# environment the Gate runs in.
+# installation the Gate sources, so the environment built here is the environment
+# the Gate runs in.
 #
-# The exit status is 0 only when the environment imports the TLA namespace and
-# reports an available NPU. Anything else is printed on stderr and returns
-# non-zero.
+# Exit status is 0 only when the environment imports the TLA namespace, carries
+# the native builder methods a kernel needs, and reports an available NPU.
 #
-# Why the wheels are local files rather than an index download: this is an Ascend
+# Why the wheels are local files rather than index downloads: this is an Ascend
 # server. pip install torch from PyPI resolves to the CUDA build and pulls
 # several gigabytes of nvidia-* wheels that cannot run here. The vendor directory
 # ships torch-<v>+cpu and torch_npu-<v>, which are the pair the Gate is verified
 # against. The triton_ascend wheel is a vendor build too: it is not on any public
 # index. Small pure-Python dependencies still come from an index, which is why
 # this script needs network access once.
+#
+# Reading and installing are separated on purpose: every value is resolved and
+# validated before anything is downloaded, so a typo in the machine file cannot
+# leave the environment half-built.
 
 set -o pipefail
 
@@ -56,8 +61,13 @@ _setup_die() {
 }
 
 # The strict NAME=value grammar the Gate uses. A machine file is data, so reading
-# it never executes Host code. Kept in step with _parse_env_file in
-# scripts/tla_gate.py; a value that the Gate rejects must not be accepted here.
+# it never executes host code. Kept in step with _parse_env_file in
+# scripts/tla_gate.py: a value the Gate rejects must not be accepted here.
+#
+# A malformed line is reported on stderr and makes the lookup fail with status 2,
+# which is distinct from status 1 ("this file does not set that key"). Callers
+# must not conflate the two: a file with a typo has to stop provisioning, not
+# silently fall back to a default that hides it.
 _env_file_lookup() {
     local file=$1 key=$2
     [ -r "$file" ] || return 1
@@ -66,7 +76,11 @@ _env_file_lookup() {
         line == "" || substr(line, 1, 1) == "#" { next }
         {
             eq = index(line, "=")
-            if (eq == 0) { print "not an assignment: " line > "/dev/stderr"; exit 2 }
+            # Set a flag rather than calling exit here. An exit in the main
+            # block still runs the END action, and the status from END wins, so
+            # the 2 below would never reach the caller. That is exactly how the
+            # malformed-file check came to be dead code, so keep the flag.
+            if (eq == 0) { print "not an assignment: " line > "/dev/stderr"; bad = 1; next }
             name = substr(line, 1, eq - 1)
             value = substr(line, eq + 1)
             sub(/^[ \t]+/, "", value); sub(/[ \t]+$/, "", value)
@@ -80,24 +94,33 @@ _env_file_lookup() {
                 found = 1
             }
         }
-        END { exit(found ? 0 : 1) }
+        END { exit(bad ? 2 : (found ? 0 : 1)) }
     ' "$file"
 }
 
-# The machine file's value, or the fallback when the file leaves the key out.
-_setting() {
-    local file=$1 key=$2 fallback=$3 value
-    value=$(_env_file_lookup "$file" "$key" 2>/dev/null) || value=''
-    if [ -n "$value" ]; then
+# One machine-file value, or the fallback when the file does not set the key. A
+# malformed file is fatal here rather than silently defaulted: the previous
+# version discarded stderr and so turned the parser's "this file is broken" into
+# "use the default", which is how a typo could provision an environment the
+# operator never configured.
+_env_value() {
+    local file=$1 key=$2 fallback=$3 value rc detail
+    value=$(_env_file_lookup "$file" "$key" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        detail=$(_env_file_lookup "$file" "$key" 2>&1 >/dev/null)
+        _setup_die "$file is malformed: $detail"
+    fi
+    if [ "$rc" -eq 0 ] && [ -n "$value" ]; then
         printf '%s' "$value"
-        return
+        return 0
     fi
     printf '%s' "$fallback"
 }
 
 # The machine file to read: the selector wins, then the checkout's own file.
 _env_file() {
-    local explicit=${TLA_NPU_ENV_FILE:-}
+    local explicit=${TLA_NPU_ENV_FILE:-} here
     if [ -n "$explicit" ]; then
         case "$explicit" in
             /*) ;;
@@ -105,156 +128,169 @@ _env_file() {
         esac
         [ -f "$explicit" ] || _setup_die "TLA_NPU_ENV_FILE does not exist: $explicit"
         printf '%s' "$explicit"
-        return
+        return 0
     fi
-    local here
     here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
     if [ -f "$here/env.sh" ]; then
         printf '%s' "$here/env.sh"
-        return
+        return 0
     fi
     printf ''
 }
 
-# Newest wheel matching one pattern anywhere under a directory.
-# Sorting by the full path would order by package directory name rather than by
-# version, so the candidate list is sorted and the last (newest by name) wins
-# only among wheels in the same directory; across directories the newest mtime
-# wins, which is what "the version somebody put there most recently" means.
+# Newest wheel matching one pattern anywhere under a directory. Sorting by full
+# path would order by package directory name rather than by version, so the
+# candidates are ordered by mtime: "the version somebody put there most recently".
 _newest_wheel() {
-    local directory pattern
-    directory=$1
-    pattern=$2
+    local directory=$1 pattern=$2
     find "$directory" -name "$pattern" -type f -printf '%T@ %p\n' 2>/dev/null \
         | sort -n | tail -1 | cut -d' ' -f2-
 }
 
-main() {
-    local env_file wheel_dir conda_sh conda_env conda_envs_path python_version
-    local pip_index cann python env_dir
+# The Conda prefix for a named environment, or nothing when it is not created
+# yet. Called before and after creation, so it exists once rather than being
+# pasted inline at each call site.
+_conda_env_dir() {
+    local name=$1
+    conda env list --json 2>/dev/null | python3 -c '
+import json, sys
+name = sys.argv[1]
+for prefix in json.load(sys.stdin).get("envs", []):
+    if prefix.rstrip("/").rsplit("/", 1)[-1] == name:
+        print(prefix)
+        break
+' "$name"
+}
 
-    env_file=$(_env_file)
-    [ -n "$env_file" ] || _setup_die 'no machine file found; copy env.example.sh to env.sh and configure it'
+# Resolve the machine file into CFG_* globals. Nothing is installed here.
+_config_load() {
+    CFG_FILE=$(_env_file)
+    [ -n "$CFG_FILE" ] \
+        || _setup_die 'no machine file found; copy env.example.sh to env.sh and configure it'
 
-    wheel_dir=$(_setting "$env_file" TLA_NPU_WHEEL_DIR '')
-    conda_sh=$(_setting "$env_file" TLA_NPU_CONDA_SH '')
-    conda_env=$(_setting "$env_file" TLA_NPU_CONDA_ENV '')
-    conda_envs_path=$(_setting "$env_file" TLA_NPU_CONDA_ENVS_PATH '')
-    python_version=$(_setting "$env_file" TLA_NPU_PYTHON_VERSION '3.11')
-    pip_index=$(_setting "$env_file" TLA_NPU_PIP_INDEX 'https://mirrors.aliyun.com/pypi/simple/')
-    cann=$(_setting "$env_file" TLA_NPU_CANN_SETUP '')
+    CFG_WHEEL_DIR=$(_env_value "$CFG_FILE" TLA_NPU_WHEEL_DIR '')
+    CFG_CONDA_SH=$(_env_value "$CFG_FILE" TLA_NPU_CONDA_SH '')
+    CFG_CONDA_ENV=$(_env_value "$CFG_FILE" TLA_NPU_CONDA_ENV '')
+    CFG_CONDA_ENVS_PATH=$(_env_value "$CFG_FILE" TLA_NPU_CONDA_ENVS_PATH '')
+    CFG_PYTHON_VERSION=$(_env_value "$CFG_FILE" TLA_NPU_PYTHON_VERSION '3.11')
+    CFG_PIP_INDEX=$(_env_value "$CFG_FILE" TLA_NPU_PIP_INDEX 'https://mirrors.aliyun.com/pypi/simple/')
+    CFG_CANN=$(_env_value "$CFG_FILE" TLA_NPU_CANN_SETUP '')
+    CFG_TRITON_WHEEL=$(_env_value "$CFG_FILE" TLA_NPU_TRITON_WHEEL '')
 
-    [ -n "$wheel_dir" ] || _setup_die 'TLA_NPU_WHEEL_DIR is required; it names the directory holding the vendor wheels'
-    [ -n "$conda_sh" ] || _setup_die 'TLA_NPU_CONDA_SH is required; it names the Conda installation to use'
-    [ -n "$conda_env" ] || _setup_die 'TLA_NPU_CONDA_ENV is required; it names the environment to create'
-    [ -r "$conda_sh" ] || _setup_die "conda.sh not readable: $conda_sh"
-    [ -d "$wheel_dir" ] || _setup_die "wheel directory does not exist: $wheel_dir"
-
-    # The vendor wheels this environment is built from. Selected by explicit
-    # pattern rather than globbed blindly, so a directory holding two versions
-    # cannot silently provision the one nobody chose. The search is recursive
-    # because the wheels are kept in per-package subdirectories
-    # (Packages/torch, Packages/tla-...), and a flat-only find would report
-    # "no wheel" on a machine where the wheels are right there one level down.
-    local triton_wheel torch_wheel npu_wheel
-    # An explicit wheel wins over discovery. This is the only way to pin the
-    # exact build an operator validated, and the TLA API changed between vendor
-    # builds, so "newest by mtime" is not a safe default on its own.
-    local triton_override
-    triton_override=$(_setting "$env_file" TLA_NPU_TRITON_WHEEL '')
-    if [ -n "$triton_override" ]; then
-        [ -f "$triton_override" ] || _setup_die "TLA_NPU_TRITON_WHEEL is not a file: $triton_override"
-        triton_wheel=$triton_override
-    else
-        triton_wheel=$(_newest_wheel "$wheel_dir" 'triton_ascend-*-cp311-*.whl')
+    [ -n "$CFG_WHEEL_DIR" ] \
+        || _setup_die 'TLA_NPU_WHEEL_DIR is required; it names the directory holding the vendor wheels'
+    [ -n "$CFG_CONDA_SH" ] \
+        || _setup_die 'TLA_NPU_CONDA_SH is required; it names the Conda installation to use'
+    [ -n "$CFG_CONDA_ENV" ] \
+        || _setup_die 'TLA_NPU_CONDA_ENV is required; it names the environment to create'
+    [ -r "$CFG_CONDA_SH" ] || _setup_die "conda.sh not readable: $CFG_CONDA_SH"
+    [ -d "$CFG_WHEEL_DIR" ] || _setup_die "wheel directory does not exist: $CFG_WHEEL_DIR"
+    if [ -n "$CFG_CANN" ] && [ ! -r "$CFG_CANN" ]; then
+        _setup_die "CANN setup not readable: $CFG_CANN"
     fi
-    torch_wheel=$(_newest_wheel "$wheel_dir" 'torch-*+cpu-cp311-*.whl')
-    npu_wheel=$(_newest_wheel "$wheel_dir" 'torch_npu-*-cp311-*.whl')
-    [ -n "$triton_wheel" ] || _setup_die "no triton_ascend cp311 wheel under $wheel_dir"
-    [ -f "$triton_wheel" ] || _setup_die "triton wheel is not a file: $triton_wheel"
+    if [ -n "$CFG_TRITON_WHEEL" ] && [ ! -f "$CFG_TRITON_WHEEL" ]; then
+        _setup_die "TLA_NPU_TRITON_WHEEL is not a file: $CFG_TRITON_WHEEL"
+    fi
+    # The Gate rejects an environment name that is not a plain identifier, so
+    # provisioning must reject it too. Building an environment the Gate will
+    # then refuse is a failure discovered at the worst possible moment.
+    case "$CFG_CONDA_ENV" in
+        [A-Za-z0-9]* ) ;;
+        * ) _setup_die "TLA_NPU_CONDA_ENV is not a plain environment name: $CFG_CONDA_ENV" ;;
+    esac
+    case "$CFG_CONDA_ENV" in
+        *[!A-Za-z0-9._-]* ) _setup_die "TLA_NPU_CONDA_ENV is not a plain environment name: $CFG_CONDA_ENV" ;;
+    esac
+}
 
+# Select the vendor wheels. The Triton build decides which TLA API and which
+# native bindings exist, so an explicit TLA_NPU_TRITON_WHEEL wins over discovery:
+# "newest by mtime" is not a safe default for a component whose API changes
+# between vendor builds.
+_wheels_select() {
+    WHEEL_TRITON=${CFG_TRITON_WHEEL:-}
+    if [ -z "$WHEEL_TRITON" ]; then
+        WHEEL_TRITON=$(_newest_wheel "$CFG_WHEEL_DIR" 'triton_ascend-*-cp311-*.whl')
+    fi
+    WHEEL_TORCH=$(_newest_wheel "$CFG_WHEEL_DIR" 'torch-*+cpu-cp311-*.whl')
+    WHEEL_NPU=$(_newest_wheel "$CFG_WHEEL_DIR" 'torch_npu-*-cp311-*.whl')
+    [ -n "$WHEEL_TRITON" ] || _setup_die "no triton_ascend cp311 wheel under $CFG_WHEEL_DIR"
+    [ -f "$WHEEL_TRITON" ] || _setup_die "triton wheel is not a file: $WHEEL_TRITON"
+}
+
+# Put CANN and Conda on the path, create or reuse the environment, and leave the
+# interpreter in PYTHON and its prefix in ENV_DIR.
+_env_prepare() {
+    local env_dir
     # CANN first: conda activation and torch_npu's later import both resolve
-    # native libraries from the CANN layout this puts on the loader path.
-    if [ -n "$cann" ]; then
-        [ -r "$cann" ] || _setup_die "CANN setup not readable: $cann"
+    # native libraries from the layout this puts on the loader path.
+    if [ -n "$CFG_CANN" ]; then
         # shellcheck disable=SC1090
-        . "$cann" || _setup_die "sourcing CANN setup failed: $cann"
-        [ -n "${ASCEND_HOME_PATH:-}" ] || _setup_die "CANN setup did not define ASCEND_HOME_PATH: $cann"
+        . "$CFG_CANN" || _setup_die "sourcing CANN setup failed: $CFG_CANN"
+        [ -n "${ASCEND_HOME_PATH:-}" ] \
+            || _setup_die "CANN setup did not define ASCEND_HOME_PATH: $CFG_CANN"
     fi
 
-    if [ -n "$conda_envs_path" ]; then
-        export CONDA_ENVS_PATH="$conda_envs_path"
+    if [ -n "$CFG_CONDA_ENVS_PATH" ]; then
+        export CONDA_ENVS_PATH="$CFG_CONDA_ENVS_PATH"
     fi
     # shellcheck disable=SC1090
-    . "$conda_sh" || _setup_die "sourcing conda.sh failed: $conda_sh"
+    . "$CFG_CONDA_SH" || _setup_die "sourcing conda.sh failed: $CFG_CONDA_SH"
 
-    env_dir=$(conda env list --json 2>/dev/null | python3 -c '
-import json, sys
-name = sys.argv[1]
-for prefix in json.load(sys.stdin).get("envs", []):
-    if prefix.rstrip("/").rsplit("/", 1)[-1] == name:
-        print(prefix)
-        break
-' "$conda_env")
-
+    env_dir=$(_conda_env_dir "$CFG_CONDA_ENV")
     if [ -z "$env_dir" ]; then
-        _setup_error "creating environment $conda_env (python $python_version)"
-        conda create -y -n "$conda_env" "python=$python_version" \
-            || _setup_die "conda create $conda_env failed"
-        env_dir=$(conda env list --json 2>/dev/null | python3 -c '
-import json, sys
-name = sys.argv[1]
-for prefix in json.load(sys.stdin).get("envs", []):
-    if prefix.rstrip("/").rsplit("/", 1)[-1] == name:
-        print(prefix)
-        break
-' "$conda_env")
+        _setup_error "creating environment $CFG_CONDA_ENV (python $CFG_PYTHON_VERSION)"
+        conda create -y -n "$CFG_CONDA_ENV" "python=$CFG_PYTHON_VERSION" \
+            || _setup_die "conda create $CFG_CONDA_ENV failed"
+        env_dir=$(_conda_env_dir "$CFG_CONDA_ENV")
     else
-        _setup_error "reusing environment $conda_env at $env_dir"
+        _setup_error "reusing environment $CFG_CONDA_ENV at $env_dir"
     fi
 
-    [ -n "$env_dir" ] || _setup_die "cannot locate the environment directory for $conda_env"
-    python="$env_dir/bin/python3"
-    [ -x "$python" ] || _setup_die "interpreter not found after environment creation: $python"
+    [ -n "$env_dir" ] || _setup_die "cannot locate the environment directory for $CFG_CONDA_ENV"
+    ENV_DIR=$env_dir
+    PYTHON=$env_dir/bin/python3
+    [ -x "$PYTHON" ] || _setup_die "interpreter not found after environment creation: $PYTHON"
+}
 
-    # torch first, then torch_npu: torch_npu's metadata pins the matching torch
-    # build, and installing it in the other order lets pip pull a CUDA torch.
-    local -a pip_args=(--disable-pip-version-check --no-cache-dir)
-    if [ -n "$pip_index" ]; then
-        pip_args+=(-i "$pip_index")
-        pip_args+=(--trusted-host "$(printf '%s' "$pip_index" | sed -e 's|^https\?://||' -e 's|/.*$||')")
+# pip options shared by every install: no cache (the wheels are local and large),
+# and an index for the small pure-Python dependencies only.
+_pip_install() {
+    local -a args=(--disable-pip-version-check --no-cache-dir)
+    if [ -n "$CFG_PIP_INDEX" ]; then
+        args+=(-i "$CFG_PIP_INDEX")
+        args+=(--trusted-host "$(printf '%s' "$CFG_PIP_INDEX" | sed -e 's|^https\?://||' -e 's|/.*$||')")
     fi
+    "$PYTHON" -m pip install "${args[@]}" "$@" || _setup_die "installing $* failed"
+}
 
-    if [ -n "$torch_wheel" ]; then
-        [ -f "$torch_wheel" ] || _setup_die "torch wheel is not a file: $torch_wheel"
-        _setup_error "installing $torch_wheel"
-        "$python" -m pip install "${pip_args[@]}" "$torch_wheel" \
-            || _setup_die "installing torch failed"
+# Install in dependency order. torch before torch_npu, because torch_npu's
+# metadata pins the matching torch build and the other order lets pip resolve a
+# CUDA torch. The vendor Triton build last, so it overlays the community triton
+# wheel its metadata declares; its dependencies are resolved rather than skipped,
+# because it pins exact versions and an environment with different ones is not
+# the environment the Gate was verified against.
+_wheels_install() {
+    if [ -n "$WHEEL_TORCH" ]; then
+        _setup_error "installing $WHEEL_TORCH"
+        _pip_install "$WHEEL_TORCH"
     else
         _setup_error 'no vendor torch wheel found; relying on the environment for torch'
     fi
-
-    if [ -n "$npu_wheel" ]; then
-        [ -f "$npu_wheel" ] || _setup_die "torch_npu wheel is not a file: $npu_wheel"
-        _setup_error "installing $npu_wheel"
-        "$python" -m pip install "${pip_args[@]}" "$npu_wheel" \
-            || _setup_die "installing torch_npu failed"
+    if [ -n "$WHEEL_NPU" ]; then
+        _setup_error "installing $WHEEL_NPU"
+        _pip_install "$WHEEL_NPU"
     fi
+    _setup_error "installing $WHEEL_TRITON"
+    _pip_install "$WHEEL_TRITON"
+}
 
-    # The vendor Triton build last, so it overlays the community triton wheel its
-    # metadata declares. Dependencies are resolved, not skipped: the wheel pins
-    # exact versions of attrs, numpy, scipy, decorator, psutil, pytest and
-    # pytest-xdist, and an environment with different ones is not the environment
-    # the Gate was verified against.
-    _setup_error "installing $triton_wheel"
-    "$python" -m pip install "${pip_args[@]}" "$triton_wheel" \
-        || _setup_die "installing triton_ascend failed"
-
-    # The final check is the one that matters: the TLA namespace must import and
-    # the device must be visible. A wheel that installs but cannot be imported is
-    # not provisioned.
+# The check that decides the exit status: a wheel that installs but cannot be
+# imported, or that imports without the native builder methods a kernel needs, is
+# not provisioned. Each failure names its own cause.
+_verify_environment() {
     _setup_error 'verifying the environment'
-    "$python" - <<'TLA_NPU_CHECK' || _setup_die 'environment verification failed'
+    "$PYTHON" - <<'TLA_NPU_CHECK' || _setup_die 'environment verification failed'
 import sys
 
 try:
@@ -276,7 +312,11 @@ print("tla_namespace", sorted(name for name in dir(tla) if not name.startswith("
 # A wheel that ships the tla package but not its entry points cannot run the
 # Gate test, and installing it would produce an environment that looks correct
 # until the test fails on an attribute error. Refuse it here instead.
-for attribute in ("jit", "alloc_buffer", "view", "copy", "simd"):
+# The API surface the Gate test actually uses, plus the newer modules the
+# triton-ascend main-dev line ships (dma, debug). A build that predates them can
+# still pass the older checks, so naming them here is what makes provisioning
+# refuse a wheel that cannot run current TLA code.
+for attribute in ("jit", "alloc_buffer", "view", "copy", "simd", "dma"):
     if not hasattr(tla, attribute):
         print("tla is missing %r; this triton_ascend build cannot run the Gate test"
               % attribute, file=sys.stderr)
@@ -323,8 +363,15 @@ if not torch.npu.is_available():
     raise SystemExit(1)
 print("npu_available", True)
 TLA_NPU_CHECK
+}
 
-    _setup_error "environment $conda_env is ready at $env_dir"
+main() {
+    _config_load
+    _wheels_select
+    _env_prepare
+    _wheels_install
+    _verify_environment
+    _setup_error "environment $CFG_CONDA_ENV is ready at $ENV_DIR"
     return 0
 }
 
