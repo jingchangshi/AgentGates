@@ -775,7 +775,17 @@ def classify_window(witness):
     #      order as the signal. It can therefore ADD a contention finding, but a
     #      canary that stayed flat is NOT evidence of a quiet window. Treating its
     #      silence as quiet would have mislabelled 6 to 8 of those 9 windows.
-    if heartbeat or co_tenants:
+    # Contended only on OBSERVED interference. On a shared machine a co-tenant PID is
+    # present almost always and says nothing about whether it USED the card: the AICore
+    # trajectory (which caught the controlled 99%-utilisation contention in 9 of 9
+    # windows) and the neighbour heartbeat are what actually mean interference, and the
+    # canary can add a finding. A co-tenant's PRESENCE is kept in the witness for
+    # transparency but no longer voids the window by itself - voiding on presence alone
+    # makes nothing on a busy shared host judgeable, which contradicts the operating rule
+    # that another tenant's use is normal and only real contention matters. One case still
+    # voids: a co-tenant present with NO AICore reading at all, where the card's use
+    # cannot be assessed and must not be assumed quiet.
+    if heartbeat:
         return 'contended'
     if peak is not None and peak >= CONTENDED_UTIL_PCT:
         return 'contended'
