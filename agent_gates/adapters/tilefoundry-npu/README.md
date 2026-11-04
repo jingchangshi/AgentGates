@@ -81,6 +81,37 @@ Direct access is ~58 KB/s. Through the host proxy it is ~1.7 MB/s, about 30x, an
 torch alone is 184 MB. `setup-tf-env.sh` reads the proxy exports from `PROXY_SH`
 and injects them into `docker exec` with `-e`.
 
+## The Gate had never been run, and did not work
+
+This adapter shipped with 14 negatives and a parity test, all green — and its primary
+path had never been executed. The first time the CPU Gate was actually run inside a
+container it failed twice:
+
+1. `FileNotFoundError: docker`. `assert_not_host` permits only the inside-container
+   mode, but `container_exec` shelled out to `docker exec`, which a container does not
+   have. The adapter forbade the mode it supported and supported the mode it forbade.
+   Fixed with a dual-mode path keyed on `/.dockerenv`.
+2. `Failed to load the backend extension: torch_npu` — `gate_cpu` did not set
+   `TORCH_DEVICE_BACKEND_AUTOLOAD=0`, and torch autoloads the `torch_npu` backend. A CPU
+   Gate must not load a device backend at all.
+
+Every negative passed because they test configuration parsing and guard refusal. **None
+of them executed the Gate against a real container**, which is exactly the path that was
+broken. This is the same failure as the vacuous checks above, one level up: the suite was
+green about everything except the thing the code exists to do.
+
+The rule: **run the primary path once, end to end, before believing a test suite.** A
+suite that never exercises it certifies only the side paths.
+
+Verified after the fix, by execution inside `tf-ascend950pr`:
+
+```
+failures: 0
+cpuEqualityRuns=True  checkCopySliceRuns=True  regressionsRun=True  verifyTirRuns=True
+analyzeOk=True  finalizeOk=True  importOk=True  exitCodeZero=True
+ranInsideContainer=True  inContainerPythonUsed=True  noHostInterpreter=True
+```
+
 ## Every test here has been made to fail
 
 A test that cannot fail certifies nothing, and it is worse than no test because it
