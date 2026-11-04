@@ -127,24 +127,31 @@ def assert_not_host(operation: str) -> None:
     # not by this code, so it cannot be satisfied by exporting a variable.
     if os.path.exists(CONTAINER_MARKER):
         return
+    # NOTE: an earlier version of this message advertised "run it from the host and it
+    # will docker exec for you". That was never true -- this guard runs first and
+    # refuses -- and advertising a path that cannot work is worse than saying nothing,
+    # because the operator concludes the tool is broken rather than misused. The gate
+    # is run INSIDE the container; the docker exec is the caller's.
+    script = Path(sys.argv[0]).name
     raise GateError(
         "refusing to run %s on the HOST.\n"
         "  TileFoundry analyse/finalize/test must run inside the container, so the\n"
         "  environment that produced a result is the environment that was verified.\n"
-        "  Run inside the container:\n"
-        "    docker exec -u <user> <container> %s\n"
-        "  Or, from the host, which does the docker exec for you:\n"
-        "    python3 %s --cpu\n"
-        % (operation, Path(sys.argv[0]).name, Path(sys.argv[0]).name),
+        "  This gate does NOT re-exec itself through docker; run it in the container:\n"
+        "    docker exec -u <user> <container> python3 <path-to>/%s --cpu\n"
+        "  (swap --cpu for --device / --build as needed.)\n"
+        "  /home is bind-mounted, so this adapter is already visible inside.\n"
+        % (operation, script),
         EXIT_CONFIG,
     )
 
 # ------------------------------------------------------------------- docker io
 
-def run(argv: list, timeout: int = 1800, check: bool = False) -> subprocess.CompletedProcess:
+def run(argv: list, timeout: int = 1800, check: bool = False,
+        env: dict | None = None) -> subprocess.CompletedProcess:
     log("$ " + " ".join(argv))
     completed = subprocess.run(
-        argv, capture_output=True, text=True, timeout=timeout, check=False,
+        argv, capture_output=True, text=True, timeout=timeout, check=False, env=env,
     )
     if completed.stdout:
         print(completed.stdout, end="")
@@ -158,7 +165,29 @@ def run(argv: list, timeout: int = 1800, check: bool = False) -> subprocess.Comp
         )
     return completed
 
+def inside_container() -> bool:
+    """Are we already running inside the container under test?
+
+    This adapter supports exactly ONE mode: execute inside the container. But
+    "inside" can be reached two ways, and they need different plumbing:
+
+      * the caller is on the host and this script re-execs each command with
+        `docker exec` -- but then this process is NOT in the container; or
+      * this process itself is running in the container (`/.dockerenv` present),
+        in which case there is no docker CLI and none is needed.
+
+    The guard in assert_not_host only permits the second. Supporting both without
+    asking which one we are in is how the gate crashed with
+    "FileNotFoundError: 'docker'" the first time it was run the documented way.
+    """
+    return os.path.exists(CONTAINER_MARKER)
+
+
 def container_exists(config: dict) -> bool:
+    if inside_container():
+        # We are in the container; there is nothing to ask docker about, and no
+        # docker binary to ask it with.
+        return True
     result = subprocess.run(
         ["docker", "inspect", config["CONTAINER_NAME"]],
         capture_output=True, text=True, check=False,
@@ -170,7 +199,18 @@ def in_container_python(config: dict) -> str:
 
 def container_exec(config: dict, argv: list, *, user: str | None = None,
                    env: dict | None = None, timeout: int = 1800) -> subprocess.CompletedProcess:
-    """Run argv inside the container. The only way this adapter executes anything."""
+    """Run argv inside the container. The only way this adapter executes anything.
+
+    Dual mode -- see inside_container(). Inside the container the argv runs
+    directly; the `user` argument is then a no-op, because a process cannot change
+    its own uid without privilege it should not have. That is why the device Gate
+    requires being launched as root inside the container rather than asking this
+    function to become root.
+    """
+    if inside_container():
+        merged = dict(os.environ)
+        merged.update(env or {})
+        return run(list(argv), timeout=timeout, env=merged)
     command = ["docker", "exec"]
     if user is not None:
         command += ["-u", user]
@@ -202,7 +242,15 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
     repo = config["TF_REPO"]
     python = in_container_python(config)
     user = config["CONTAINER_USER"]
-    env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo)}
+    # TORCH_DEVICE_BACKEND_AUTOLOAD=0 is REQUIRED, not an optimisation. torch
+    # autoloads the torch_npu backend, which needs CANN sourced; without CANN the
+    # import dies with "Failed to load the backend extension: torch_npu". A CPU Gate
+    # must not load a device backend at all -- doing so would reach the device stack
+    # as a side effect of a run that claims to be CPU-only. Discovered by running the
+    # Gate rather than reading it: cpu_equality and check_copy_slice failed until
+    # this was set.
+    env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
+           "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
     failures = 0
 
     # 1. The interpreter is the container's, and it can import TileFoundry.
