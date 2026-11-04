@@ -87,7 +87,7 @@ TF_REPO=/home/s00653124/workspace/TileFoundry
 IMAGE=tilefoundry-ascend950pr-dev:24.04
 CONTAINER_NAME=tf-ascend950pr
 CANN_ROOT=/data/pri/cann-9.2.0
-IN_CONTAINER_PYTHON=/opt/tf-venv/bin/python
+IN_CONTAINER_PYTHON=/home/s00653124/.conda/envs/tilefoundry-npu/bin/python
 CONTAINER_USER=s00653124
 EOS
 expect 2 "running the CPU Gate on the host is refused" \
@@ -116,6 +116,27 @@ expect 2 "non-numeric device id is refused" \
 echo "== no Gate selected =="
 expect 2 "no subcommand refuses rather than guessing" \
     python3 -B "$GATE" --env-file "$TMP/good.sh"
+
+echo "== retired paths must not reappear =="
+
+# /opt/tf-venv is deprecated. A stale reference in a fixture or a doc is how a
+# retired interpreter quietly comes back, so this is checked mechanically rather
+# than trusted to review. Deprecation NOTICES are allowed; USE is not.
+stale=0
+for f in "$HERE/../scripts"/* "$HERE/../env.example.sh"; do
+    [ -f "$f" ] || continue
+    hits="$(grep -n 'opt/tf-venv' "$f" 2>/dev/null | grep -vi 'DEPRECATED\|deprecated\|no longer' | head -3)"
+    if [ -n "$hits" ]; then
+        echo "  FAIL  $f still uses the retired /opt interpreter"
+        printf '%s\n' "$hits" | sed 's/^/        /'
+        stale=$((stale + 1))
+    fi
+done
+if [ "$stale" -eq 0 ]; then
+    ok "no live /opt/tf-venv reference in scripts or env"
+else
+    fail=$((fail + stale))
+fi
 
 echo
 echo "passed: $pass, failed: $fail"
