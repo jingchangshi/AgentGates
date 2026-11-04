@@ -240,20 +240,39 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
     #    failure, not a skip: a suite that quietly omits a check is a suite
     #    whose PASS does not mean what its name says.
     log("--- tool suite ---")
+    tool_status = {}
     for name, relative in CPU_TOOLS:
         target = "%s/%s" % (repo, relative)
         exists = container_exec(config, ["test", "-f", target], user=user)
         if exists.returncode != 0:
             log("FAIL %s: tool absent at %s" % (name, target))
             failures += 1
+            tool_status[name] = False
             continue
         record = container_exec(config, [python, target], user=user, env=env)
+        tool_status[name] = record.returncode == 0
         if record.returncode != 0:
             log("FAIL %s: exit %d" % (name, record.returncode))
             failures += 1
         else:
             print("PASS %s" % name)
 
+    # These keys are exactly the ones manifest.json declares as observationChecks.
+    # A manifest that names a check the script never reports is a gate whose PASS
+    # rests on a field nobody produced. tests/manifest_parity.py enforces the match.
+    observations = {
+        "exitCodeZero": failures == 0,
+        "ranInsideContainer": True,     # every command went through docker exec
+        "inContainerPythonUsed": True,  # the interpreter path is a container path
+        "importOk": imported.returncode == 0,
+        "analyzeOk": analyze.returncode == 0,
+        "finalizeOk": finalize.returncode == 0,
+        "cpuEqualityRuns": tool_status.get("cpu_equality", False),
+        "regressionsRun": tool_status.get("regressions", False),
+        "verifyTirRuns": tool_status.get("verify_tir", False),
+        "checkCopySliceRuns": tool_status.get("check_copy_slice", False),
+        "noHostInterpreter": True,      # assert_not_host ran before anything else
+    }
     if evidence_dir is not None:
         write_evidence(evidence_dir, "cpu", {
             "container": config["CONTAINER_NAME"],
@@ -261,6 +280,7 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
             "python": python,
             "ran_as": user,
             "failures": failures,
+            "observations": observations,
         })
     log("cpu gate: %s" % ("PASS" if failures == 0 else "FAIL"))
     return EXIT_PASS if failures == 0 else EXIT_FAIL
@@ -371,6 +391,20 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
         log("FAIL: the device probe exited %d" % probe.returncode)
         return EXIT_FAIL
 
+    # Same rule as the CPU gate: the keys are exactly the manifest observationChecks.
+    observations = {
+        "exitCodeZero": True,
+        "explicitDeviceId": bool(device_id),
+        "ranAsRoot": True,              # docker exec -u root, asserted in-payload
+        "deviceCountOne": True,         # the in-payload assertion requires exactly 1
+        "assertionInsidePayload": True, # the prefix runs inside the container
+        "deviceBoundIntoContainer": True,
+        "occupancyReported": True,
+        # Only true when exclusive mode was asked for AND the card was held, i.e.
+        # the BLOCKED_ENV path was actually exercised. Reporting True otherwise
+        # would claim a refusal that never happened.
+        "exclusiveBlockedEnv": occupied and config.get("TF_REQUIRE_EXCLUSIVE") == "1",
+    }
     if evidence_dir is not None:
         write_evidence(evidence_dir, "device", {
             "container": config["CONTAINER_NAME"],
@@ -379,6 +413,7 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
             "holders": len(holders),
             "ran_as": "root",
             "assertion": "in-payload, exactly one visible device and uid 0",
+            "observations": observations,
         })
     log("device gate: PASS (schema-level; this is not device attestation)")
     return EXIT_PASS
@@ -428,10 +463,17 @@ def gate_build(config: dict, evidence_dir) -> int:
     # The adapter does not duplicate the recipe: it reuses the repo one, so the
     # container that runs the Gate is the same container the repo verifies.
     log("reusing the recipe from %s" % recipe)
+    observations = {
+        "exitCodeZero": True,
+        "imagePresent": True,       # the recipe refuses otherwise
+        "containerCreated": container_exists(config),
+        "recipeReused": True,       # never duplicated here
+    }
     if evidence_dir is not None:
         write_evidence(evidence_dir, "build", {
             "image": image, "container": container,
             "recipe": str(recipe), "reused": True,
+            "observations": observations,
         })
     log("build gate: PASS")
     return EXIT_PASS

@@ -138,6 +138,13 @@ else
     fail=$((fail + stale))
 fi
 
+echo "== manifest and script agree on every check =="
+
+# Static, so it needs no container. Drift between the declared observationChecks and
+# what the script reports is invisible in a normal run: both sides look like success.
+expect 0 "manifest observationChecks match the script" \
+    python3 "$HERE/manifest_parity.py"
+
 echo
 echo "passed: $pass, failed: $fail"
 [ "$fail" -eq 0 ] && { echo "RESULT: PASS"; exit 0; }
