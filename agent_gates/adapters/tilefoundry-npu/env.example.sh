@@ -75,6 +75,12 @@ CONDA_SH=/data/miniconda3/etc/profile.d/conda.sh
 # ascend-toolkit/ component: /data/pri/cann-9.2.0/set_env.sh does not exist.
 CANN_SET_ENV=/data/pri/cann-9.2.0/ascend-toolkit/set_env.sh
 
+# A card another tenant already holds is REFUSED by default (exit 75 BLOCKED_ENV):
+# occupancy is read before torch_npu is imported, because a failed aclInit still
+# opens the device node. Set this to 1 only to deliberately accept a shared card;
+# the run is then recorded as a shared-card result with provisional timings.
+TF_ALLOW_BUSY_DEVICE=
+
 # The host proxy script. Its exports are passed into docker exec with -e; direct
 # network here runs at ~58 KB/s against ~1.7 MB/s through the proxy.
 PROXY_SH=/home/s00653124/set_proxy.sh

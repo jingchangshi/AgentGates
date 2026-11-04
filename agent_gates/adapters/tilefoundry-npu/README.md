@@ -48,6 +48,33 @@ puts on the loader path. The order is fixed: CANN, then conda activate, then
 `ASCEND_RT_VISIBLE_DEVICES`, then import. Two traps: the script breaks under
 `set -u`, and the path has an `ascend-toolkit/` component that is easy to omit.
 
+### A held card is refused, not entered
+
+Before anything imports `torch_npu` or reaches `aclInit`, the device Gate reads
+occupancy. If another tenant already holds the card it **refuses with exit 75
+`BLOCKED_ENV`** and the workload never runs.
+
+This is the default, and it was learned the hard way. In this program a device open at
+`13:46:26` was followed **32 s later** by a host-wide `docker exec` stall, with the
+card already held by other tenants. A failed `aclInit` still *opens the device node*, so
+"it only errored" is not a defence: the open happens either way.
+
+The ordering is the point, so the check lives **above** the probe and must not be moved
+below it. The previous default was the opposite — record occupancy, proceed, refuse only
+when `TF_REQUIRE_EXCLUSIVE=1` — which made walking onto somebody else's card the normal
+case.
+
+An override exists and is deliberately loud:
+
+```
+TF_ALLOW_BUSY_DEVICE=1
+```
+
+It prints an unmissable banner, records `overriddenBusyDevice=true` in the evidence, and
+the result is labelled a **shared-card** result: timings provisional, numerics
+unaffected. The flag is named for what it does, so nobody sets it by accident. There is
+no way to reach a device while hiding that the card was busy.
+
 ### Network
 
 Direct access is ~58 KB/s. Through the host proxy it is ~1.7 MB/s, about 30x, and

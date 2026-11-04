@@ -16,7 +16,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_gate.py": "24b3e49244463bdb52aec7a8e72ced3ede455ec5837aa9d08f082e92cd780325",
+    "scripts/tilefoundry_gate.py": "880cbc82f900652e3c3af9d13515d5c88414cfe99c4cb841349793f0baaafb05",
     "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869"
   },
   "recipes": [
@@ -125,8 +125,10 @@
         "assertionInsidePayload": true,
         "deviceBoundIntoContainer": true,
         "occupancyReported": true,
-        "exclusiveBlockedEnv": true
-      }
+        "overriddenBusyDevice": true,
+        "refusedBusyDevice": true
+      },
+      "description": "Runs one device workload as root inside the container, on an explicitly named device, with the identity assertion executed in-payload. REFUSES to open a card another tenant already holds: occupancy is read first, before torch_npu or aclInit, and a held card yields 75 BLOCKED_ENV. TF_ALLOW_BUSY_DEVICE=1 is the deliberate, recorded override."
     }
   ],
   "provenance": {
@@ -198,6 +200,13 @@
         "set_env.sh breaks under set -u (expands unset LD_LIBRARY_PATH, PYTHONPATH, CMAKE_PREFIX_PATH)",
         "the path is /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh, not .../cann-9.2.0/set_env.sh"
       ]
+    },
+    "busyDevicePolicy": {
+      "default": "REFUSE with exit 75 BLOCKED_ENV when another tenant holds the card",
+      "why": "A device open at 13:46:26 was followed 32 s later by a host-wide docker exec stall, with the card already held by other tenants. A failed aclInit still opens the device node, so probing a held card is not a neutral act.",
+      "ordering": "Occupancy is read in gate_device BEFORE torch_npu is imported and before aclInit is reachable, and tests/device_policy.py enforces that order from the AST. A runtime test of the refusal branch would pass even if occupancy were read after a device had already been opened.",
+      "override": "TF_ALLOW_BUSY_DEVICE=1 -- loud banner, recorded as overriddenBusyDevice=true, result is a SHARED-card result with provisional timings",
+      "superseded": "The previous default was the inverse: record occupancy, proceed, and refuse only when TF_REQUIRE_EXCLUSIVE=1. That made walking onto another tenant's card the normal path."
     }
   }
 }

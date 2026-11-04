@@ -39,6 +39,7 @@ EXIT_PASS, EXIT_FAIL, EXIT_CONFIG, EXIT_BLOCKED, EXIT_ASSERT = 0, 1, 2, 75, 97
 KNOWN_KEYS = {
     "TF_REPO", "IMAGE", "CONTAINER_NAME", "CANN_ROOT", "IN_CONTAINER_PYTHON",
     "CONTAINER_USER", "DEVICE_ID", "TF_REQUIRE_EXCLUSIVE", "TF_VENV", "TF_WORKSPACE",
+    "TF_ALLOW_BUSY_DEVICE",
     "TF_NPU_ENV", "CONDA_SH", "VENDOR_WHEELS", "TF_CONDA_ENV",
     "CANN_SET_ENV", "PROXY_SH",
 }
@@ -312,7 +313,14 @@ def device_assertion_prefix(expected: str) -> str:
     )
 
 def device_occupancy(config: dict, device_id: str) -> tuple:
-    """Report who is on the card. Report it -- never enforce it."""
+    """Report who is on the card.
+
+    The caller refuses when it is held. Occupancy is READ HERE, BEFORE anything
+    imports torch_npu or reaches aclInit, because the cost of probing a held card is
+    not hypothetical: in this program's own incident a device open at 13:46:26 was
+    followed 32 s later by a host-wide exec stall. A card someone else is using is not
+    a fact about the code under test, and it is also not ours to test on.
+    """
     result = container_exec(config, ["npu-smi", "info"], user="root")
     if result.returncode != 0:
         raise GateError(
@@ -348,8 +356,20 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
     env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
            "ASCEND_RT_VISIBLE_DEVICES": device_id}
 
-    # Occupancy is recorded, not enforced: a busy card is not a fact about the
-    # code under test. Exclusive mode, when asked for, is honest instead.
+    # OCCUPANCY FIRST, AND IT REFUSES BY DEFAULT.
+    #
+    # This runs before torch_npu is imported and before aclInit is ever reached. That
+    # ordering is the whole point, so it must not be moved below the probe.
+    #
+    # The default used to be the other way round: record occupancy, proceed, and only
+    # refuse when TF_REQUIRE_EXCLUSIVE=1 was set. That made "somebody else is using
+    # the card" the normal case to walk into. The evidence against it is our own: a
+    # device open at 13:46:26 was followed 32 s later by a host-wide stall, with the
+    # card already held by other tenants. Probing a held card is not a neutral act.
+    #
+    # A busy card is also not a fact about the code under test, so proceeding cannot
+    # produce a result about that code: it produces a result about a shared,
+    # contention-affected card, which is why the override is loud rather than quiet.
     holders, _ = device_occupancy(config, device_id)
     occupied = bool(holders)
     if occupied:
@@ -359,14 +379,26 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
     else:
         log("device %s reports no active process" % device_id)
 
-    if occupied and config.get("TF_REQUIRE_EXCLUSIVE") == "1":
-        log("BLOCKED_ENV: exclusive access was requested and device %s is held." % device_id)
-        log("  The run did not happen. This is not a pass and not a failure:")
-        log("  there is no result to report, and reporting one would be a fabrication.")
+    override = config.get("TF_ALLOW_BUSY_DEVICE") == "1"
+    if occupied and not override:
+        log("BLOCKED_ENV: device %s is held by another user; refusing to open it." % device_id)
+        log("  The run did not happen. This is not a pass and not a failure: there is")
+        log("  no result to report, and reporting one would be a fabrication.")
+        log("  Refusal is the default because opening a held card is not a neutral act:")
+        log("  in this program a device open at 13:46:26 preceded a host-wide stall 32 s")
+        log("  later, with the card already held by other tenants.")
+        log("  To override deliberately, set TF_ALLOW_BUSY_DEVICE=1. Anything the run")
+        log("  then produces is a SHARED-CARD result: timings are PROVISIONAL and the")
+        log("  evidence is marked as overridden.")
         return EXIT_BLOCKED
 
-    if occupied:
-        log("proceeding on a shared device; timings are PROVISIONAL, numerics unaffected")
+    if occupied and override:
+        log("=" * 72)
+        log("OVERRIDE: TF_ALLOW_BUSY_DEVICE=1 -- proceeding on a card held by others.")
+        log("  Anything below describes a SHARED card, not exclusive use.")
+        log("  Timings are PROVISIONAL; numerics are unaffected by contention.")
+        log("  This override is recorded in the evidence as overriddenBusyDevice=true.")
+        log("=" * 72)
 
     # The device must be bound INTO the container. Presence on the host is not
     # enough: a container fixed to device 0 cannot reach device 1, and running
@@ -400,10 +432,13 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
         "assertionInsidePayload": True, # the prefix runs inside the container
         "deviceBoundIntoContainer": True,
         "occupancyReported": True,
-        # Only true when exclusive mode was asked for AND the card was held, i.e.
-        # the BLOCKED_ENV path was actually exercised. Reporting True otherwise
-        # would claim a refusal that never happened.
-        "exclusiveBlockedEnv": occupied and config.get("TF_REQUIRE_EXCLUSIVE") == "1",
+        # Only true when the card was held AND the run was allowed to continue via the
+        # override. Reporting True when the card was free would claim an override that
+        # never happened; reporting False when it was used would hide it.
+        "overriddenBusyDevice": occupied and config.get("TF_ALLOW_BUSY_DEVICE") == "1",
+        # The refusal path returns 75 before this point, so if we are here it was not
+        # taken. Recorded explicitly rather than left as an absent key.
+        "refusedBusyDevice": False,
     }
     if evidence_dir is not None:
         write_evidence(evidence_dir, "device", {

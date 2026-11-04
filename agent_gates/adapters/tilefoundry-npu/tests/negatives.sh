@@ -138,6 +138,10 @@ else
     fail=$((fail + stale))
 fi
 
+echo "== busy-device policy: refusal first, and by default =="
+
+expect 0 "busy-device policy holds (order + default + override)" \
+    python3 "$HERE/device_policy.py"
 echo "== manifest and script agree on every check =="
 
 # Static, so it needs no container. Drift between the declared observationChecks and
