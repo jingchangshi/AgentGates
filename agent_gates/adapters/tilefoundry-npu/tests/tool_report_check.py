@@ -55,6 +55,50 @@ check("check_copy_slice with a false structural check is a FAILURE",
 check("check_copy_slice with all structural checks true is accepted",
       gate.tool_report_ok("check_copy_slice", 0, ccs_good) is True)
 
+# Frozen empty-checks: an empty checks dict must FAIL, not default-true via all().
+ce_empty = {"status": "PASS", "exit_code": 0, "cases": [{"status": "PASS", "checks": {}}]}
+check("cpu_equality with EMPTY checks is a FAILURE",
+      gate.tool_report_ok("cpu_equality", 0, ce_empty) is False)
+ce_missing = {"status": "PASS", "exit_code": 0,
+              "cases": [{"status": "PASS", "checks": {"shape": True, "dtype": True}}]}
+check("cpu_equality missing a mandatory check (bits) is a FAILURE",
+      gate.tool_report_ok("cpu_equality", 0, ce_missing) is False)
+
+# Staleness: a report older than the run start is the PREVIOUS run's file.
+import time as _time
+_now = _time.time()
+check("report newer than run start is fresh", gate.report_is_fresh(_now, _now - 1) is True)
+check("report older than run start is STALE (rejected as a skipped writer)",
+      gate.report_is_fresh(_now - 100, _now) is False)
+
+# SKIPPED_WRITER_E2E: exits 0 and writes NO report. In a fresh run directory there
+# is no file to read, so it must be rejected -- the staleness scenario in miniature.
+import subprocess as _sp
+import tempfile as _tf
+import os as _os
+with _tf.TemporaryDirectory() as _td:
+    _out = _os.path.join(_td, "skipped.json")
+    _r = _sp.run(["/bin/true", "--out", _out], capture_output=True, text=True)
+    _wrote = _os.path.exists(_out)
+    _rep = None
+    if _wrote:
+        import json as _json
+        _rep = _json.load(open(_out))
+    check("SKIPPED_WRITER_E2E: a writer that exits 0 and writes nothing is REJECTED",
+          _r.returncode == 0 and not _wrote and gate.tool_report_ok("regressions", 0, _rep) is False)
+
+# UID_COUNTED: a wrong uid must be a counted failure, not an informational field.
+check("UID_COUNTED: uid 0 (root) is not acceptable",
+      gate.uid_is_acceptable(0, 1071) is False)
+check("UID_COUNTED: uid 999 != 1071 is not acceptable",
+      gate.uid_is_acceptable(999, 1071) is False)
+check("UID_COUNTED: root is unacceptable even if expected is 0",
+      gate.uid_is_acceptable(0, 0) is False)
+check("UID_COUNTED: None uid is not acceptable",
+      gate.uid_is_acceptable(None, 1071) is False)
+check("UID_COUNTED: uid 1071 is acceptable",
+      gate.uid_is_acceptable(1071, 1071) is True)
+
 print()
 if failures:
     print("RESULT: FAIL (%d)" % failures)

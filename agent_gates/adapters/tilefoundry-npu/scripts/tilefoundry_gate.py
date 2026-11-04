@@ -30,6 +30,8 @@ import os
 import re
 import shutil
 import subprocess
+import time
+import uuid
 import sys
 from pathlib import Path
 
@@ -293,12 +295,41 @@ def identity_verdict(info, configured_python):
     return all(checks.values()), checks
 
 
-def tool_report_ok(name, returncode, report):
-    """A tool "ran" only if it emitted a structured PASS report.
+def uid_is_acceptable(actual_uid, expected_uid):
+    """Wrong uid is a FAILURE, not an informational field.
 
-    Pure, so it is unit-testable without a container. Exit 0 with a missing or
-    non-PASS report is a FAILURE: a tool that exits 0 and prints nothing is exactly
-    the vacuous success this Gate exists to refuse.
+    In the previous revision the uid comparison was recorded in the evidence but
+    never counted toward failures, so a wrong-uid run could still PASS. This predicate
+    is the single source of truth the Gate counts on.
+    """
+    return actual_uid is not None and actual_uid == expected_uid and actual_uid != 0
+
+
+def report_is_fresh(mtime, run_start, slack=2.0):
+    """A report written before this run started is the PREVIOUS run's file.
+
+    Staleness guard. With a fixed work directory and fixed filenames, an exit-0 run
+    that writes nothing could be "accepted" by reading the previous run's report.
+    A unique per-run directory already prevents that; this is the second lock, for
+    the case where a directory is ever reused.
+    """
+    try:
+        return float(mtime) >= (float(run_start) - slack)
+    except (TypeError, ValueError):
+        return False
+
+
+#: The mandatory per-case checks for cpu_equality. Named explicitly so a missing one
+#: is a FAILURE. all({}.values()) is True, so an empty checks dict must not pass.
+REQUIRED_CASE_CHECKS = ("shape", "dtype", "bits")
+
+
+def tool_report_ok(name, returncode, report):
+    """A tool "ran" only if it emitted a structured PASS report with real checks.
+
+    Pure, so unit-testable without a container. Exit 0 with a missing or non-PASS
+    report is a FAILURE: a tool that exits 0 and prints nothing is the vacuous
+    success this Gate refuses.
     """
     ok = (
         returncode == 0
@@ -308,15 +339,21 @@ def tool_report_ok(name, returncode, report):
     )
     if name == "cpu_equality" and report is not None:
         cases = report.get("cases") or []
-        ok = ok and bool(cases) and all(
-            c.get("status") == "PASS" and all((c.get("checks") or {}).values())
-            for c in cases
-        )
+        if not cases:
+            return False
+        for c in cases:
+            checks = c.get("checks")
+            if c.get("status") != "PASS" or not isinstance(checks, dict):
+                return False
+            # every mandatory check MUST be present and exactly True; a missing key
+            # is a failure, not a default-true via all().
+            if any(k not in checks or checks[k] is not True for k in REQUIRED_CASE_CHECKS):
+                return False
     if name == "check_copy_slice" and report is not None:
         checks = report.get("checks") or {}
-        ok = (ok and bool(checks.get("two_copies"))
-              and bool(checks.get("one_smem_buffer"))
-              and bool(checks.get("stages_through_same_buffer")))
+        ok = (ok and checks.get("two_copies") is True
+              and checks.get("one_smem_buffer") is True
+              and checks.get("stages_through_same_buffer") is True)
     return ok
 
 
@@ -356,7 +393,15 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
     env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
     failures = 0
-    workdir = "/tmp/tfgate"
+    run_id = uuid.uuid4().hex[:12]
+    run_start = time.time()
+    # UNIQUE directory per run. A fixed path let a skipped writer with rc 0 be
+    # "accepted" by reusing a previous run's report; mktemp makes the directory new
+    # and empty, so a writer that writes nothing has no file to be accepted from.
+    mk = container_exec(config, ["mktemp", "-d", "/tmp/tfgate.XXXXXXXX"], user=user)
+    workdir = (mk.stdout or "").strip()
+    if mk.returncode != 0 or not workdir.startswith("/tmp/"):
+        raise GateError("could not allocate a run directory: %r" % workdir, EXIT_BLOCKED)
 
     # 1. ACTUAL uid. The configured user string is NOT evidence: inside the
     #    container the exec helper's user argument is a no-op, so "ran as X" must
@@ -371,6 +416,46 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
             % uid_text, EXIT_BLOCKED,
         )
     log("actual uid = %d (expected %d, must be non-root)" % (actual_uid, expected_uid))
+    # EARLY precondition: refuse BEFORE any CPU tool runs, not at the end. Running
+    # the whole suite as the wrong account and only then objecting wastes the run
+    # and leaves tool output produced under the wrong identity.
+    if not uid_is_acceptable(actual_uid, expected_uid):
+        # COUNTED FAILURE, not an output-only note. The previous revision recorded the
+        # uid but never added it to failures, so a wrong-uid run could still PASS. Now
+        # a wrong uid fails: nothing runs, evidence is written, and the Gate exits 1.
+        log("FAIL: the CPU Gate must run as uid %d (non-root); id -u reported %d."
+            " Refusing before any tool runs; this counts as a failure."
+            % (expected_uid, actual_uid))
+        if evidence_dir is not None:
+            write_evidence(evidence_dir, "cpu", {
+                "run_id": run_id,
+                "container": config["CONTAINER_NAME"],
+                "image": config["IMAGE"],
+                "python": python,
+                "configured_user": user,
+                "ran_as_uid": actual_uid,
+                "expected_uid": expected_uid,
+                "refused_before_tools": True,
+                "failures": 1,
+                "observations": {
+                    "exitCodeZero": False,
+                    "ranInsideContainer": inside_container(),
+                    "inContainerPythonUsed": False,
+                    "importOk": False,
+                    "analyzeOk": False,
+                    "finalizeOk": False,
+                    "cpuEqualityRuns": False,
+                    "regressionsRun": False,
+                    "verifyTirRuns": False,
+                    "checkCopySliceRuns": False,
+                    "noHostInterpreter": True,
+                    "interpreterIdentityOk": False,
+                    "actualUidIsExpected": False,
+                    "toolReportsStructured": False,
+                    "finalizedArtifactTyped": False,
+                },
+            })
+        return EXIT_FAIL
 
     # 2. Interpreter identity challenge. A config pointing at /bin/true dies here.
     ident_ok, ident_detail = check_interpreter_identity(config, python, env, user)
@@ -436,8 +521,14 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
         out_path = "%s/%s.json" % (workdir, name)
         record = container_exec(config, [python, target, "--out", out_path], user=user, env=env)
         read_ok, text = container_read_text(config, out_path, user=user)
-        report = None
+        fresh = False
         if read_ok:
+            try:
+                fresh = report_is_fresh(os.stat(out_path).st_mtime, run_start)
+            except OSError:
+                fresh = False
+        report = None
+        if read_ok and fresh:
             try:
                 report = json.loads(text)
             except Exception:  # noqa: BLE001
@@ -445,10 +536,13 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
         tool_reports[name] = {
             "returncode": record.returncode,
             "report_present": report is not None,
+            "report_fresh": fresh,
             "status": (report or {}).get("status"),
             "exit_code": (report or {}).get("exit_code"),
         }
-        ok = tool_report_ok(name, record.returncode, report)
+        # fresh=False means the file predates this run (stale) or is absent: a
+        # writer that wrote nothing cannot be accepted from a previous run's file.
+        ok = fresh and tool_report_ok(name, record.returncode, report)
         tool_status[name] = ok
         if ok:
             print("PASS %s" % name)
@@ -476,7 +570,15 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
         "finalizedArtifactTyped": finalize_ok,
     }
     if evidence_dir is not None:
+        archive = Path(evidence_dir) / ("tool_reports_" + run_id)
+        archive.mkdir(parents=True, exist_ok=True)
+        for _n in tool_reports:
+            _src = Path(workdir) / (_n + ".json")
+            if _src.is_file():
+                shutil.copy(_src, archive / (_n + ".json"))
         write_evidence(evidence_dir, "cpu", {
+            "run_id": run_id,
+            "workdir": workdir,
             "container": config["CONTAINER_NAME"],
             "image": config["IMAGE"],
             "python": python,
@@ -492,6 +594,10 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
             "failures": failures,
             "observations": observations,
         })
+    # Remove the per-run directory: it is scratch, and leaving it invites the next
+    # run to read a stale file. Raw reports were archived above when evidence was
+    # requested.
+    shutil.rmtree(workdir, ignore_errors=True)
     log("cpu gate: %s" % ("PASS" if failures == 0 else "FAIL"))
     return EXIT_PASS if failures == 0 else EXIT_FAIL
 
