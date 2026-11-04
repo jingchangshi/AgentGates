@@ -629,13 +629,12 @@ def device_assertion_prefix(expected: str) -> str:
     )
 
 def device_occupancy(config: dict, device_id: str) -> tuple:
-    """Report who is on the card.
+    """Report who is on the card (HANDOFF section 4: a shared card is NORMAL).
 
-    The caller refuses when it is held. Occupancy is READ HERE, BEFORE anything
-    imports torch_npu or reaches aclInit, because the cost of probing a held card is
-    not hypothetical: in this program's own incident a device open at 13:46:26 was
-    followed 32 s later by a host-wide exec stall. A card someone else is using is not
-    a fact about the code under test, and it is also not ours to test on.
+    Occupancy is READ and RECORDED, never a refusal by itself: multiple users/processes
+    may hold device 0 and busy is allowed. Only an UNREADABLE/FAILED npu-smi is refused
+    here (occupancy UNKNOWN is not evidence of an idle card -> health refusal). The
+    refusal set for this gate is health / readability / identity / ffi errors ONLY.
     """
     result = container_exec(config, ["npu-smi", "info"], user="root")
     if result.returncode != 0:
@@ -672,49 +671,27 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
     env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
            "ASCEND_RT_VISIBLE_DEVICES": device_id}
 
-    # OCCUPANCY FIRST, AND IT REFUSES BY DEFAULT.
+    # OCCUPANCY IS READ AND RECORDED, THEN WE PROCEED (HANDOFF section 4).
     #
-    # This runs before torch_npu is imported and before aclInit is ever reached. That
-    # ordering is the whole point, so it must not be moved below the probe.
-    #
-    # The default used to be the other way round: record occupancy, proceed, and only
-    # refuse when TF_REQUIRE_EXCLUSIVE=1 was set. That made "somebody else is using
-    # the card" the normal case to walk into. The evidence against it is our own: a
-    # device open at 13:46:26 was followed 32 s later by a host-wide stall, with the
-    # card already held by other tenants. Probing a held card is not a neutral act.
-    #
-    # A busy card is also not a fact about the code under test, so proceeding cannot
-    # produce a result about that code: it produces a result about a shared,
-    # contention-affected card, which is why the override is loud rather than quiet.
+    # Shared card is NORMAL: multiple users/processes may hold device 0. A busy card is
+    # a usage fact, not a refusal reason. Refuse ONLY on health/readability (npu-smi
+    # unreadable or failed -> occupancy UNKNOWN, handled inside device_occupancy), on
+    # identity (device id / binding / in-payload assertion), or on ffi errors. The read
+    # still happens before torch_npu is imported so a health problem is reported before
+    # any device node is opened.
     holders, _ = device_occupancy(config, device_id)
     occupied = bool(holders)
     if occupied:
-        log("device %s is OCCUPIED by %d process(es):" % (device_id, len(holders)))
+        log("device %s is OCCUPIED by %d process(es) -- shared card is ALLOWED:" % (device_id, len(holders)))
         for row in holders:
             log("  " + row)
+        log("  occupancy is RECORDED (busyRecorded=true); timings are PROVISIONAL,")
+        log("  numerics are unaffected by contention. This is NOT a refusal.")
     else:
         log("device %s reports no active process" % device_id)
-
-    override = config.get("TF_ALLOW_BUSY_DEVICE") == "1"
-    if occupied and not override:
-        log("BLOCKED_ENV: device %s is held by another user; refusing to open it." % device_id)
-        log("  The run did not happen. This is not a pass and not a failure: there is")
-        log("  no result to report, and reporting one would be a fabrication.")
-        log("  Refusal is the default because opening a held card is not a neutral act:")
-        log("  in this program a device open at 13:46:26 preceded a host-wide stall 32 s")
-        log("  later, with the card already held by other tenants.")
-        log("  To override deliberately, set TF_ALLOW_BUSY_DEVICE=1. Anything the run")
-        log("  then produces is a SHARED-CARD result: timings are PROVISIONAL and the")
-        log("  evidence is marked as overridden.")
-        return EXIT_BLOCKED
-
-    if occupied and override:
-        log("=" * 72)
-        log("OVERRIDE: TF_ALLOW_BUSY_DEVICE=1 -- proceeding on a card held by others.")
-        log("  Anything below describes a SHARED card, not exclusive use.")
-        log("  Timings are PROVISIONAL; numerics are unaffected by contention.")
-        log("  This override is recorded in the evidence as overriddenBusyDevice=true.")
-        log("=" * 72)
+    if config.get("TF_ALLOW_BUSY_DEVICE") == "1":
+        log("note: legacy TF_ALLOW_BUSY_DEVICE=1 is accepted but NO LONGER NEEDED; a busy")
+        log("      card is allowed by default under HANDOFF section 4.")
 
     # The device must be bound INTO the container. Presence on the host is not
     # enough: a container fixed to device 0 cannot reach device 1, and running
@@ -748,13 +725,9 @@ def gate_device(config: dict, device_id: str, evidence_dir) -> int:
         "assertionInsidePayload": True, # the prefix runs inside the container
         "deviceBoundIntoContainer": True,
         "occupancyReported": True,
-        # Only true when the card was held AND the run was allowed to continue via the
-        # override. Reporting True when the card was free would claim an override that
-        # never happened; reporting False when it was used would hide it.
-        "overriddenBusyDevice": occupied and config.get("TF_ALLOW_BUSY_DEVICE") == "1",
-        # The refusal path returns 75 before this point, so if we are here it was not
-        # taken. Recorded explicitly rather than left as an absent key.
-        "refusedBusyDevice": False,
+        # HANDOFF section 4: busy is RECORDED, never refused. A busy card is allowed and
+        # the run is a SHARED-card result (provisional timings); a free card records false.
+        "busyRecorded": occupied,
     }
     if evidence_dir is not None:
         write_evidence(evidence_dir, "device", {

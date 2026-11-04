@@ -132,10 +132,9 @@
         "assertionInsidePayload": true,
         "deviceBoundIntoContainer": true,
         "occupancyReported": true,
-        "overriddenBusyDevice": true,
-        "refusedBusyDevice": true
+        "busyRecorded": true
       },
-      "description": "Runs one device workload as root inside the container, on an explicitly named device, with the identity assertion executed in-payload. REFUSES to open a card another tenant already holds: occupancy is read first, before torch_npu or aclInit, and a held card yields 75 BLOCKED_ENV. TF_ALLOW_BUSY_DEVICE=1 is the deliberate, recorded override."
+      "description": "Runs one device workload as root inside the container, on an explicitly named device, with the identity assertion executed in-payload. A SHARED card is normal (HANDOFF section 4): occupancy is read first (before torch_npu/aclInit) and a busy card is RECORDED (busyRecorded=true), not refused; timings are provisional. Only health/readability (npu-smi unreadable/failed), identity (device id/binding/in-payload assertion) and ffi errors yield 75 BLOCKED_ENV."
     }
   ],
   "provenance": {
@@ -209,11 +208,11 @@
       ]
     },
     "busyDevicePolicy": {
-      "default": "REFUSE with exit 75 BLOCKED_ENV when another tenant holds the card",
-      "why": "A device open at 13:46:26 was followed 32 s later by a host-wide docker exec stall, with the card already held by other tenants. A failed aclInit still opens the device node, so probing a held card is not a neutral act.",
-      "ordering": "Occupancy is read in gate_device BEFORE torch_npu is imported and before aclInit is reachable, and tests/device_policy.py enforces that order from the AST. A runtime test of the refusal branch would pass even if occupancy were read after a device had already been opened.",
-      "override": "TF_ALLOW_BUSY_DEVICE=1 -- loud banner, recorded as overriddenBusyDevice=true, result is a SHARED-card result with provisional timings",
-      "superseded": "The previous default was the inverse: record occupancy, proceed, and refuse only when TF_REQUIRE_EXCLUSIVE=1. That made walking onto another tenant's card the normal path."
+      "default": "RECORD occupancy and PROCEED: a shared card is normal and busy is allowed (HANDOFF section 4). busyRecorded=true; timings are provisional, numerics unaffected by contention.",
+      "refusalSet": "ONLY health/readability (npu-smi unreadable or failed -> occupancy UNKNOWN), identity (device id, device not bound, in-payload assertion), and ffi errors yield 75 BLOCKED_ENV. Occupancy itself is NEVER a refusal reason.",
+      "ordering": "Occupancy is still read in gate_device BEFORE torch_npu is imported, so a health problem is reported before any device node is opened. tests/device_policy.py enforces: occupancy precedes the probe, and NO branch returns BLOCKED_ENV conditioned on occupied.",
+      "legacy": "TF_ALLOW_BUSY_DEVICE=1 is accepted but no longer needed; a busy card is allowed by default.",
+      "superseded": "The previous policy REFUSED a busy card by default (with TF_ALLOW_BUSY_DEVICE as an override). That contradicted HANDOFF section 4 (shared card multi-user is normal; busy only recorded, never refused) and is replaced."
     },
     "registryStatus": {
       "registeredWithAgentGates": false,

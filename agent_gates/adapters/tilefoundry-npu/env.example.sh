@@ -48,9 +48,10 @@ CONTAINER_USER=s00653124
 # without one and never discovers or substitutes a device.
 DEVICE_ID=
 
-# Occupancy is reported, not enforced: this is a shared server, and a busy card
-# is not a fact about the code under test. Setting this to 1 turns a held card
-# into BLOCKED_ENV (exit 75) -- not a pass, not a failure, no result invented.
+# HANDOFF section 4: a shared card is NORMAL. Occupancy is RECORDED (busyRecorded)
+# and the run proceeds; a busy card is never a refusal reason. Only health/readability,
+# identity and ffi errors yield BLOCKED_ENV (exit 75). TF_REQUIRE_EXCLUSIVE is a legacy
+# key kept for config compatibility and is IGNORED by the gate.
 TF_REQUIRE_EXCLUSIVE=0
 
 # --- optional -------------------------------------------------------------
