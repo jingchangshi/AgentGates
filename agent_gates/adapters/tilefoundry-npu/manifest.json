@@ -1,0 +1,203 @@
+{
+  "schemaVersion": 1,
+  "id": "tilefoundry-npu",
+  "version": "0.1.0",
+  "capabilities": [
+    "build",
+    "regression",
+    "device-regression"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/tilefoundry_gate.py": "b216e690845e25fa32f8e72586363d711fdc02dff01e58b1c429b4b867f51fb4",
+    "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869"
+  },
+  "recipes": [
+    {
+      "id": "tilefoundry-npu.build",
+      "cwd": "source",
+      "timeout": 2400,
+      "device": "none",
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_gate.py",
+        "--build"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_gate.py",
+        "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "tilefoundry-npu.cpu",
+      "cwd": "source",
+      "timeout": 1800,
+      "device": "none",
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_gate.py",
+        "--cpu"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_gate.py",
+        "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "tilefoundry-npu.device",
+      "cwd": "source",
+      "timeout": 1800,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_gate.py",
+        "--device"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_gate.py",
+        "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "tilefoundry-npu-build",
+      "recipeId": "tilefoundry-npu.build",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "imagePresent": true,
+        "containerCreated": true,
+        "recipeReused": true
+      }
+    },
+    {
+      "id": "tilefoundry-npu-cpu",
+      "recipeId": "tilefoundry-npu.cpu",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "ranInsideContainer": true,
+        "inContainerPythonUsed": true,
+        "importOk": true,
+        "analyzeOk": true,
+        "finalizeOk": true,
+        "cpuEqualityRuns": true,
+        "regressionsRun": true,
+        "verifyTirRuns": true,
+        "checkCopySliceRuns": true,
+        "noHostInterpreter": true
+      }
+    },
+    {
+      "id": "tilefoundry-npu-device",
+      "recipeId": "tilefoundry-npu.device",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "explicitDeviceId": true,
+        "ranAsRoot": true,
+        "deviceCountOne": true,
+        "assertionInsidePayload": true,
+        "deviceBoundIntoContainer": true,
+        "occupancyReported": true,
+        "exclusiveBlockedEnv": true
+      }
+    }
+  ],
+  "provenance": {
+    "deprecated": {
+      "/opt/tf-venv": "DEPRECATED and no longer mounted or created. Superseded by the conda env under $HOME/.conda/envs. Nothing under /opt is used.",
+      "tfpy312": "ABANDONED as an interpreter. Never used to run TileFoundry in this adapter. Its site-packages were used once, as plain files, to seed an earlier environment; that environment is itself superseded and removed."
+    },
+    "environment": {
+      "path": "/home/s00653124/.conda/envs/tilefoundry-npu",
+      "manager": "conda",
+      "channel": "conda-forge (repo.anaconda.com requires an interactive ToS acceptance, which is a legal agreement and was not accepted on the user behalf)",
+      "python": "3.12.16",
+      "durability": "under /home, which is bind-mounted, so it survives container recreation without reinstall",
+      "status": "BUILT BUT NOT APPROVED. The packages are installed and z3 was verified by solving. No canonical verification (analyze/finalize/tool suite) has run against this interpreter in a working container, so no result may cite it as evidence yet."
+    },
+    "packages": {
+      "torch": {
+        "version": "2.12.0+cpu",
+        "source": "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl"
+      },
+      "torch_npu": {
+        "version": "2.12.0",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "z3-solver": {
+        "version": "5.3.3.0",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "isl-python": {
+        "version": "0.1.11",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "jinja2": {
+        "version": "3.1.6",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "graphviz": {
+        "version": "0.21",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "apache-tvm-ffi": {
+        "version": "0.1.15.post2",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "ortools": {
+        "version": "9.15.6755",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      },
+      "numpy": {
+        "version": "2.5.4",
+        "source": "https://mirrors.aliyun.com/pypi/simple/"
+      }
+    },
+    "network": {
+      "direct": "~58 KB/s",
+      "viaProxy": "~1.7 MB/s",
+      "ratio": "~30x",
+      "proxySetup": "source /home/s00653124/set_proxy.sh on the host, then pass http_proxy, https_proxy and no_proxy into docker exec with -e. The proxy listens on 127.0.0.1:17890 and the container uses --network host, so loopback is shared."
+    },
+    "ordering": {
+      "fixed": [
+        ". /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh",
+        ". /data/miniconda3/etc/profile.d/conda.sh && conda activate <env>",
+        "export ASCEND_RT_VISIBLE_DEVICES=<id>",
+        "import torch / import torch_npu"
+      ],
+      "observedFailure": "Without CANN sourced first: ImportError: libhccl.so: cannot open shared object file, from torch_npu/npu/utils.py importing torch_npu._C. With CANN sourced first: torch_npu 2.12.0 imports, exit 0. Both directions observed.",
+      "traps": [
+        "set_env.sh breaks under set -u (expands unset LD_LIBRARY_PATH, PYTHONPATH, CMAKE_PREFIX_PATH)",
+        "the path is /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh, not .../cann-9.2.0/set_env.sh"
+      ]
+    }
+  }
+}
