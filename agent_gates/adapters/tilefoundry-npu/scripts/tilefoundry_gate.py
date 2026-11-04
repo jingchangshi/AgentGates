@@ -38,7 +38,7 @@ EXIT_PASS, EXIT_FAIL, EXIT_CONFIG, EXIT_BLOCKED, EXIT_ASSERT = 0, 1, 2, 75, 97
 
 KNOWN_KEYS = {
     "TF_REPO", "IMAGE", "CONTAINER_NAME", "CANN_ROOT", "IN_CONTAINER_PYTHON",
-    "CONTAINER_USER", "DEVICE_ID", "TF_REQUIRE_EXCLUSIVE", "TF_VENV", "TF_WORKSPACE",
+    "CONTAINER_USER", "CONTAINER_UID", "DEVICE_ID", "TF_REQUIRE_EXCLUSIVE", "TF_VENV", "TF_WORKSPACE",
     "TF_ALLOW_BUSY_DEVICE",
     "TF_NPU_ENV", "CONDA_SH", "VENDOR_WHEELS", "TF_CONDA_ENV",
     "CANN_SET_ENV", "PROXY_SH",
@@ -228,111 +228,273 @@ CPU_TOOLS = [
     ("check_copy_slice", "examples/rmsnorm_950pr/tools/check_copy_slice.py"),
 ]
 
+#: A challenge only a real Python can answer.
+#:
+#: The Gate used to accept exit-code-only success, and the Architect reproduced a
+#: FALSE PASS with IN_CONTAINER_PYTHON=/bin/true: every check "passed" because
+#: /bin/true exits 0 and nothing ran. So the interpreter must prove what it is.
+#: /bin/true prints nothing, fails to produce this JSON, and is refused.
+_CHALLENGE_SALT = "tf-gate-identity:"
+_EXPECTED_CHALLENGE = hashlib.sha256(
+    (_CHALLENGE_SALT + str(sum(range(1000)))).encode()
+).hexdigest()
+
+IDENTITY_SCRIPT = (
+    "import sys,os,json,hashlib;print(json.dumps({"
+    "'executable':os.path.realpath(sys.executable),"
+    "'version':'%d.%d'%sys.version_info[:2],"
+    "'challenge':hashlib.sha256(('" + _CHALLENGE_SALT + "'+str(sum(range(1000)))).encode()).hexdigest()"
+    "}))"
+)
+
+
+def container_read_text(config: dict, path: str, *, user: str | None = None):
+    """Read a file from the container. Returns (ok, text)."""
+    result = container_exec(config, ["cat", path], user=user)
+    return result.returncode == 0, result.stdout
+
+
+def _last_json_line(text: str):
+    for line in reversed([l for l in (text or "").splitlines() if l.strip()]):
+        try:
+            return json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def identity_verdict(info, configured_python):
+    """Decide, from the parsed identity, whether this interpreter is acceptable.
+
+    Split out as a pure function so it can be UNIT-TESTED WITHOUT A CONTAINER.
+    That matters: the failure this guards against is a config pointing at a
+    non-interpreter, and a test for it must be runnable where such a config is
+    harmless. /bin/true yields info=None here and is refused.
+    """
+    if info is None:
+        return False, {
+            "executableMatches": False,
+            "versionIsPython3": False,
+            "challengeMatches": False,
+            "why": "no identity JSON: not a Python interpreter (e.g. /bin/true)",
+        }
+    try:
+        want_exec = os.path.realpath(configured_python)
+    except Exception:  # noqa: BLE001
+        want_exec = configured_python
+    version = info.get("version")
+    checks = {
+        "executableMatches": info.get("executable") == want_exec,
+        "versionIsPython3": isinstance(version, str)
+        and version.split(".")[0].isdigit()
+        and int(version.split(".")[0]) >= 3,
+        "challengeMatches": info.get("challenge") == _EXPECTED_CHALLENGE,
+    }
+    return all(checks.values()), checks
+
+
+def tool_report_ok(name, returncode, report):
+    """A tool "ran" only if it emitted a structured PASS report.
+
+    Pure, so it is unit-testable without a container. Exit 0 with a missing or
+    non-PASS report is a FAILURE: a tool that exits 0 and prints nothing is exactly
+    the vacuous success this Gate exists to refuse.
+    """
+    ok = (
+        returncode == 0
+        and report is not None
+        and report.get("status") == "PASS"
+        and report.get("exit_code") == 0
+    )
+    if name == "cpu_equality" and report is not None:
+        cases = report.get("cases") or []
+        ok = ok and bool(cases) and all(
+            c.get("status") == "PASS" and all((c.get("checks") or {}).values())
+            for c in cases
+        )
+    if name == "check_copy_slice" and report is not None:
+        checks = report.get("checks") or {}
+        ok = (ok and bool(checks.get("two_copies"))
+              and bool(checks.get("one_smem_buffer"))
+              and bool(checks.get("stages_through_same_buffer")))
+    return ok
+
+
+def check_interpreter_identity(config, python, env, user):
+    """Prove the configured interpreter is a real Python at the expected path."""
+    result = container_exec(config, [python, "-c", IDENTITY_SCRIPT], user=user, env=env)
+    info = _last_json_line(result.stdout)
+    ok, checks = identity_verdict(info, python)
+    detail = {
+        "configured": python,
+        "returncode": result.returncode,
+        "stdout_bytes": len(result.stdout or ""),
+        "observed": info,
+        "checks": checks,
+        "expected_challenge": _EXPECTED_CHALLENGE,
+    }
+    if info is None:
+        detail["why"] = (
+            "the interpreter produced no JSON. It did not run Python: this is what a"
+            " non-interpreter such as /bin/true looks like, and it must not pass."
+        )
+    return ok, detail
+
+
 def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
-    """The CPU Gate: everything runs through docker exec as the container user."""
-    # The guard sits on the path that would run the toolchain, so a later edit
-    # cannot bypass it by adding an entry point that forgets to check.
+    """The CPU Gate: every claim is read from evidence, not from an exit code."""
     assert_not_host("the CPU Gate")
     if not container_exists(config):
         raise GateError(
             "container %s does not exist; run the build Gate first"
-            % config["CONTAINER_NAME"],
-            EXIT_BLOCKED,
+            % config["CONTAINER_NAME"], EXIT_BLOCKED,
         )
     repo = config["TF_REPO"]
     python = in_container_python(config)
     user = config["CONTAINER_USER"]
-    # TORCH_DEVICE_BACKEND_AUTOLOAD=0 is REQUIRED, not an optimisation. torch
-    # autoloads the torch_npu backend, which needs CANN sourced; without CANN the
-    # import dies with "Failed to load the backend extension: torch_npu". A CPU Gate
-    # must not load a device backend at all -- doing so would reach the device stack
-    # as a side effect of a run that claims to be CPU-only. Discovered by running the
-    # Gate rather than reading it: cpu_equality and check_copy_slice failed until
-    # this was set.
+    expected_uid = int(config.get("CONTAINER_UID", "1071"))
     env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
     failures = 0
+    workdir = "/tmp/tfgate"
 
-    # 1. The interpreter is the container's, and it can import TileFoundry.
-    log("--- the in-container interpreter ---")
-    version = container_exec(config, [python, "--version"], user=user, env=env)
-    if version.returncode != 0:
+    # 1. ACTUAL uid. The configured user string is NOT evidence: inside the
+    #    container the exec helper's user argument is a no-op, so "ran as X" must
+    #    be read from the process, not asserted from configuration.
+    log("--- actual identity ---")
+    uid_result = container_exec(config, ["id", "-u"], user=user)
+    uid_text = (uid_result.stdout or "").strip()
+    actual_uid = int(uid_text) if uid_result.returncode == 0 and uid_text.isdigit() else None
+    if actual_uid is None:
         raise GateError(
-            "the in-container interpreter is not usable: %s (exit %d)"
-            % (python, version.returncode), EXIT_BLOCKED,
+            "could not read the actual uid inside the container (id -u returned %r)"
+            % uid_text, EXIT_BLOCKED,
         )
-    imported = container_exec(
-        config, [python, "-c", "import tilefoundry; print('tilefoundry import ok')"],
-        user=user, env=env,
-    )
-    if imported.returncode != 0:
+    log("actual uid = %d (expected %d, must be non-root)" % (actual_uid, expected_uid))
+
+    # 2. Interpreter identity challenge. A config pointing at /bin/true dies here.
+    ident_ok, ident_detail = check_interpreter_identity(config, python, env, user)
+    if not ident_ok:
+        log("FAIL interpreter identity: " + json.dumps(ident_detail))
         failures += 1
 
-    # 2. analyze and finalize, the two things every later Gate depends on.
-    log("--- analyze / finalize ---")
+    # 3. Import both roots, and require the success token in the OUTPUT, not just
+    #    exit 0: a process that exits 0 without printing is not proof of an import.
+    imported = container_exec(
+        config,
+        [python, "-c",
+         "import tilefoundry, tilefoundry_ascend; print('IMPORT-OK', tilefoundry.__file__)"],
+        user=user, env=env,
+    )
+    import_ok = imported.returncode == 0 and "IMPORT-OK" in (imported.stdout or "")
+    if not import_ok:
+        failures += 1
+
+    # 4. analyze: require HIR in the OUTPUT, not merely exit 0.
     analyze = container_exec(
         config, [python, "-m", "tilefoundry.cli", "analyze",
                  "%s/examples/rmsnorm_950pr/copy_slice.py:CopySlice" % repo],
         user=user, env=env,
     )
-    failures += analyze.returncode != 0
-
-    with_list = ["schedule", "finalize",
-                 "%s/examples/rmsnorm_950pr/copy_slice.py:CopySlice" % repo,
-                 "/tmp/tf_gate_tir.py"]
-    finalize = container_exec(
-        config, [python, "-m", "tilefoundry.cli"] + with_list, user=user, env=env,
+    analyze_ok = (
+        analyze.returncode == 0
+        and "@func" in (analyze.stdout or "")
+        and "copy1" in (analyze.stdout or "")
     )
-    failures += finalize.returncode != 0
+    if not analyze_ok:
+        failures += 1
 
-    # 3. The tool suite, one record per tool. A tool that cannot run is a
-    #    failure, not a skip: a suite that quietly omits a check is a suite
-    #    whose PASS does not mean what its name says.
+    # 5. finalize: the TYPED artifact must exist and look like finalized TIR, with a
+    #    recorded hash and size. "exit 0" alone could mean an empty file was written.
+    container_exec(config, ["mkdir", "-p", workdir], user=user)
+    tir_path = workdir + "/tir.py"
+    finalize = container_exec(
+        config, [python, "-m", "tilefoundry.cli", "schedule", "finalize",
+                 "%s/examples/rmsnorm_950pr/copy_slice.py:CopySlice" % repo, tir_path],
+        user=user, env=env,
+    )
+    tir_read_ok, tir_text = container_read_text(config, tir_path, user=user)
+    tir_sha = hashlib.sha256((tir_text or "").encode()).hexdigest() if tir_read_ok else None
+    finalize_ok = (
+        finalize.returncode == 0
+        and tir_read_ok
+        and len(tir_text or "") > 200
+        and "@prim_func" in (tir_text or "")
+        and "tensor_view" in (tir_text or "")
+    )
+    if not finalize_ok:
+        failures += 1
+
+    # 6. The tool suite. Each tool must emit a STRUCTURED report whose status is PASS
+    #    and whose exit_code is 0, plus the tool-specific fields its own report
+    #    carries. A bare exit 0 is not a result.
     log("--- tool suite ---")
     tool_status = {}
+    tool_reports = {}
     for name, relative in CPU_TOOLS:
         target = "%s/%s" % (repo, relative)
-        exists = container_exec(config, ["test", "-f", target], user=user)
-        if exists.returncode != 0:
-            log("FAIL %s: tool absent at %s" % (name, target))
-            failures += 1
-            tool_status[name] = False
-            continue
-        record = container_exec(config, [python, target], user=user, env=env)
-        tool_status[name] = record.returncode == 0
-        if record.returncode != 0:
-            log("FAIL %s: exit %d" % (name, record.returncode))
-            failures += 1
-        else:
+        out_path = "%s/%s.json" % (workdir, name)
+        record = container_exec(config, [python, target, "--out", out_path], user=user, env=env)
+        read_ok, text = container_read_text(config, out_path, user=user)
+        report = None
+        if read_ok:
+            try:
+                report = json.loads(text)
+            except Exception:  # noqa: BLE001
+                report = None
+        tool_reports[name] = {
+            "returncode": record.returncode,
+            "report_present": report is not None,
+            "status": (report or {}).get("status"),
+            "exit_code": (report or {}).get("exit_code"),
+        }
+        ok = tool_report_ok(name, record.returncode, report)
+        tool_status[name] = ok
+        if ok:
             print("PASS %s" % name)
+        else:
+            log("FAIL %s: " + json.dumps(tool_reports[name]))
+            failures += 1
 
-    # These keys are exactly the ones manifest.json declares as observationChecks.
-    # A manifest that names a check the script never reports is a gate whose PASS
-    # rests on a field nobody produced. tests/manifest_parity.py enforces the match.
+    tool_reports_ok = bool(tool_status) and all(tool_status.values())
+
     observations = {
         "exitCodeZero": failures == 0,
-        "ranInsideContainer": True,     # every command went through docker exec
-        "inContainerPythonUsed": True,  # the interpreter path is a container path
-        "importOk": imported.returncode == 0,
-        "analyzeOk": analyze.returncode == 0,
-        "finalizeOk": finalize.returncode == 0,
+        "ranInsideContainer": inside_container(),
+        "inContainerPythonUsed": ident_ok,
+        "importOk": import_ok,
+        "analyzeOk": analyze_ok,
+        "finalizeOk": finalize_ok,
         "cpuEqualityRuns": tool_status.get("cpu_equality", False),
         "regressionsRun": tool_status.get("regressions", False),
         "verifyTirRuns": tool_status.get("verify_tir", False),
         "checkCopySliceRuns": tool_status.get("check_copy_slice", False),
-        "noHostInterpreter": True,      # assert_not_host ran before anything else
+        "noHostInterpreter": True,
+        "interpreterIdentityOk": ident_ok,
+        "actualUidIsExpected": actual_uid == expected_uid and actual_uid != 0,
+        "toolReportsStructured": tool_reports_ok,
+        "finalizedArtifactTyped": finalize_ok,
     }
     if evidence_dir is not None:
         write_evidence(evidence_dir, "cpu", {
             "container": config["CONTAINER_NAME"],
             "image": config["IMAGE"],
             "python": python,
-            "ran_as": user,
+            "configured_user": user,
+            "ran_as_uid": actual_uid,
+            "expected_uid": expected_uid,
+            "interpreter": ident_detail.get("observed"),
+            "interpreter_checks": ident_detail.get("checks"),
+            "finalized_artifact": {"sha256": tir_sha,
+                                   "bytes": len(tir_text or "") if tir_read_ok else 0,
+                                   "path": tir_path},
+            "tool_reports": tool_reports,
             "failures": failures,
             "observations": observations,
         })
     log("cpu gate: %s" % ("PASS" if failures == 0 else "FAIL"))
     return EXIT_PASS if failures == 0 else EXIT_FAIL
+
 # ---------------------------------------------------------------- device Gate
 
 def device_assertion_prefix(expected: str) -> str:

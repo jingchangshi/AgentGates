@@ -81,6 +81,39 @@ Direct access is ~58 KB/s. Through the host proxy it is ~1.7 MB/s, about 30x, an
 torch alone is 184 MB. `setup-tf-env.sh` reads the proxy exports from `PROXY_SH`
 and injects them into `docker exec` with `-e`.
 
+## What this evidence is, and is not
+
+The Gate writes a local JSON report. That report is NOT a verified service receipt,
+and this adapter is NOT registered with the AgentGates service.
+
+- list_workspaces on the agentgates server returns the workspaces ascendnpu-ir and
+  tilelang. It does NOT list tilefoundry-npu. There is no server-side gate record for
+  this adapter, and no run id exists for it.
+- Consequently the JSON under --evidence-dir is this process describing itself. It is
+  inspectable evidence that a run happened and what it observed, but it carries no
+  independent attestation. Treat it as a local artifact signed by nobody, not a receipt.
+
+What the CPU Gate DOES now guarantee, because each item below was broken once and is
+now checked from evidence rather than from an exit code:
+
+  interpreter identity challenge   refuses a config pointing IN_CONTAINER_PYTHON at
+                                   /bin/true (the reproduced FALSE PASS: exit 0, every
+                                   field true, nothing run)
+  structured per-tool reports      refuses a tool that exits 0 but emits no PASS report,
+                                   or a report whose status/exit/checks disagree
+  typed finalized artifact         refuses finalize exiting 0 without producing
+                                   parseable TIR (hash and size recorded)
+  actual in-container uid          refuses ran_as being a configured string; the uid is
+                                   read with id -u and must be non-root and equal to
+                                   CONTAINER_UID
+
+Both the identity and the report checks have NEGATIVE tests that prove the refusal
+fires (tests/identity_check.py, tests/tool_report_check.py), because a check that
+cannot fail is the exact defect this section exists to prevent.
+
+An M3 acceptance receipt produced elsewhere in this session remains valid on its own
+terms; it is independent of this adapter, and this adapter's gaps did not touch it.
+
 ## The Gate had never been run, and did not work
 
 This adapter shipped with 14 negatives and a parity test, all green — and its primary

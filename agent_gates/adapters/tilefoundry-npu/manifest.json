@@ -16,8 +16,10 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_gate.py": "bdbbfa8db17d0f429eefb0cffe32b8ef521de619b50828e3be439067c3636c6b",
-    "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869"
+    "scripts/tilefoundry_gate.py": "3381d6bec2be515abce5f1c3b87c280a65e66cd7a057c84157a3ae313a91bd67",
+    "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
+    "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",
+    "tests/tool_report_check.py": "53937914a1656365c0cf8bf67f93292aad089b98fb9da36af66f94f6d5fe20ef"
   },
   "recipes": [
     {
@@ -110,8 +112,13 @@
         "regressionsRun": true,
         "verifyTirRuns": true,
         "checkCopySliceRuns": true,
-        "noHostInterpreter": true
-      }
+        "noHostInterpreter": true,
+        "interpreterIdentityOk": true,
+        "actualUidIsExpected": true,
+        "toolReportsStructured": true,
+        "finalizedArtifactTyped": true
+      },
+      "description": "CPU Gate: interpreter identity challenge, structured per-tool reports, actual in-container uid, and a typed finalized artifact -- each read from evidence, not from an exit code. Exit 0 with nothing run is a FAIL."
     },
     {
       "id": "tilefoundry-npu-device",
@@ -207,6 +214,11 @@
       "ordering": "Occupancy is read in gate_device BEFORE torch_npu is imported and before aclInit is reachable, and tests/device_policy.py enforces that order from the AST. A runtime test of the refusal branch would pass even if occupancy were read after a device had already been opened.",
       "override": "TF_ALLOW_BUSY_DEVICE=1 -- loud banner, recorded as overriddenBusyDevice=true, result is a SHARED-card result with provisional timings",
       "superseded": "The previous default was the inverse: record occupancy, proceed, and refuse only when TF_REQUIRE_EXCLUSIVE=1. That made walking onto another tenant's card the normal path."
+    },
+    "registryStatus": {
+      "registeredWithAgentGates": false,
+      "why": "list_workspaces returns ascendnpu-ir and tilelang; tilefoundry-npu is not listed. No server-side gate record or run id exists for this adapter, so the local evidence JSON is not a verified service receipt.",
+      "localJsonIs": "self-described evidence from the gate process, with no independent attestation"
     }
   }
 }

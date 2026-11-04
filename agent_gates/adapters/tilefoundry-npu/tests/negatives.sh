@@ -142,6 +142,18 @@ echo "== busy-device policy: refusal first, and by default =="
 
 expect 0 "busy-device policy holds (order + default + override)" \
     python3 "$HERE/device_policy.py"
+echo "== a non-interpreter must be refused, not passed =="
+
+# The Architect's FALSE PASS: IN_CONTAINER_PYTHON=/bin/true gave exit 0 with every
+# field true and nothing ran. This proves the identity check refuses /bin/true.
+expect 0 "interpreter identity refuses /bin/true" \
+    python3 "$HERE/identity_check.py"
+
+echo "== exit 0 with no structured report is a failure =="
+
+expect 0 "tool reports must be structured PASS, not bare exit 0" \
+    python3 "$HERE/tool_report_check.py"
+
 echo "== manifest and script agree on every check =="
 
 # Static, so it needs no container. Drift between the declared observationChecks and
