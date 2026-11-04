@@ -81,6 +81,35 @@ Direct access is ~58 KB/s. Through the host proxy it is ~1.7 MB/s, about 30x, an
 torch alone is 184 MB. `setup-tf-env.sh` reads the proxy exports from `PROXY_SH`
 and injects them into `docker exec` with `-e`.
 
+## Every test here has been made to fail
+
+A test that cannot fail certifies nothing, and it is worse than no test because it
+produces confidence. Three checks in this adapter were written, passed, and were then
+found to be incapable of failing:
+
+| check | why it could not fail | what replaced it |
+|---|---|---|
+| busy-card refusal (grep) | reverting the refusal to the opt-in form keeps every string a grep looks for, so it passed on the regression it existed to catch | `tests/device_policy.py`, reading the AST and asserting ORDER and DEFAULT |
+| manifest/script parity (first version) | read only inline dicts, so it found zero keys and compared two empty sets | name resolution to the nearest assignment *before* each call |
+| manifest/script parity (second version) | resolved to the last assignment in the file, so every Gate reported the final Gate's keys | position-scoped resolution |
+
+The rule that follows: **prove the test fails before trusting it to pass.** Each of the
+above was confirmed by deliberately breaking the thing it watches and observing the
+failure, then restoring it. Those negative controls are part of the record:
+
+```
+opt-in revert            -> FAIL "the refusal is conditional on an opt-in flag" (1)
+occupancy moved later    -> FAIL on order (1)
+one declared key deleted -> FAIL "declared but never reported: importOk" (1)
+restored                 -> 0
+```
+
+This matters most for properties a runtime assertion cannot observe. "A held card
+returns 75" is testable at runtime; "occupancy is read **before** the device is opened"
+and "the refusal is not conditional on an opt-in flag" are not, because both are about
+code that has not run yet. Grep is not enough for those either — the regression they
+guard against is a change of *structure* that preserves every string. Hence the AST.
+
 ## Provision
 
 ```bash
