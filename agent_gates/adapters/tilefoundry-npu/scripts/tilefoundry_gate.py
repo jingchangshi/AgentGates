@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -490,12 +491,54 @@ def assert_not_host(operation: str) -> None:
 
 # ------------------------------------------------------------------- docker io
 
+def bounded_call(argv: list, timeout: int, *, env: dict | None = None,
+                 kill_grace: int = 5) -> dict:
+    """Run a command with a bound that survives an UNKILLABLE child.
+
+    Measured hang this exists for: docker inspect and a toolchain version probe
+    blocked in uninterruptible sleep (D) behind a neighbouring tenant's device job.
+    subprocess.run(timeout=...) kills the child and then WAITS for it, so a D-state
+    child makes the "timeout" unbounded -- the call that was supposed to be bounded
+    is exactly the one that never returns. Here the child gets its own process
+    group, the group is killed, and if it still has not exited the pipes are closed
+    and the child is abandoned. The caller turns that into a NAMED refusal; an
+    unreaped child is reported, never hidden.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True, env=env)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return {"rc": proc.returncode, "out": out, "err": err, "timed_out": False,
+                "unreaped": False, "pid": proc.pid}
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            out, err = proc.communicate(timeout=kill_grace)
+            return {"rc": proc.returncode, "out": out, "err": err, "timed_out": True,
+                    "unreaped": False, "pid": proc.pid}
+        except subprocess.TimeoutExpired:
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"rc": None, "out": "", "err": "", "timed_out": True,
+                    "unreaped": True, "pid": proc.pid}
+
+
 def run(argv: list, timeout: int = 1800, check: bool = False,
         env: dict | None = None, echo_stdout: bool = True) -> subprocess.CompletedProcess:
     log("$ " + " ".join(argv))
-    completed = subprocess.run(
-        argv, capture_output=True, text=True, timeout=timeout, check=False, env=env,
-    )
+    bounded = bounded_call(argv, timeout=timeout, env=env)
+    if bounded["timed_out"]:
+        # Preserve the contract the callers already speak: a timeout is raised,
+        # never returned as an empty success. The wait itself is now bounded too.
+        raise subprocess.TimeoutExpired(argv, timeout)
+    completed = subprocess.CompletedProcess(argv, bounded["rc"],
+                                            bounded["out"], bounded["err"])
     if completed.stdout and echo_stdout:
         print(completed.stdout, end="", file=sys.stderr)
     if completed.stderr:
@@ -531,11 +574,18 @@ def container_exists(config: dict) -> bool:
         # We are in the container; there is nothing to ask docker about, and no
         # docker binary to ask it with.
         return True
-    result = subprocess.run(
-        ["docker", "inspect", config["CONTAINER_NAME"]],
-        capture_output=True, text=True, check=False,
-    )
-    return result.returncode == 0
+    bounded = bounded_call(["docker", "inspect", config["CONTAINER_NAME"]],
+                           timeout=60)
+    if bounded["timed_out"]:
+        # NOT "absent". A daemon that did not answer has told us nothing, and
+        # reporting it as absent would send the caller down the CREATE path --
+        # the one action that must never be taken on an unknown shared container.
+        raise GateError(
+            "DOCKER_INSPECT_TIMEOUT: docker did not answer within 60s (unreaped=%s); "
+            "the existence of container %r was NOT determined"
+            % (bounded["unreaped"], config["CONTAINER_NAME"]),
+            EXIT_BLOCKED)
+    return bounded["rc"] == 0
 
 def in_container_python(config: dict) -> str:
     return config["IN_CONTAINER_PYTHON"]
@@ -1995,7 +2045,7 @@ def compile_profile_payload() -> str:
     that codegen ran or that generated code is correct.
     """
     return r"""
-import os, json, hashlib, subprocess
+import os, json, hashlib, signal, subprocess
 
 def sha256_file(path):
     try:
@@ -2023,12 +2073,49 @@ def tree_digest(root):
                 continue
     return digest.hexdigest(), count
 
-def tool_version(argv):
+def bounded_call(argv, timeout, kill_grace=5):
+    # Run a command with a bound that survives an UNKILLABLE child (D state):
+    # subprocess.run(timeout=...) kills the child and then WAITS for it, so the
+    # wait is unbounded exactly when the child cannot die. Own process group,
+    # kill the group, and abandon an unreaped child after a short grace.
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-        return (done.stdout or done.stderr or "").splitlines()[0].strip()
-    except (OSError, subprocess.SubprocessError) as exc:
+        out, err = proc.communicate(timeout=timeout)
+        return {"rc": proc.returncode, "out": out, "err": err,
+                "timed_out": False, "unreaped": False}
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            out, err = proc.communicate(timeout=kill_grace)
+            return {"rc": proc.returncode, "out": out, "err": err,
+                    "timed_out": True, "unreaped": False}
+        except subprocess.TimeoutExpired:
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            return {"rc": None, "out": "", "err": "", "timed_out": True,
+                    "unreaped": True}
+
+def tool_version(argv):
+    # A D-state toolchain probe must not make the profile capture unbounded.
+    # bounded_call bounds the wait; an abandoned child is NAMED, not silently
+    # reported as a tool that printed nothing.
+    try:
+        bounded = bounded_call(argv, timeout=30)
+    except OSError as exc:
         return "UNAVAILABLE: %s" % exc
+    if bounded["timed_out"]:
+        return "UNAVAILABLE: timed out after 30s (unreaped=%s)" % bounded["unreaped"]
+    lines = (bounded["out"] or bounded["err"] or "").splitlines()
+    if lines:
+        return lines[0].strip()
+    return "UNAVAILABLE: rc=%s" % (bounded["rc"],)
 
 profile = {"roots": {}, "libraries": {}, "tools": {}, "unavailable": []}
 for root in ("src/tilefoundry", "targets/ascend/tilefoundry_ascend"):

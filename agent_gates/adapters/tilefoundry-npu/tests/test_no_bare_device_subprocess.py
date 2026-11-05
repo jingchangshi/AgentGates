@@ -15,13 +15,12 @@ PACK = Path(__file__).resolve().parents[1]
 SCRIPTS = PACK / "scripts"
 
 #: Modules that touch the device (or launch children that do).
-#: verify_environment.py is the module that launches device probes, so it is the one
-#: this rule MUST cover. tilefoundry_gate.py still holds two direct calls
-#: (container_exists: docker inspect without a timeout, tool_version: timeout+wait on a
-#: child that may be in D state); that is recorded as C9 and is fixed in that batch, not
-#: silently allowlisted here -- adding it to ALLOWLIST would hide exactly the hazard
-#: this test exists for.
-DEVICE_MODULES = ("verify_environment.py",)
+#: verify_environment.py launches the device probes; tilefoundry_gate.py runs docker
+#: inspect and the toolchain version probes. Both must bound their children: a
+#: subprocess.run(timeout=...) kills and then WAITS, so a D-state child makes the
+#: timeout unbounded. C9 removed the two remaining call sites in gate.py; the
+#: allowlist stays empty so a new one has to be justified in review.
+DEVICE_MODULES = ("verify_environment.py", "tilefoundry_gate.py")
 
 #: Sites still allowed to call subprocess.run directly. Empty on purpose: a new entry
 #: has to be justified in review, which is the point.
@@ -64,6 +63,33 @@ def test_no_bare_subprocess_run_in_device_modules() -> None:
     assert not offenders, (
         "device modules must call bounded_run(), not subprocess.run(timeout=...), "
         "because that timeout does not bound a D-state child: " + ", ".join(offenders))
+
+
+def test_the_embedded_compile_profile_payload_uses_bounded_calls() -> None:
+    """gate.py ships a Python program as an r-string; the AST cannot see inside it.
+
+    compile_profile_payload() runs in the container and probes toolchain versions.
+    Those probes must not use subprocess.run(timeout=...) either, so the embedded
+    text is checked separately: comments may NAME the pattern, code may not call it.
+    """
+    import ast as _ast
+
+    source = (SCRIPTS / "tilefoundry_gate.py").read_text(encoding="utf-8")
+    payloads = [node.value for node in _ast.walk(_ast.parse(source))
+                if isinstance(node, _ast.Constant)
+                and isinstance(node.value, str)
+                and "def tool_version" in node.value]
+    assert payloads, "the compile-profile payload was not found"
+    for payload in payloads:
+        code_lines = [line for line in payload.splitlines()
+                      if not line.strip().startswith("#")]
+        offenders = [line for line in code_lines if "subprocess.run(" in line]
+        assert not offenders, (
+            "the embedded compile-profile payload still calls subprocess.run: %r"
+            % offenders)
+        assert "def bounded_call(" in payload, (
+            "the embedded payload has no bounded_call helper, so a D-state tool "
+            "probe would be unbounded")
 
 
 def test_verify_environment_honours_the_test_lock_override() -> None:
