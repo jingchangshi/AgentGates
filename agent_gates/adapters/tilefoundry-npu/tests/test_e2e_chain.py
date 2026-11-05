@@ -59,8 +59,17 @@ PAYLOAD_OK = json.dumps({
 EXPOSED = "/dev/davinci0\n/dev/davinci1\n/dev/davinci_manager\n"
 
 
-class SkipCase(Exception):
-    """Not a failure: this case is OPT-IN and was not requested."""
+import unittest
+
+
+class SkipCase(unittest.SkipTest):
+    """Not a failure: this case is OPT-IN and was not requested.
+
+    unittest.SkipTest, not Exception: under pytest a plain Exception is reported as
+    FAILED, so a deliberate skip would look like a defect and would make the suite
+    indistinguishable from a real failure. The local runner below still catches
+    SkipCase explicitly and counts it as skipped.
+    """
 
 
 SKIP = []
