@@ -289,6 +289,33 @@ Rules (H addendum: attribution is strict):
 TFNU_PROBE_OVERRIDE (e.g. 0=unresponsive,1=responsive) is a TEST seam for the
 two failover negatives; every simulated attempt carries simulated=true.
 
+## H device harness (adapter side, harness-run/1)
+
+The H harness is a thin layer over the canonical device entry; it never opens a second
+ENV path and never substitutes a generic add for an unregistered workload.
+
+- **Workloads** are registered by ID with a canonical recipe + X mode + output spec;
+  an unknown ID is `UNSUPPORTED_WORKLOAD`, and any other/generic entry is
+  `NON_CANONICAL_DEVICE_ENTRY`.
+- **Scope is separate from selection**: `SELECT_ONE` reports only the selected card;
+  `ALL_REQUESTED` requires a real, distinct output for every requested physical id,
+  otherwise `DEVICE_COVERAGE_MISMATCH` (another card never substitutes).
+- **Failover is pre-launch only**: only a driver probe that is `timed_out + unreaped +
+  driver wchan` may move to another card. Once launch starts, a timeout/error/numeric
+  failure is `LAUNCH_FAILED`/`SYNC_FAILED`/`NUMERIC_MISMATCH` in the original
+  scope; it is **not** retried elsewhere.
+- Phases, raw actual inputs + eps f32 bits, raw outputs, and the four artifact
+  identities `source/CCE/binary/load` (OBSERVED or UNOBSERVED) are written under the
+  run directory; every case gets its own directory.
+- **FINISHED is not PASS**: `finished` means the run ended, including failures;
+  `passed` additionally requires all required phases, complete coverage, observed
+  artifact identities, raw output bytes, and a passing T report. Exit 0, a finished
+  flag, an all-skipped run, or a stale payload cannot pass.
+- Local evidence and any AgentGates service execution/receipt are separate fields; an
+  unregistered local run reports `service_receipt=None` and never invents a run id.
+- CPU verify stays `--skip-device` by default; a device recipe needs an explicit
+  `allow_device=True` request.
+
 ## What a PASS does not mean
 
 - **It is not device attestation.** The receipt is written by the same process
