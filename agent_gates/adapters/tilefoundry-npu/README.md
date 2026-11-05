@@ -327,6 +327,11 @@ interpreter prefix and the tilelang/apache-tvm-ffi/z3-solver triple and fails by
 (`ABI_PREFLIGHT_INTERPRETER`, `ABI_PREFLIGHT_VERSION`, `ABI_PREFLIGHT_SHA`) instead of
 running tests in the wrong ABI. See `envs/ENVIRONMENT.md`.
 
+**sitecustomize caveat:** `sitecustomize.py` prepends the tfnpu-v2
+site-packages. If tfnpu-v2 ever gains pytest, it would shadow tfnpu-dev's pinned
+pytest. Keep tfnpu-v2 free of test tooling (the rule), or make sitecustomize
+explicitly preserve the dev pytest path.
+
 ## What a PASS does not mean
 
 - **It is not device attestation.** The receipt is written by the same process
