@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "comment": [
+    "The tracked DEPLOYMENT PROFILE for the tilefoundry-npu adapter.",
+    "This is the versioned half of the deployment contract: it states what a",
+    "correct deployment must look like, so git show can answer whether a given",
+    "deployment was right without the machine-local, git-ignored env.sh.",
+    "It contains no secrets, no host paths and no usernames. Local paths live in",
+    "env.sh and their key-set is hashed per run as effective_config_sha256, so a",
+    "run that used a different configuration is detectable without publishing it."
+  ],
+  "required_image_name": "tilefoundry-ascend950pr-dev:24.04",
+  "required_control_nodes": ["/dev/davinci_manager", "/dev/hisi_hdc"],
+  "required_driver_libraries": ["libc_sec.so", "libascend_hal.so", "libdrvdsmi_host.so"],
+  "device_node_pattern": "/dev/davinci[0-9]+",
+  "device_work_user": "root",
+  "must_source_cann_before_npu_import": true,
+  "smi_requires_same_environment": true,
+  "notes": {
+    "character_device": "Each device node inside the container must be a character device; a regular file with the same name is a deployment fault.",
+    "no_exclusive_or_busy_flag": "No configuration value can make the gate wait for, refuse, skip or downgrade a busy card. Occupancy is recorded metadata only."
+  }
+}

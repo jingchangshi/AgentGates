@@ -698,6 +698,405 @@ def parse_npu_smi(text: str):
     return health, holders, in_process_table
 
 
+# ------------------------------------------------- environment preflight (P0-A)
+
+#: Named environment faults. All of them mean "the run did not happen" -- none is
+#: a device fault, and none may be reported as busy.
+ENV_CANN_SCRIPT_MISSING = "ENV_CANN_SCRIPT_MISSING"
+ENV_CANN_SOURCE_FAILED = "ENV_CANN_SOURCE_FAILED"
+ENV_ASCEND_HOME_UNRESOLVED = "ENV_ASCEND_HOME_UNRESOLVED"
+ENV_LIBRARY_UNRESOLVED = "ENV_LIBRARY_UNRESOLVED"
+ENV_LD_LIBRARY_PATH_MISSING = "ENV_LD_LIBRARY_PATH_MISSING"
+ENV_SMI_EXEC_FAILED = "ENV_SMI_EXEC_FAILED"
+
+#: Seconds npu-smi may take before the environment is declared wedged.
+SMI_TIMEOUT = 30
+
+#: Libraries that must actually resolve. libc_sec.so is here because its absence
+#: is EXACTLY the historic fault: npu-smi exit 127 "libc_sec.so: cannot open
+#: shared object file" was reported as a device problem. It is an environment
+#: problem and must be named as one.
+REQUIRED_LIBRARIES = ("libc_sec.so", "libascend_hal.so", "libdrvdsmi_host.so")
+
+
+def required_libraries() -> tuple:
+    """The libraries to verify, taken from the TRACKED profile when it is readable.
+
+    The profile is the single source of truth, so this list cannot quietly drift
+    from the reviewed deployment contract. The constant above only guards the
+    degenerate case and is never allowed to silently replace a broken profile.
+    """
+    try:
+        profile = load_deployment_profile()
+    except GateError:
+        raise
+    libs = tuple(profile.get("required_driver_libraries") or REQUIRED_LIBRARIES)
+    return libs
+
+
+def _env_fail(kind: str, detail: str):
+    """Report a named environment failure and stop at the environment stage.
+
+    BLOCKED_ENV, never FAIL: no result is being reported, so nothing is claimed
+    about any card. The message names the exact contract that broke.
+    """
+    raise GateError("%s: %s" % (kind, detail), EXIT_BLOCKED)
+
+
+def build_preflight_script(cann: str) -> str:
+    """The exact shell program the preflight runs. Pure: no configuration, no I/O.
+
+    Kept as a separate function so a CPU test can assert on the SCRIPT ITSELF.
+    This matters: the first version of these tests only fed fabricated stdout to the
+    parser, so a mutation that deleted the readlink/hash logic -- or that ignored the
+    tracked profile -- still passed. A test that never executes the shell cannot
+    notice the shell losing a step.
+    """
+    return "; ".join([
+        "if [ ! -f " + _sq(cann) + " ]; then echo FAIL-CANN-MISSING; exit 11; fi",
+        ". " + _sq(cann) + " >/dev/null 2>&1 || { echo FAIL-CANN-SOURCE; exit 12; }",
+        'if [ -z "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-UNSET; exit 13; fi',
+        'if [ ! -d "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-MISSING; exit 14; fi',
+        'echo "HOME=$ASCEND_HOME_PATH"',
+        'case ":$LD_LIBRARY_PATH:" in *":$ASCEND_HOME_PATH/lib64:"*) : ;; '
+        '*) echo FAIL-LD-PATH; exit 15 ;; esac',
+        # Resolve the libraries the way the LOADER will, not the way a cache index
+        # happens to be built. ldconfig -p was the wrong mechanism: on this machine
+        # libc_sec.so is NOT in the ldconfig cache at all, it is reached through
+        # LD_LIBRARY_PATH, so an ldconfig-only check reports a healthy machine as
+        # broken. Conversely a cache entry proves nothing about the loader path
+        # npu-smi actually receives. So ask ldd -- the same loader -- about the very
+        # binary that must run, and require each needed library to resolve to a file.
+        'SMI=$(command -v npu-smi || echo /usr/local/sbin/npu-smi)',
+        'if [ ! -x "$SMI" ]; then echo FAIL-SMI-ABSENT; exit 17; fi',
+        'ldd "$SMI" > /tmp/.tf-ldd 2>&1',
+        'for lib in ' + " ".join(required_libraries()) + '; do '
+        '  line=$(grep -F "$lib" /tmp/.tf-ldd 2>/dev/null | head -1)',
+        '  p=$(printf %s "$line" | sed -n "s/.*=> \\([^ ]*\\) .*/\\1/p")',
+        '  case "$line" in '
+        '    *"not found"*) echo "FAIL-LIB $lib"; exit 16 ;; '
+        '  esac',
+        '  if [ -z "$p" ] || [ ! -f "$p" ]; then echo "FAIL-LIB $lib"; exit 16; fi',
+        # The real path AND a content hash, not just the name: a library that
+        # resolves to a different build than the one verified is a real difference,
+        # and a resolved name alone cannot show it.
+        '  rp=$(readlink -f "$p" 2>/dev/null || echo "$p")',
+        '  h=$(sha256sum "$rp" 2>/dev/null | cut -d" " -f1)',
+        '  case "$h" in "") h=UNREADABLE ;; esac',
+        '  echo "LIB $lib $p $rp $h"',
+        'done',
+        "echo PREFLIGHT-OK",
+    ])
+
+
+def environment_preflight(config: dict) -> dict:
+    """The ONE mandatory bootstrap every SMI / compile / device consumer depends on.
+
+    Before this existed, three near-identical `source` prefixes were open-coded in
+    different places, each with its own error handling: the device payload checked
+    for a missing script, occupancy used `. script >/dev/null 2>&1; exec npu-smi`
+    which DISCARDED the source result, and nothing checked ASCEND_HOME_PATH or
+    whether the driver libraries actually resolved. Two similar prefixes are not
+    one non-bypassable contract, and the libc_sec failure could return through any
+    unguarded path.
+
+    Returns verified facts for the evidence record. Raises GateError with a named
+    ENV_* code -- never a device verdict, never busy -- on any failure.
+    """
+    cann = (config.get("CANN_SET_ENV") or "").strip()
+    facts = {"cann_script": cann or None}
+
+    # CANN is REQUIRED for anything touching the NPU. An empty value is not "use
+    # the ambient environment"; it is a configuration that cannot satisfy the
+    # contract, and it is refused by name.
+    if not cann:
+        _env_fail(ENV_CANN_SCRIPT_MISSING,
+                  "CANN_SET_ENV is not set. torch_npu cannot import (libhccl.so) and "
+                  "npu-smi cannot load its libraries without it. Set it to the CANN "
+                  "set_env.sh path; an ambient source in the calling shell does not count")
+
+    # One shell program does the whole check, so every step shares one environment.
+    # Each failure exits with its own code so the reason survives instead of
+    # collapsing into "npu-smi returned 127".
+    script = build_preflight_script(cann)
+
+    result = container_exec(config, ["sh", "-c", script], user="root",
+                            timeout=120, echo_stdout=False)
+    out = result.stdout or ""
+
+    if result.returncode != 0:
+        if "FAIL-CANN-MISSING" in out:
+            _env_fail(ENV_CANN_SCRIPT_MISSING,
+                      "CANN_SET_ENV=%r does not exist inside the container" % cann)
+        if "FAIL-CANN-SOURCE" in out:
+            _env_fail(ENV_CANN_SOURCE_FAILED,
+                      "sourcing CANN_SET_ENV=%r returned non-zero; the environment it "
+                      "would provide is not available" % cann)
+        if "FAIL-HOME-UNSET" in out or "FAIL-HOME-MISSING" in out:
+            _env_fail(ENV_ASCEND_HOME_UNRESOLVED,
+                      "ASCEND_HOME_PATH is unset or not a directory after sourcing; "
+                      "the driver libraries cannot be located from a name alone")
+        if "FAIL-LD-PATH" in out:
+            _env_fail(ENV_LD_LIBRARY_PATH_MISSING,
+                      "ASCEND_HOME_PATH/lib64 is not on LD_LIBRARY_PATH after sourcing; "
+                      "npu-smi would fail to load its own libraries")
+        if "FAIL-LIB" in out:
+            missing = [ln.split(None, 2)[1] for ln in out.splitlines()
+                       if ln.startswith("FAIL-LIB")]
+            _env_fail(ENV_LIBRARY_UNRESOLVED,
+                      "required driver libraries do not resolve: %s. A missing "
+                      "libc_sec.so is exactly the historic exit-127 fault and is an "
+                      "ENVIRONMENT failure, not a device one" % ", ".join(missing))
+        _env_fail(ENV_LIBRARY_UNRESOLVED,
+                  "environment preflight exited %d with no recognised reason: %r"
+                  % (result.returncode, out[-400:]))
+
+    if "PREFLIGHT-OK" not in out:
+        _env_fail(ENV_LIBRARY_UNRESOLVED,
+                  "environment preflight did not report success: %r" % out[-400:])
+
+    for line in out.splitlines():
+        if line.startswith("HOME="):
+            facts["ascend_home_path"] = line.split("=", 1)[1]
+        elif line.startswith("LIB "):
+            parts = line.split()
+            name, path, real, digest = parts[1], parts[2], parts[3], parts[4]
+            facts.setdefault("libraries", {})[name] = {
+                "resolved": path,
+                "realpath": real,
+                "sha256": digest,
+            }
+
+    # npu-smi must run in the SAME environment just verified. This is the only
+    # place its loader failure may be classified.
+    # npu-smi is bounded INSIDE the container as well as by the exec timeout. This
+    # machine has hung the docker-exec SMI path, and an unbounded call surfaces as a
+    # raw TimeoutExpired instead of a named environment fault -- which is exactly the
+    # kind of untyped failure that gets mistaken for a device problem.
+    smi = 'exec "$(command -v npu-smi || echo /usr/local/sbin/npu-smi)" info'
+    try:
+        probe = container_exec(
+            config,
+            ["sh", "-c", ". " + _sq(cann) + " >/dev/null 2>&1; "
+             'exec timeout ' + str(SMI_TIMEOUT) + ' sh -c ' + _sq(smi)],
+            user="root", timeout=SMI_TIMEOUT + 30, echo_stdout=False)
+    except subprocess.TimeoutExpired:
+        _env_fail(ENV_SMI_EXEC_FAILED,
+                  "npu-smi did not return within %d seconds even with a container-side "
+                  "timeout. This is an ENVIRONMENT fault (the SMI path is wedged); it is "
+                  "NOT a busy card and NOT a device failure" % SMI_TIMEOUT)
+    if probe.returncode in (124, 137):
+        _env_fail(ENV_SMI_EXEC_FAILED,
+                  "npu-smi exceeded its %d second bound inside the container. This is an "
+                  "ENVIRONMENT fault, not a busy card" % SMI_TIMEOUT)
+    if probe.returncode != 0:
+        _env_fail(ENV_SMI_EXEC_FAILED,
+                  "npu-smi failed with status %d in the verified CANN environment. This "
+                  "is classified as an ENVIRONMENT fault; it is NOT reported as a busy "
+                  "card and NOT as a device failure" % probe.returncode)
+    if not (probe.stdout or "").strip():
+        _env_fail(ENV_SMI_EXEC_FAILED,
+                  "npu-smi produced no output in the verified CANN environment")
+    facts["smi_probe_exit"] = probe.returncode
+    facts["smi_probe_bytes"] = len(probe.stdout or "")
+    return facts
+
+# ------------------------------------------------ deployment verification (P0-DEPLOY)
+
+#: The TRACKED deployment profile. Versioned, secret-free, and READ (not merely
+#: documented): the gate refuses to run if it is missing or inconsistent, so the
+#: contract cannot drift away from the code that claims to enforce it.
+DEPLOYMENT_PROFILE_PATH = Path(__file__).resolve().parent.parent / "deployment_profile.json"
+DEPLOYMENT_SCHEMA_VERSION = 1
+
+#: Fallbacks, used only if the profile cannot be read; a missing profile is itself
+#: reported, so these cannot silently become the whole contract.
+REQUIRED_CONTROL_NODES = ("/dev/davinci_manager", "/dev/hisi_hdc")
+
+
+def load_deployment_profile() -> dict:
+    """Read the tracked deployment profile.
+
+    A missing or malformed profile is a configuration error: the deployment
+    contract is part of the adapter, and a Gate that silently invented its own
+    would be enforcing something nobody reviewed.
+    """
+    try:
+        profile = json.loads(DEPLOYMENT_PROFILE_PATH.read_text())
+    except FileNotFoundError:
+        raise GateError(
+            "deployment profile is missing: %s\n"
+            "  the tracked deployment contract is part of this adapter"
+            % DEPLOYMENT_PROFILE_PATH, EXIT_CONFIG)
+    except ValueError as exc:
+        raise GateError(
+            "deployment profile is not valid JSON: %s: %s"
+            % (DEPLOYMENT_PROFILE_PATH, exc), EXIT_CONFIG)
+    version = profile.get("schema_version")
+    if version != DEPLOYMENT_SCHEMA_VERSION:
+        raise GateError(
+            "deployment profile schema_version is %r, this gate understands %d"
+            % (version, DEPLOYMENT_SCHEMA_VERSION), EXIT_CONFIG)
+    return profile
+
+
+def effective_config_hash(config: dict) -> str:
+    """Hash the effective configuration so a run records WHICH deployment it used.
+
+    The machine-local env.sh is git-ignored and cannot be version-controlled, but a
+    run that does not record its effective configuration cannot be reproduced or
+    audited. Only keys are hashed, never values, so no secret enters the evidence.
+    """
+    keys = sorted(k for k in config if config.get(k) not in (None, ""))
+    payload = "\n".join("%s" % k for k in keys)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _host_inspect(config: dict) -> dict:
+    """Read the container deployment facts from the host docker daemon.
+
+    Returns {} when the host inspect is unavailable (for example when this process
+    already runs INSIDE the container). An empty result is NEVER treated as a pass:
+    the caller must supply a fresh deployment record or the Gate refuses by name.
+    """
+    if inside_container():
+        return {}
+    result = run(
+        ["docker", "inspect", config["CONTAINER_NAME"],
+         "--format", "{{json .}}"],
+        timeout=60, echo_stdout=False)
+    if result.returncode != 0:
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return {}
+
+
+def deployment_verify(config: dict, device_ids: list, evidence_dir=None) -> dict:
+    """Verify the RUNNING container against the deployment contract.
+
+    Checks, all BEFORE any device work:
+      * the container exists and its image matches the configured image
+      * every requested /dev/davinciN is in HostConfig.Devices (a real bind, not a
+        path that merely exists inside the container)
+      * the control nodes are bound too
+      * each requested node INSIDE the container is a character device, not a
+        regular file that happens to be named davinci0
+
+    Every failure is a named deployment fault. None of them is busy, and none of
+    them waits for a card, rebuilds a container, or touches another user's work.
+    """
+    profile = load_deployment_profile()
+    facts = {"schema_version": DEPLOYMENT_SCHEMA_VERSION,
+             "effective_config_sha256": effective_config_hash(config),
+             "profile_libraries": profile.get("required_driver_libraries"),
+             "profile_image": profile.get("required_image_name")}
+    required_control = tuple(profile.get("required_control_nodes")
+                             or REQUIRED_CONTROL_NODES)
+    inspect = _host_inspect(config)
+
+    if not inspect:
+        # No host view. The Gate must not silently downgrade to "trust the
+        # container"; it records that the binding could not be cross-checked and
+        # falls back to the in-container device-node check with that limitation
+        # stated. It does NOT claim the deployment was verified.
+        facts["host_inspect"] = "UNAVAILABLE"
+    else:
+        facts["host_inspect"] = "OK"
+        facts["container_id"] = inspect.get("Id")
+        facts["image_id"] = (inspect.get("Image") or "")
+        # The image the container actually runs must match the configured image.
+        # A container left over from an older image is exactly the "stale deployment"
+        # case: it looks fine until a result cannot be reproduced.
+        configured_image = config.get("IMAGE")
+        if configured_image:
+            tag = run(["docker", "inspect", "--format", "{{.Id}}", configured_image],
+                      timeout=60, echo_stdout=False)
+            if tag.returncode == 0 and tag.stdout.strip():
+                expected_image_id = tag.stdout.strip()
+                facts["configured_image_id"] = expected_image_id
+                if facts["image_id"] and facts["image_id"] != expected_image_id:
+                    raise GateError(
+                        "CONTAINER_IMAGE_MISMATCH: container %s runs image %s but the "
+                        "configuration names %s (%s). This is a STALE DEPLOYMENT: the "
+                        "container predates the image the Gate is configured for"
+                        % (config["CONTAINER_NAME"], facts["image_id"][:19],
+                           configured_image, expected_image_id[:19]),
+                        EXIT_BLOCKED)
+        host_config = inspect.get("HostConfig") or {}
+        bound = set()
+        for entry in host_config.get("Devices") or []:
+            path_in = entry.get("PathInContainer") or entry.get("PathOnHost")
+            if path_in:
+                bound.add(path_in)
+        facts["bound_devices"] = sorted(bound)
+        facts["effective_config_sha256"] = facts["effective_config_sha256"]
+
+        missing = ["/dev/davinci%d" % i for i in device_ids if "/dev/davinci%d" % i not in bound]
+        if missing:
+            raise GateError(
+                "CONTAINER_DEVICE_BINDING_MISSING: %s are not in the container's "
+                "HostConfig.Devices. The container exposes %s. This is a DEPLOYMENT "
+                "fault: the requested device is not bound, so it cannot be busy, "
+                "idle, or faulty" % (", ".join(missing), sorted(bound)),
+                EXIT_BLOCKED)
+        missing_control = [n for n in REQUIRED_CONTROL_NODES if n not in bound]
+        if missing_control:
+            raise GateError(
+                "CONTAINER_DEPLOYMENT_MISMATCH: control node(s) %s are not bound; "
+                "the driver cannot be driven without them. This is a DEPLOYMENT fault"
+                % ", ".join(missing_control), EXIT_BLOCKED)
+
+    # In-container truth: the requested nodes must be CHARACTER devices.
+    nodes = ["/dev/davinci%d" % i for i in device_ids] + list(REQUIRED_CONTROL_NODES)
+    check = (
+        "for n in " + " ".join(_sq(n) for n in nodes) + "; do "
+        'if [ ! -e "$n" ]; then echo "MISSING $n"; continue; fi; '
+        'if [ ! -c "$n" ]; then echo "NOTCHAR $n"; continue; fi; '
+        'echo "CHAR $n"; done'
+    )
+    result = container_exec(config, ["sh", "-c", check], user="root",
+                            timeout=60, echo_stdout=False)
+    out = result.stdout or ""
+    facts["nodes"] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            facts["nodes"][parts[1]] = parts[0]
+    not_char = [n for n, kind in facts["nodes"].items() if kind == "NOTCHAR"]
+    if not_char:
+        raise GateError(
+            "CONTAINER_DEVICE_BINDING_MISSING: %s exist but are NOT character "
+            "devices. A regular file named davinci0 is not a device. This is a "
+            "DEPLOYMENT fault, not a device fault" % ", ".join(sorted(not_char)),
+            EXIT_BLOCKED)
+    absent = [n for n, kind in facts["nodes"].items() if kind == "MISSING"]
+    if absent:
+        raise GateError(
+            "DRIVER_MOUNT_MISSING: %s are absent inside the container"
+            % ", ".join(sorted(absent)), EXIT_BLOCKED)
+
+    # The hardware must never be reached by a stale record: refuse if the container
+    # was created by a different effective configuration than the one now in force.
+    # `verified` means the FULL contract was checked. When the host inspect is
+    # unavailable -- which is the normal case inside the container -- the binding
+    # half could not be cross-checked, so this must NOT claim True. Reporting True
+    # there is exactly the overclaim the audit objected to elsewhere: the node check
+    # alone cannot prove the container was created with those nodes bound.
+    facts["verified"] = facts.get("host_inspect") == "OK"
+    facts["verified_scope"] = (
+        "image+device-binding+control-nodes+char-nodes" if facts["verified"]
+        else "char-nodes-only (host inspect unavailable; device BINDING not proven)")
+    if not facts["verified"]:
+        log("deployment: host inspect UNAVAILABLE, so only the in-container node check "
+            "ran. The device BINDING is NOT proven from inside the container.")
+    log("deployment verified: image=%s bound=%s nodes=%s"
+        % (str(facts.get("image_id"))[:19], len(facts.get("bound_devices", [])),
+           len(facts.get("nodes", {}))))
+    return facts
+
+
 OCCUPANCY_TIMEOUT = 90
 
 
@@ -708,19 +1107,24 @@ def device_occupancy(config: dict, device_ids: list):
     free. A failure to read is reported as an unreadable environment, not as an
     idle card, and a card that is not OK is a real health fault.
     """
-    # npu-smi needs the CANN libraries on its own loader path. Reading occupancy
-    # without them fails with a loader error that says nothing about the card,
-    # so the same configured script is sourced here as for the workload. A
-    # missing npu-smi after that is a real environment fault.
-    cann = config.get("CANN_SET_ENV") or ""
-    prefix = (". %s >/dev/null 2>&1; " % _sq(cann)) if cann else ""
+    # npu-smi needs the CANN libraries on its own loader path. The environment is
+    # NOT re-sourced here with an open-coded prefix: environment_preflight owns that
+    # contract, and this consumer depends on it. The old prefix was
+    # `. <script> >/dev/null 2>&1; exec npu-smi`, which DISCARDED the source result,
+    # so a failed or missing CANN reported itself only as "npu-smi status 127" --
+    # exactly the libc_sec confusion. That path no longer exists.
+    facts = environment_preflight(config)
+    cann = (config.get("CANN_SET_ENV") or "").strip()
     result = container_exec(config, ["sh", "-c",
-                                     prefix + 'exec "$(command -v npu-smi || echo /usr/local/sbin/npu-smi)" info'],
+                                     ". " + _sq(cann) + " >/dev/null 2>&1; "
+                                     'exec "$(command -v npu-smi || echo /usr/local/sbin/npu-smi)" info'],
                             user="root", timeout=OCCUPANCY_TIMEOUT, echo_stdout=False)
     if result.returncode != 0:
         raise GateError(
-            "npu-smi failed with status %d; occupancy is UNKNOWN, not empty"
-            % result.returncode, EXIT_BLOCKED)
+            "%s: npu-smi failed with status %d AFTER the environment preflight "
+            "passed; occupancy is UNKNOWN, not empty. This is an environment fault "
+            "and is NOT a busy card" % (ENV_SMI_EXEC_FAILED, result.returncode),
+            EXIT_BLOCKED)
     health, holders, table_seen = parse_npu_smi(result.stdout)
     if not health:
         raise GateError(
@@ -772,6 +1176,22 @@ def gate_device(config: dict, device_raw: str, evidence_dir) -> int:
         raise GateError(
             "container %s does not exist; run the build Gate first"
             % config["CONTAINER_NAME"], EXIT_BLOCKED)
+
+    # P0-A: the environment contract runs BEFORE occupancy, before the device-node
+    # check and before any payload. A missing CANN, a failed source, an unresolved
+    # ASCEND_HOME_PATH or an unresolvable driver library stops the Gate here, with a
+    # named ENV_* code. It never reaches the card, so it can never be reported as
+    # busy, idle, or a device fault.
+    env_facts = environment_preflight(config)
+    log("environment preflight: HOME=%s libraries=%d SMI=%s"
+        % (env_facts.get("ascend_home_path"), len(env_facts.get("libraries", {})),
+           "ok" if env_facts.get("smi_probe_exit") == 0 else "FAILED"))
+
+    # P0-DEPLOY: the deployment is verified against the versioned contract BEFORE the
+    # card is touched. A device that is not bound, a control node that is missing, or
+    # a davinci path that is a regular file stops here as a DEPLOYMENT fault -- never
+    # as busy, and never by rebuilding someone else's container.
+    deploy_facts = deployment_verify(config, device_ids, evidence_dir)
 
     visible = ",".join(str(i) for i in device_ids)
     run_id = uuid.uuid4().hex[:12]
@@ -861,6 +1281,10 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
     workload_ok = coverage and all(bool(row.get("ok")) for row in by_logical)
     observations = {
         "exitCodeZero": True,
+        # Both preflights ran and passed BEFORE the card was touched. Recorded as
+        # observations so a verifier can REQUIRE them rather than infer them.
+        "environmentPreflight": True,
+        "deploymentVerified": bool(deploy_facts.get("verified")),
         "ranAsRoot": True,
         "multiDeviceCoverage": coverage,
         "assertionInsidePayload": True,
@@ -883,6 +1307,25 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
                                 "scope": v["scope"]}
                       for k, v in occupancy.items()},
         "occupancy_raw_sha256": hashlib.sha256(occupancy_raw.encode()).hexdigest(),
+        # P0-A / P0-DEPLOY: the environment and deployment facts are part of the
+        # RESULT. A run that cannot say which environment and which deployment
+        # produced it is not reproducible, so both are recorded, not just logged.
+        "environment": {
+            "cann_script": env_facts.get("cann_script"),
+            "ascend_home_path": env_facts.get("ascend_home_path"),
+            "libraries": env_facts.get("libraries", {}),
+            "smi_probe_exit": env_facts.get("smi_probe_exit"),
+            "preflight": "PASSED",
+        },
+        "deployment": {
+            "schema_version": deploy_facts.get("schema_version"),
+            "effective_config_sha256": deploy_facts.get("effective_config_sha256"),
+            "host_inspect": deploy_facts.get("host_inspect"),
+            "image_id": deploy_facts.get("image_id"),
+            "bound_devices": deploy_facts.get("bound_devices"),
+            "nodes": deploy_facts.get("nodes"),
+            "verified": deploy_facts.get("verified", False),
+        },
         "observations": observations,
     }
     stdout_result = dict(observations)
