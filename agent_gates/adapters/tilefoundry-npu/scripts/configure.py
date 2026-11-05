@@ -24,25 +24,36 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import env_context as E  # noqa: E402
 
 
-def _run(command, *, env=None, timeout=3600, cwd=None, check=False):
+class ConfigureError(RuntimeError):
+    """A NAMED failure. The caller prints the code and exits non-zero.
+
+    The previous revision returned 0 from the converge path no matter what the
+    actions said, and represented a failed metadata read as an empty package set.
+    A named exception is what makes "failed" impossible to mistake for "done".
+    """
+
+    def __init__(self, code: str, message: str, exit_code: int = 1):
+        super().__init__("%s: %s" % (code, message))
+        self.code = code
+        self.exit_code = exit_code
+
+
+def _run(command, *, env=None, timeout=3600, cwd=None):
     """Run a command, returning (rc, stdout, stderr) -- never raising on failure.
 
-    Callers report raw output. A silent non-zero here would be the exact defect
-    this module exists to make visible.
+    Callers report raw output and decide what a non-zero means. There is no
+    generic "check" shortcut here: a shared fallback turned every distinct fault
+    into the same SystemExit, which is how a specific refusal gets lost.
     """
     done = subprocess.run(
         command, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
     )
-    if check and done.returncode != 0:
-        raise SystemExit(
-            "command failed (%s): %s\n%s\n%s"
-            % (done.returncode, " ".join(map(str, command)), done.stdout, done.stderr)
-        )
     return done.returncode, done.stdout, done.stderr
 
 
@@ -61,9 +72,18 @@ def _create_prefix() -> dict:
 
 
 def _installed() -> dict:
-    """{normalised name: version} as the SHARED interpreter sees them."""
+    """{normalised name: version} as the SHARED interpreter sees them.
+
+    A READ FAILURE IS NOT AN EMPTY SET. Returning {} here made the plan see every
+    pin as missing, so a broken interpreter was "repaired" by reinstalling the
+    whole lock into it -- the one action that cannot work and hides the fault.
+    Reading is therefore fallible by name, and the caller must refuse to install
+    on it (INSTALLED_METADATA_UNREADABLE / INTERPRETER_MISSING).
+    """
     if not _interpreter_ready():
-        return {}
+        raise ConfigureError(
+            "INTERPRETER_MISSING",
+            "%s does not exist or is not executable" % E.interpreter(), 2)
     code = (
         "import json,sys;"
         "import importlib.metadata as m;"
@@ -73,14 +93,22 @@ def _installed() -> dict:
     )
     rc, out, err = _run([str(E.interpreter()), "-c", code], timeout=300)
     if rc != 0:
-        return {}
+        raise ConfigureError(
+            "INSTALLED_METADATA_UNREADABLE",
+            "the interpreter could not enumerate installed packages (rc=%s): %s"
+            % (rc, ((err or "") + (out or "")).strip()[-300:]), 2)
     for line in reversed((out or "").strip().splitlines()):
         if line.startswith("{"):
             try:
-                return json.loads(line)
+                payload = json.loads(line)
             except ValueError:
                 continue
-    return {}
+            if isinstance(payload, dict):
+                return payload
+    raise ConfigureError(
+        "INSTALLED_METADATA_UNREADABLE",
+        "the interpreter printed no JSON package metadata: %r"
+        % ((out or "").strip()[-200:],), 2)
 
 
 def _plan(installed: dict) -> list[dict]:
@@ -130,7 +158,24 @@ PIP_TIMEOUT = os.environ.get("TFNU_PIP_TIMEOUT", "60")
 PIP_RETRIES = os.environ.get("TFNU_PIP_RETRIES", "2")
 INSTALL_TIMEOUT = int(os.environ.get("TFNU_INSTALL_TIMEOUT", "900"))
 PROXY_SCRIPT = os.environ.get("TFNU_PROXY_SH", os.path.expanduser("~/set_proxy.sh"))
+
+#: The domestic mirror. It is reachable from this host WITHOUT the proxy, so using
+#: the proxy against it was simply wrong: the proxy exists for slow/unreachable
+#: OVERSEAS addresses, and adding it to a domestic request only adds a hop.
 MIRROR_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+MIRROR_HOST = "mirrors.aliyun.com"
+
+#: Packages the domestic mirror does NOT publish. Only these may use the proxy,
+#: and only after the mirror was actually tried without it. Measured case: torch's
+#: CPU build is served by download.pytorch.org, not by the PyPI mirror, so the
+#: mirror cannot satisfy the pin no matter how long it is waited on.
+OVERSEAS_INDEX = {
+    "torch": "https://download-r2.pytorch.org/whl/cpu",
+}
+
+#: What the network half actually did. Recorded in facts so a run can say
+#: "proxy_used=false" and mean it, instead of leaving the reader to guess.
+NETWORK = {"proxy_used": False, "packages": [], "reason": "offline", "indexes": []}
 
 
 def _pip_argv() -> list:
@@ -157,19 +202,64 @@ def _missing_wheels(stderr: str, steps: list[dict]) -> list[str]:
     return missing
 
 
-def _install(steps: list[dict]) -> list[dict]:
-    """Converge on the plan: OFFLINE FIRST, network only when a wheel is missing.
+def _network_facts() -> dict:
+    """A copy of what the network half did, for the facts report."""
+    return json.loads(json.dumps(NETWORK))
 
-    Offline is not a preference, it is the reproducibility claim: 35 wheels in the
-    local cache cover every pin, so a converge must finish in milliseconds. If it
-    cannot, the answer is "WHEEL_MISSING: <name>" -- not a silent wait on a mirror.
+
+def _warm_cache(names, steps, *, index, host, proxy, env, actions):
+    """Put the fetched wheels in the local cache, so the NEXT run is offline.
+
+    A failed warm is RECORDED rather than dropped: if the wheel is not in
+    envs/wheels, the next offline run will name it missing, and the reason has to
+    already exist in the evidence rather than be reconstructed later.
+    """
+    for name in names:
+        want = next(step["want"] for step in steps if step["name"] == name)
+        argv = [str(E.interpreter()), "-m", "pip", "download", "--no-deps",
+                "-i", index, "--trusted-host", host,
+                "--timeout", str(PIP_TIMEOUT), "--retries", str(PIP_RETRIES),
+                "-d", str(E.WHEEL_CACHE), "%s==%s" % (name, want)]
+        command = argv
+        if proxy is not None:
+            command = ["bash", "-lc", ". %s >/dev/null 2>&1; exec %s"
+                       % (proxy, " ".join(argv))]
+        try:
+            rc, out, err = _run(command, env=env, timeout=INSTALL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            actions.append({"action": "cache_warm", "code": "CONFIGURE_NETWORK_TIMEOUT",
+                            "wheel": name, "index": index,
+                            "timeout_s": INSTALL_TIMEOUT})
+            continue
+        actions.append({"action": "cache_warm", "wheel": name, "rc": rc,
+                        "index": index,
+                        "proxy": str(proxy) if proxy is not None else None,
+                        "tail": (out + err)[-300:]})
+
+
+def _install(steps: list[dict]):
+    """Converge on the plan: OFFLINE, then the domestic mirror, then -- only for a
+    wheel the mirror genuinely does not publish -- the upstream index via proxy.
+
+    The order is a contract, not a preference:
+      1. offline is the reproducibility claim (the local cache covers the pins);
+      2. the domestic mirror is reachable DIRECTLY. Routing it through the proxy
+         was a real defect: the proxy exists for slow/unreachable OVERSEAS
+         addresses, and adding it to a domestic request only adds a hop;
+      3. the proxy is used only for packages whose wheel lives upstream
+         (OVERSEAS_INDEX), and facts record proxy_used=true plus those names, so
+         "the internet was needed" is never a vague statement.
+
+    Returns (actions, failure); failure is a NAMED dict or None.
     """
     if not steps:
-        return []
+        return [], None
     recipes = ["%s==%s" % (step["name"], step["want"]) for step in steps]
     env = dict(os.environ)
     env.setdefault("PYTHONNOUSERSITE", "1")
     actions = []
+    NETWORK.update({"proxy_used": False, "packages": [], "reason": "offline",
+                    "indexes": []})
 
     # ---- 1. offline, bounded
     offline = _pip_argv()
@@ -180,54 +270,116 @@ def _install(steps: list[dict]) -> list[dict]:
     try:
         rc, out, err = _run(offline, env=env, timeout=INSTALL_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return [{"action": "pip", "mode": "offline", "code": "CONFIGURE_NETWORK_TIMEOUT",
-                 "rc": None, "timeout_s": INSTALL_TIMEOUT, "argv": offline}]
+        actions.append({"action": "pip", "mode": "offline",
+                        "code": "CONFIGURE_NETWORK_TIMEOUT", "rc": None,
+                        "timeout_s": INSTALL_TIMEOUT, "argv": offline})
+        return actions, {"code": "CONFIGURE_NETWORK_TIMEOUT",
+                         "detail": "the offline install exceeded %ss" % INSTALL_TIMEOUT}
     actions.append({"action": "pip", "mode": "offline", "rc": rc,
                     "seconds": round(time.time() - started, 2), "argv": offline,
                     "tail": (out + err)[-600:]})
     if rc == 0:
-        return actions
+        NETWORK["reason"] = "offline"
+        return actions, None
 
     missing = _missing_wheels(err, steps)
     actions.append({"action": "diagnose", "code": "WHEEL_MISSING", "missing": missing,
                     "cache": str(E.WHEEL_CACHE)})
-    if not missing or os.environ.get("TFNU_OFFLINE_ONLY", "").strip() == "1":
-        return actions
+    if not missing:
+        return actions, {
+            "code": "CONFIGURE_INSTALL_FAILED",
+            "detail": "the offline install failed without naming a missing wheel, so "
+                      "there is nothing specific to fetch (rc=%s)" % rc}
+    if os.environ.get("TFNU_OFFLINE_ONLY", "").strip() == "1":
+        return actions, {"code": "WHEEL_MISSING",
+                         "detail": "offline only, and the local wheel cache lacks: %r"
+                                   % (missing,)}
 
-    # ---- 2. network, ONLY for the named missing wheels, and bounded
-    online = _pip_argv() + ["-i", MIRROR_INDEX, "--trusted-host", "mirrors.aliyun.com"]
-    online += ["%s==%s" % (step["name"], step["want"])
-               for step in steps if step["name"] in missing]
-    proxy = Path(PROXY_SCRIPT)
-    command = online
-    if proxy.is_file():
-        command = ["bash", "-lc", ". %s >/dev/null 2>&1; exec %s"
-                   % (proxy, " ".join(online))]
+    missing_steps = [step for step in steps if step["name"] in missing]
+
+    # ---- 2. domestic mirror, explicitly WITHOUT the proxy
+    mirror = _pip_argv() + ["-i", MIRROR_INDEX, "--trusted-host", MIRROR_HOST]
+    mirror += ["%s==%s" % (step["name"], step["want"]) for step in missing_steps]
     started = time.time()
     try:
-        rc, out, err = _run(command, env=env, timeout=INSTALL_TIMEOUT)
+        rc, out, err = _run(mirror, env=env, timeout=INSTALL_TIMEOUT)
     except subprocess.TimeoutExpired:
-        actions.append({"action": "pip", "mode": "online",
+        actions.append({"action": "pip", "mode": "mirror", "proxy": False,
                         "code": "CONFIGURE_NETWORK_TIMEOUT", "rc": None,
-                        "timeout_s": INSTALL_TIMEOUT, "argv": online})
-        return actions
-    actions.append({"action": "pip", "mode": "online", "rc": rc,
-                    "seconds": round(time.time() - started, 2), "argv": online,
-                    "proxy": str(proxy) if proxy.is_file() else None,
+                        "timeout_s": INSTALL_TIMEOUT, "argv": mirror})
+        return actions, {"code": "CONFIGURE_NETWORK_TIMEOUT",
+                         "detail": "the domestic mirror install exceeded %ss"
+                                   % INSTALL_TIMEOUT}
+    actions.append({"action": "pip", "mode": "mirror", "proxy": False,
+                    "index": MIRROR_INDEX, "rc": rc,
+                    "seconds": round(time.time() - started, 2), "argv": mirror,
                     "tail": (out + err)[-600:]})
+    NETWORK.update({"proxy_used": False, "packages": [],
+                    "reason": "domestic mirror (no proxy)", "indexes": [MIRROR_INDEX]})
     if rc == 0:
-        # Persist what was fetched, so the NEXT run is offline again. Without this the
-        # network becomes a permanent dependency and this whole path is unrepeatable.
-        for name in missing:
-            want = next(step["want"] for step in steps if step["name"] == name)
-            _run([str(E.interpreter()), "-m", "pip", "download", "--no-deps",
-                  "-i", MIRROR_INDEX, "--trusted-host", "mirrors.aliyun.com",
-                  "--timeout", str(PIP_TIMEOUT), "--retries", str(PIP_RETRIES),
-                  "-d", str(E.WHEEL_CACHE), "%s==%s" % (name, want)],
-                 env=env, timeout=INSTALL_TIMEOUT)
-        actions.append({"action": "cache_warmed", "wheels": missing,
-                        "cache": str(E.WHEEL_CACHE)})
-    return actions
+        _warm_cache(missing, steps, index=MIRROR_INDEX, host=MIRROR_HOST,
+                    proxy=None, env=env, actions=actions)
+        return actions, None
+
+    still = _missing_wheels(err, missing_steps)
+    actions.append({"action": "diagnose", "code": "MIRROR_INCOMPLETE",
+                    "missing": still, "index": MIRROR_INDEX})
+    if not still:
+        return actions, {
+            "code": "CONFIGURE_MIRROR_FAILED",
+            "detail": "the domestic mirror attempt failed without naming a missing "
+                      "wheel (rc=%s)" % rc}
+    overseas = {name: OVERSEAS_INDEX[name] for name in still
+                if name in OVERSEAS_INDEX}
+    unfetchable = [name for name in still if name not in OVERSEAS_INDEX]
+    if unfetchable or not overseas:
+        return actions, {
+            "code": "WHEEL_MISSING",
+            "detail": "not in the local wheel cache and not published on the "
+                      "domestic mirror: %r" % (unfetchable or still,)}
+
+    # ---- 3. upstream, proxy ONLY for the named overseas packages
+    proxy = Path(PROXY_SCRIPT)
+    if not proxy.is_file():
+        return actions, {
+            "code": "PROXY_MISSING_FOR_OVERSEAS",
+            "detail": "%r is only served by the upstream index, and %s does not "
+                      "exist" % (sorted(overseas), PROXY_SCRIPT)}
+    for name in sorted(overseas):
+        index = overseas[name]
+        host = urlparse(index).hostname or ""
+        want = next(step["want"] for step in steps if step["name"] == name)
+        argv = _pip_argv() + ["-i", index, "--trusted-host", host,
+                              "%s==%s" % (name, want)]
+        command = ["bash", "-lc", ". %s >/dev/null 2>&1; exec %s"
+                   % (proxy, " ".join(argv))]
+        started = time.time()
+        try:
+            rc, out, err = _run(command, env=env, timeout=INSTALL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            actions.append({"action": "pip", "mode": "overseas", "proxy": True,
+                            "code": "CONFIGURE_NETWORK_TIMEOUT", "rc": None,
+                            "timeout_s": INSTALL_TIMEOUT, "packages": [name],
+                            "index": index, "argv": argv})
+            return actions, {"code": "CONFIGURE_NETWORK_TIMEOUT",
+                             "detail": "the upstream install of %r exceeded %ss"
+                                       % (name, INSTALL_TIMEOUT)}
+        actions.append({"action": "pip", "mode": "overseas", "proxy": True,
+                        "index": index, "packages": [name], "rc": rc,
+                        "seconds": round(time.time() - started, 2), "argv": argv,
+                        "tail": (out + err)[-600:]})
+        if rc != 0:
+            return actions, {
+                "code": "CONFIGURE_OVERSEAS_INSTALL_FAILED",
+                "detail": "%s is not on the domestic mirror and its upstream "
+                          "install failed (index=%s, rc=%s)" % (name, index, rc)}
+        _warm_cache([name], steps, index=index, host=host, proxy=proxy,
+                    env=env, actions=actions)
+
+    NETWORK.update({"proxy_used": True, "packages": sorted(overseas),
+                    "reason": "not published on the domestic mirror; the upstream "
+                              "index serves it", "indexes": sorted(set(overseas.values()))})
+    return actions, None
 
 
 def _tilelang_state() -> dict:
@@ -261,7 +413,15 @@ def _wheel_facts() -> dict:
 
 def gather_facts() -> dict:
     """Everything a reader needs to decide whether this prefix is trustworthy."""
-    installed = _installed()
+    try:
+        installed = _installed()
+        installed_error = None
+    except ConfigureError as exc:
+        # FACTS MUST STILL BE PRODUCED: the whole point of --facts on a broken
+        # prefix is to show WHY it is broken. What must NOT happen is treating the
+        # empty map as "every pin is missing".
+        installed = {}
+        installed_error = {"code": exc.code, "detail": str(exc)}
     facts = {
         "workspace": str(E.WORKSPACE),
         "prefix": str(E.SHARED_PREFIX),
@@ -286,8 +446,19 @@ def gather_facts() -> dict:
         "python_version": None,
         "pythonpath_entries": E.python_path_entries(),
         "pins": E.ALL_PINS,
-        "pin_problems": E.pin_problems(installed),
-        "installed_count": len(installed),
+        # An UNREADABLE package set is reported as unreadable, never as "all pins
+        # missing": the latter is indistinguishable from a fresh prefix and would
+        # justify reinstalling a whole lock into a broken interpreter.
+        "installed_readable": installed_error is None,
+        "installed_error": installed_error,
+        "pin_problems": (E.pin_problems(installed) if installed_error is None
+                         else {"code": installed_error["code"],
+                               "missing": None,
+                               "detail": "not evaluated: package metadata unreadable"}),
+        "installed_count": len(installed) if installed_error is None else None,
+        # Which network tier ran, and whether the proxy was needed. Recorded, not
+        # inferred: "proxy_used" must be a fact about this run.
+        "network": _network_facts(),
         "tilelang_source": _tilelang_state(),
         "tilelang_wheel": _wheel_facts(),
         "cann_set_env": E.CANN_SET_ENV,
@@ -371,6 +542,20 @@ def _findings(facts: dict) -> int:
     return 0
 
 
+def _fail(actions: list, code: str, detail: str, exit_code: int = 1) -> int:
+    """Print a NAMED failure and return a NON-ZERO code.
+
+    The converge path used to end in a hard-coded `return 0`: every failure was
+    printed into the action list and then the program reported success. A caller
+    (the verify phase, a run recipe) could not tell a converged prefix from a
+    broken one, so "configure exited 0" meant nothing.
+    """
+    report = {"actions": actions, "verdict": "FAIL", "code": code, "detail": detail}
+    print(json.dumps(report, indent=1, sort_keys=True))
+    print("%s: %s" % (code, detail), file=sys.stderr)
+    return exit_code
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--facts", action="store_true", help="inspect only, write nothing")
@@ -378,7 +563,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.facts:
-        print(json.dumps(gather_facts(), indent=1, sort_keys=True))
+        facts = gather_facts()
+        print(json.dumps(facts, indent=1, sort_keys=True))
+        # The facts WERE produced, including an unreadable-metadata fact. The
+        # non-zero refusal belongs to the paths that could otherwise repair or
+        # approve the prefix (converge, --findings).
         return 0
 
     actions = []
@@ -387,7 +576,12 @@ def main(argv=None) -> int:
         # run to confirm the prefix, one pin disagreed, and the check silently
         # reinstalled that pin -- reverting a diagnosed downgrade and breaking the
         # very import it had been asked to confirm. Inspect, report, exit.
-        installed = _installed()
+        try:
+            installed = _installed()
+        except ConfigureError as exc:
+            actions.append({"action": "refused", "code": exc.code,
+                            "detail": str(exc)})
+            return _fail(actions, exc.code, str(exc), exc.exit_code)
         pending = _plan(installed)
         if pending:
             # Report the drift; do not "fix" it behind the caller's back.
@@ -401,25 +595,46 @@ def main(argv=None) -> int:
         print(json.dumps(report, indent=1, sort_keys=True))
         return _findings(facts)
 
-    if not _interpreter_ready():
-        actions.append(_create_prefix())
+    # ---- converge: every failure stops the sequence, and none of them exits 0.
+    try:
+        if not _interpreter_ready():
+            created = _create_prefix()
+            actions.append(created)
+            if created.get("rc") != 0:
+                return _fail(
+                    actions, "CONFIGURE_PREFIX_CREATE_FAILED",
+                    "creating %s failed (rc=%r): %s"
+                    % (E.SHARED_PREFIX, created.get("rc"), created.get("tail")))
 
-    installed = _installed()
-    steps = _plan(installed)
-    if steps:
-        actions.append({"action": "plan", "steps": steps})
-        actions.extend(_install(steps))
-    else:
-        # Idempotence is an assertion, not a hope: with an empty plan nothing is
-        # written, so a second run genuinely changes nothing.
-        actions.append({"action": "noop", "reason": "every pin already satisfied"})
+        installed = _installed()
+        steps = _plan(installed)
+        if steps:
+            actions.append({"action": "plan", "steps": steps})
+            install_actions, failure = _install(steps)
+            actions.extend(install_actions)
+            if failure is not None:
+                # Nothing further runs: not the re-read, not facts that look like a
+                # verdict, and certainly not a second install attempt.
+                return _fail(actions, failure["code"], failure["detail"])
+            # A successful pip is not a satisfied pin. Re-read the interpreter and
+            # re-plan: an install that reported success while leaving the pins wrong
+            # must fail, or "converged" would be a claim about pip's exit code.
+            installed = _installed()
+            remaining = _plan(installed)
+            if remaining:
+                return _fail(
+                    actions, "CONFIGURE_PINS_UNSATISFIED",
+                    "after the install these pins are still wrong: %r" % (remaining,))
+        else:
+            # Idempotence is an assertion, not a hope: with an empty plan nothing is
+            # written, so a second run genuinely changes nothing.
+            actions.append({"action": "noop", "reason": "every pin already satisfied"})
+    except ConfigureError as exc:
+        return _fail(actions, exc.code, str(exc), exc.exit_code)
 
     facts = gather_facts()
     report = {"actions": actions, "facts": facts}
     print(json.dumps(report, indent=1, sort_keys=True))
-
-    if args.findings:
-        return _findings(facts)
     return 0
 
 
