@@ -369,7 +369,8 @@ def collect_evidence(run_context: RunContext, phase_events, outputs,
         value = artifact_identity.get(key)
         if isinstance(value, dict):
             artifacts[key] = {"status": value.get("status", OBSERVED),
-                              "path": value.get("path"), "sha256": value.get("sha256")}
+                              "path": value.get("path"), "sha256": value.get("sha256"),
+                              "reason": value.get("reason")}
         elif value:
             artifacts[key] = {"status": OBSERVED, "path": str(value),
                               "sha256": sha256_file(Path(value)) if Path(value).is_file() else None}
@@ -395,7 +396,8 @@ def collect_evidence(run_context: RunContext, phase_events, outputs,
     return evidence
 
 
-def evaluate_run(request: RunRequest, evidence: dict, t_report=None) -> dict:
+def evaluate_run(request: RunRequest, evidence: dict, t_report=None,
+                 allow_unobserved=()) -> dict:
     """FINISHED != PASS. A finished run can fail every required condition below."""
     phases = list(evidence.get("phases", []) or [])
     by_name = {}
@@ -415,7 +417,7 @@ def evaluate_run(request: RunRequest, evidence: dict, t_report=None) -> dict:
     elif request.input_ref and not evidence.get("inputs"):
         reason = "INPUT_IDENTITY_MISMATCH"
     elif any(evidence.get("artifacts", {}).get(key, {}).get("status") != OBSERVED
-             for key in ARTIFACT_KEYS):
+             and key not in set(allow_unobserved) for key in ARTIFACT_KEYS):
         reason = "ARTIFACT_IDENTITY_UNOBSERVED"
     elif request.recipe_id == "":
         reason = "NON_CANONICAL_DEVICE_ENTRY"
