@@ -37,7 +37,7 @@
     "scripts/provision.py": "f0cafa3445171ff55e03cf2f3787be7da954365e0c1997504753eaae1abdcd7a",
     "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
     "scripts/tilefoundry_gate.py": "829aee9e953b3dd52ee35520ec86a5c3dc1666d664924db3f17372e3f32b0c42",
-    "scripts/verify_environment.py": "53797f41e717c659c43cf65fd85adaff89daf66efd54ecedf86e6955df25ccc4",
+    "scripts/verify_environment.py": "a6d07ec80252e41d39a0be56fa5ba1c9376b8f454541a1f37991aa0dd27a30be",
     "tests/fixtures/docker-inspect-foreign.json": "c5dfeb005023f83eb0b3ac181d38e72a3ce82032fae6f4a34f2ed3ae5982db61",
     "tests/fixtures/provision.env.fixture": "7be66866ccb12f1d89dc9326d39eb55a8b598cc61f3e2431204e91a94909c48f",
     "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",

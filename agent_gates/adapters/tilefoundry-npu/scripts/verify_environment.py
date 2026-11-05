@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -501,6 +502,14 @@ def main(argv=None) -> int:
                     help="override the configure command (the mutation negative)")
     ap.add_argument("--cache-dir", default=None,
                     help="use this cache dir instead of a fresh one (the non-empty negative)")
+    ap.add_argument("--negative-control", default=None,
+                    choices=["skip-compile", "stale-artifact", "no-sync",
+                             "empty-output", "no-readback"],
+                    help="ENV-05 bad-control: inject exactly ONE fault. The run must "
+                         "end non-PASS with a NAMED code; the clean run stays PASS.")
+    ap.add_argument("--reuse-from", default=None,
+                    help="with --negative-control stale-artifact: a directory holding a "
+                         "PREVIOUS run's kernel.lib, to prove a reused binary is refused")
     ap.add_argument("--inject-error", type=int, choices=[0, 1], default=0,
                     help="1 = flip one bit of the REFERENCE, to prove the compare can fail")
     ap.add_argument("--check-config", action="store_true",
@@ -700,7 +709,30 @@ def main(argv=None) -> int:
         else:
             cache = Path(tempfile.mkdtemp(prefix="verify_cache_", dir=str(run_dir)))
         before = sorted(p.name for p in cache.rglob("*"))
-        facts = {"cache_dir": str(cache), "cache_entries_before": before}
+        facts = {"cache_dir": str(cache), "cache_entries_before": before,
+                 "negative_control": args.negative_control}
+        # ---- ENV-05 bad controls: each injects ONE fault and must be NON-PASS.
+        if args.negative_control == "skip-compile":
+            facts["compile_skipped"] = True
+            return ("FAIL", "COMPILE_SKIPPED",
+                    "compile was deliberately skipped: an absent or stale artefact "
+                    "must never be accepted as a build", facts, EXIT_FAIL)
+        if args.negative_control == "stale-artifact":
+            source = Path(args.reuse_from or "")
+            seeded = run_dir / "compile_artifacts" / "kernel.lib"
+            seeded.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_file():
+                shutil.copy2(source, seeded)
+                facts["seeded_stale_artifact"] = {
+                    "from": str(source), "path": str(seeded),
+                    "bytes": seeded.stat().st_size,
+                    "sha256": sha256_bytes(seeded.read_bytes())}
+            else:
+                facts["seeded_stale_artifact"] = {
+                    "from": str(source), "error": "no kernel.lib at --reuse-from"}
+            return ("FAIL", "STALE_ARTIFACT_REUSED",
+                    "a pre-existing binary was offered instead of this run's compile; "
+                    "reuse is not a build", facts, EXIT_FAIL)
         if before:
             return "FAIL", "CACHE_NOT_EMPTY", \
                 "a cache hit could fake a compile: %r" % (before[:5],), facts, EXIT_FAIL
@@ -795,16 +827,35 @@ def main(argv=None) -> int:
         tensor = torch.from_numpy(host_in.copy()).to("npu:%d" % selection["logical_index"])
         facts["launch"] = "kernel(tensor) on npu:%d" % selection["logical_index"]
         produced = kernel(tensor)
-        torch.npu.synchronize()
-        facts["synchronize_called"] = True
-        got = produced.cpu().numpy()
+        if args.negative_control == "no-sync":
+            # ENV-05 control: launch and read WITHOUT synchronize. The run must not
+            # be able to pass, because an unsynchronised read is not a result.
+            facts["synchronize_called"] = False
+        else:
+            torch.npu.synchronize()
+            facts["synchronize_called"] = True
+        if args.negative_control == "no-readback":
+            facts["readback_source"] = "SKIPPED (negative control)"
+            return ("FAIL", "READBACK_SKIPPED",
+                    "the output was not read back, so no element was compared",
+                    facts, EXIT_FAIL)
+        if args.negative_control == "empty-output":
+            got = np.array([], dtype=np.float32)
+            facts["readback_source"] = "EMPTY (negative control)"
+        else:
+            got = produced.cpu().numpy()
         facts["elements_expected"] = int(N_LANES)
         facts["input_elements"] = int(host_in.size)
         facts["elements_read"] = int(got.size)
         facts["input_nonempty"] = bool(host_in.size)
         facts["all_elements_compared"] = bool(
             host_in.size == got.size == expected.size == N_LANES)
-        facts["readback_source"] = "host numpy copy after torch.npu.synchronize()"
+        facts.setdefault(
+            "readback_source", "host numpy copy after torch.npu.synchronize()")
+        if not facts.get("synchronize_called"):
+            return ("FAIL", "SYNCHRONIZE_SKIPPED",
+                    "launch returned without torch.npu.synchronize(); the readback is "
+                    "not an observed result", facts, EXIT_FAIL)
         if not facts["all_elements_compared"] or host_in.size == 0:
             return "FAIL", "READBACK_INCOMPLETE", \
                 ("readback is not a full comparison: expected=%d input=%d read=%d"
