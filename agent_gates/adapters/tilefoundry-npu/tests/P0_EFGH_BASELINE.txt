@@ -383,3 +383,65 @@ GAPS (each line is a behaviour that did not happen):
   - test_record_separates_finished_from_passed: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
   - test_the_device_payload_is_selected_not_hard_coded: AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
   - test_two_workers_never_enter_the_payload_together: AssertionError: the gate has no team lock lease at all, so two jobs can enter the device payload concurrently and neither would notice
+
+==================================================================
+## Standing methodology (keep this; it is what produced the evidence)
+
+### 1. A crash is not a red. The harness must enforce that.
+
+A failing test can fail three ways: the behaviour did not happen (useful), the code
+crashed (noise), or the assertion was never reached (a lie). "N red" says nothing
+until you know which. So the runner parses every FAIL line and REJECTS any failure
+whose exception type is not AssertionError; the report states the count explicitly
+and it must be 0.
+
+This is not theoretical. During the eb00028 update the discriminator referenced a
+helper deleted in a rewrite and raised NameError. Without the check it would have
+been counted as "one more gap"; with it, it was immediately visible as a crash --
+a defect in the TEST, not evidence about the product. It was fixed and the run
+returned to 0 non-AssertionError failures.
+
+Corollary: a message must say what did NOT happen ("the gate has no team lock lease,
+so two jobs can enter the payload concurrently"), never merely "assert False" or a
+bare AttributeError. The failure text is the finding.
+
+### 2. A suite that can only go red proves nothing.
+
+Every negative needs a control that can go green, or the baseline is unreadable:
+"all red" cannot distinguish "feature missing" from "harness broken". Hence the
+control group -- busy-is-recorded, injected-busy-skip-is-detected -- which passes
+today and must keep passing.
+
+### 3. Negatives that share one failure reason prove only that the reason is missing.
+
+When seven attestation negatives all failed for "no verifier exists", they showed
+the mechanism was absent but said NOTHING about whether the matrix would catch each
+defect once a verifier landed: a verifier that refuses EVERYTHING satisfies them all.
+The discriminator control replays the same defects against a contract reference and
+requires each to be refused for its OWN code, with the clean record accepted.
+
+This is what turned a shrug into a finding. With the reference in place it reported
+"the reference ACCEPTED the image_drift record" -- which is how a MISSING CHECK was
+told apart from a MISTAKEN TEST, and how the real image-drift defect (reported to I2,
+not fixed here) was confirmed rather than assumed. It also caught a tamper case that
+recomputed the digest it existed to detect.
+
+The discriminator is PERMANENT. Do not delete it to make a revision go green: it is
+the only thing standing between "refuses everything" and "refuses the right things".
+
+### 4. An interface name is not a contract; the DEFECT is the contract.
+
+When the implementation landed with verify_attestation / content_sha256 / its own
+refusal-code spelling, the tests were adapted to the real API. That is not a
+relaxation: each negative still asserts that its specific defect is refused, and the
+failure message prints the code ACTUALLY raised, so "renamed code" stays
+distinguishable from "absent check". Never weaken an assertion to reach green --
+adapt the call, keep the property.
+
+### 5. Complementary: prove the record is about THIS container.
+
+"unlinked mount" (ATTESTATION_MOUNT_NOT_LINKED) is kept alongside the container_id
+check. Inside the container the docker ID is unreadable, so an ID comparison cannot
+carry the identity burden there; but an attested mount that is absent in here proves
+the record describes a different container. The two checks cover each other's blind
+spot, which is why both are negatives rather than one being "enough".
