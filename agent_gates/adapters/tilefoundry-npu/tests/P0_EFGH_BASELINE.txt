@@ -104,6 +104,45 @@ Recorded so nobody reads this baseline as "red by construction".
    corrupted stdout and swallowed later results. Replaced with real competing processes,
    which also model what a second team job actually is.
 
+## Standing test methodology: a reported green must be provably green
+
+These are not anecdotes. Each was a real defect found in THIS suite, and each is a
+rule for every test added from here. They are the same family as "a crash is not red":
+the failure mode is always a report that cannot distinguish itself from success.
+
+1. **A hardcoded injection anchor silently stops injecting.** The mutation controls
+   replaced a call site by exact string. When `device_occupancy` gained the preflight
+   argument the anchor no longer matched, `str.replace()` returned the source
+   UNCHANGED, and both controls reported PASS -- the "injected" source was byte-for-byte
+   identical to the clean one. Rule: derive the anchor FROM the source, and assert that
+   the injection actually changed it (`injected != original`). A mutation control that
+   cannot show it mutated something proves nothing.
+
+2. **A mismatched stub kills the harness, and a dead harness looks like a pass.**
+   Removing one stub made the tool raise an uncaught `GateError`, so it exited with
+   rc=1 and printed ZERO failure lines. At a glance -- and in any summary that counts
+   lines -- that is indistinguishable from a clean run. Rule: wrap the harness body and
+   report an internal failure as a NAMED FAIL, never as an exception that ends the run.
+
+3. **A crash is not a red.** A suite that aborts early silently skips every test after
+   the crash, so the red count is fiction. Assert `AssertionError`-only failures, and
+   treat any other exception as a harness defect to be fixed, not as a finding.
+
+4. **A test that needs an ambient environment cannot be run by anyone else.**
+   `device_policy.py` passed only two configuration keys and therefore died with
+   `ENV_CANN_SCRIPT_MISSING` from a bare shell once the preflight existed. Rule: a test
+   supplies its own complete minimal configuration and runs under `env -i`.
+
+5. **Validation layers are not interchangeable.** `TF_REPO`/`CONTAINER_NAME` are
+   structural and named by `load_config`; `CANN_SET_ENV` is an environment fact named by
+   the preflight. Demanding all three of one layer is a wrong test, not a stricter one.
+   Keep the division; do not collapse it for convenience.
+
+6. **"It passes in my checkout" is not evidence.** Re-runs extract committed content
+   with `git show <ref>:<path>` into a fresh directory and record the sha256 of the gate
+   and of every test actually executed. A working tree can be mid-edit -- this baseline
+   was itself once captured against a tree whose `parse_npu_smi()` had lost its return.
+
 ## Invariants the implementation must not break
 
 - **busy is RECORDED only**: no wait, poll, retry, skip, downgrade, or busy-dependent
