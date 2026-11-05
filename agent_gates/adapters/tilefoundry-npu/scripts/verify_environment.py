@@ -222,6 +222,9 @@ def bounded_run(argv, timeout, kill_grace=5, env=None):
                     stream.close()
                 except Exception:  # noqa: BLE001
                     pass
+            UNREAPED_CHILDREN.append({"pid": child_pid, "argv": list(argv),
+                                     "wchan": wchan,
+                                     "recorded_at": time.strftime("%Y%m%dT%H%M%S")})
             return {"rc": None, "out": "", "err": "", "pid": child_pid,
                     "timed_out": True, "unreaped": True, "wchan": wchan}
 
@@ -358,6 +361,10 @@ def run_tf_cpu_chain(tf_cmd, program, workdir, env, timeout: int = 180) -> dict:
 
 BUSY_CODE = "BUSY_DEVICE_NOT_RESPONDING"
 
+#: Children that had to be ABANDONED (still unreaped, possibly D-state). Recorded in
+#: the evidence so a reader knows a process of ours may still be alive after exit.
+UNREAPED_CHILDREN = []
+
 
 def device_responsiveness(timeout: int = 20) -> dict:
     """A GLOBAL driver pulse (not per-card). Used only as a diagnostic record.
@@ -378,6 +385,20 @@ def device_responsiveness(timeout: int = 20) -> dict:
     return facts
 
 
+def acquire_team_lock(lock_path):
+    """Take the team lease non-blocking and return the open handle.
+
+    An open handle is the whole lock: the kernel releases the flock when the fd
+    closes, including on os._exit. tests/test_verify_evidence_integrity.py proves
+    that a completed verify process leaves the lock re-acquirable.
+    """
+    import fcntl
+
+    handle = open(lock_path, "a+")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
 def probe_card(physical_id: int, timeout: float) -> dict:
     """One BOUNDED call that asks whether THIS card's driver queue answers.
 
@@ -393,7 +414,11 @@ def probe_card(physical_id: int, timeout: float) -> dict:
     """
     started = time.time()
     forced = None
-    spec = (os.environ.get("TFNU_PROBE_OVERRIDE") or "").strip()
+    # A seam must never be active by accident: the override is honoured ONLY under
+    # the explicit test switch, and every attempt it drives is marked simulated.
+    spec = ""
+    if (os.environ.get("TFNU_ALLOW_TEST_SEAMS") or "").strip() == "1":
+        spec = (os.environ.get("TFNU_PROBE_OVERRIDE") or "").strip()
     if spec:
         for part in spec.split(","):
             key, _, value = part.partition("=")
@@ -645,6 +670,20 @@ def main(argv=None) -> int:
     ap.add_argument("--watchdog", type=int, default=0,
                     help="seconds after which a stack dump is printed (diagnostics only)")
     args = ap.parse_args(argv)
+    # TEST SEAMS ARE NOT PRODUCTION. The probe override (and every --negative-control)
+    # exists to demonstrate a refusal; it must be requested explicitly, recorded in
+    # the evidence, and must never make the run count as ENV evidence.
+    seam_requested = bool((os.environ.get("TFNU_PROBE_OVERRIDE") or "").strip())
+    seam_allowed = (os.environ.get("TFNU_ALLOW_TEST_SEAMS") or "").strip() == "1"
+    test_seam_used = seam_requested or bool(args.negative_control)
+    if test_seam_used and not seam_allowed:
+        print(json.dumps({
+            "tool": "verify_environment.py", "verdict": "CONFIG_ERROR",
+            "code": "TEST_SEAM_NOT_ALLOWED",
+            "detail": "TFNU_PROBE_OVERRIDE / --negative-control require "
+                      "TFNU_ALLOW_TEST_SEAMS=1; a test seam must never be active by "
+                      "accident, and its run is not ENV evidence"}, indent=1))
+        return EXIT_CONFIG
     if args.check_config:
         return check_configuration()
     ensure_deployment_interpreter()
@@ -660,6 +699,7 @@ def main(argv=None) -> int:
               "started_at": started, "python": sys.version.split()[0],
               "executable": sys.executable,
               "launched_by": os.environ.get(LAUNCHED_BY_ENV),
+              "test_seam_used": test_seam_used,
               "phases": [], "mutations": [], "npu_smi": {}}
 
     report["npu_smi"]["before"] = smi("before", run_dir)
@@ -670,14 +710,33 @@ def main(argv=None) -> int:
         if not smi_after_done["flag"]:
             report["npu_smi"]["after"] = smi("after", run_dir)
             smi_after_done["flag"] = True
+        if report.get("test_seam_used") and verdict == "PASS":
+            # The observations may be real, but a seam-controlled run is NOT evidence
+            # for the ENV gate: it must carry a conclusion different from PASS.
+            verdict = "PASS_TEST_SEAM_NOT_EVIDENCE"
+            code = "TEST_SEAM_NOT_EVIDENCE"
+            detail = ("a test seam was active; observations are shown but this run "
+                      "must not be cited as ENV evidence")
+            exit_code = EXIT_FAIL
         report["verdict"] = verdict
         report["code"] = code
         report["detail"] = detail
         report["finished_at"] = time.strftime("%Y%m%dT%H%M%S")
         report["phases"] = [phase.as_dict() for phase in phases]
-        (run_dir / "evidence.json").write_text(json.dumps(report, indent=1, sort_keys=True))
+        report["unreaped_children"] = list(UNREAPED_CHILDREN)
+        evidence_path = run_dir / "evidence.json"
+        evidence_path.write_text(json.dumps(report, indent=1, sort_keys=True))
+        # Fsync the FILE and the DIRECTORY before exiting: os._exit skips interpreter
+        # teardown, and a machine crash must not leave the only record in page cache.
+        with open(evidence_path, "rb") as handle:
+            os.fsync(handle.fileno())
+        directory_fd = os.open(str(run_dir), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         print(json.dumps({"run_dir": str(run_dir), "verdict": verdict, "code": code,
-                          "detail": detail, "json": str(run_dir / "evidence.json")}, indent=1))
+                          "detail": detail, "json": str(evidence_path)}, indent=1))
         # The evidence is on disk. Measured: after a device run the interpreter's
         # teardown (torch_npu destructors) can block far outside any phase bound --
         # one run wrote PASS evidence and then sat 480+ s in shutdown. Exiting here
@@ -936,10 +995,8 @@ def main(argv=None) -> int:
         if os.environ.get("TF_DEVICE_LOCK_HELD", "").strip() == "1":
             facts["lock"] = "held by parent"
         else:
-            import fcntl
             try:
-                handle = open(TEAM_LOCK, "a+")
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle = acquire_team_lock(TEAM_LOCK)
             except BlockingIOError:
                 return "BLOCKED", "TEAM_LOCK_HELD", \
                     "another team measurement job holds %s" % TEAM_LOCK, facts, EXIT_BLOCKED

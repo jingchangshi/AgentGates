@@ -65,6 +65,8 @@ REQUIRED_CLOSURE = (
     "tests/test_configure_negatives.py",
     "tests/test_verify_tf_cpu_chain.py",
     "tests/test_device_failover_policy.py",
+    "tests/test_verify_evidence_integrity.py",
+    "tests/env_evidence_check.py",
     "tests/manifest_parity.py",
     "tests/fixtures/docker-inspect-foreign.json",
     # The clean-archive fixture: provision_negatives.sh must not need the
