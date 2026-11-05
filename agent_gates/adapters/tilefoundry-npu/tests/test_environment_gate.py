@@ -1348,11 +1348,18 @@ def _stub_device_gate(overrides, call_log=None):
     return code, buffer.getvalue()
 
 
-def _stub_defaults(call_log=None):
+def _stub_defaults(call_log=None, stub_leases=None):
     """The full stub set, shared by the in-place harness and the mutant runner.
 
     Shared deliberately: the mutant runner must install EXACTLY the same stubs into
     the mutant's namespace, and a second hand-written copy would drift.
+
+    The LEASE is part of this set. It was missing once, and the consequence was not
+    theoretical: every _stub_device_gate call acquired and released the CANONICAL
+    team lock (/home/.tf_device0.lock), so running the suite took the lock that
+    coordinates the whole team -- measured as a 20-second mtime jump. A test must
+    never take it. Stubbing the lease only in the mutant runner was not enough,
+    because the in-place harness reaches the same code path.
     """
     class Result:
         def __init__(self, rc=0, out="", err=""):
@@ -1371,7 +1378,24 @@ def _stub_defaults(call_log=None):
             return fn(*args, **kwargs)
         return wrapper
 
+    class _StubLease:
+        """Yields the lease RECORD the Gate expects (a dict), not None.
+
+        Returning None made gate_device raise AttributeError on `lease.get(...)`,
+        which the per-mutant handler then swallowed, so the log looked merely
+        "unobservable" rather than broken.
+        """
+
+        def __enter__(self):
+            if stub_leases is not None:
+                stub_leases.append(1)
+            return {"held": True, "stubbed": True, "canonical": False}
+
+        def __exit__(self, *exc):
+            return False
+
     return {
+        "device_lock_lease": _StubLease,
         "assert_not_host": lambda *a, **k: None,
         "container_exists": lambda config: True,
         "environment_preflight": _tracked("environment_preflight", lambda config: {
@@ -1611,6 +1635,22 @@ def _call_site(source, name, index=0, same_scope_as=None):
 _TEST_LOCK_PATH = "/tmp/.tf-test-lock-not-the-team-lock"
 
 
+def _counted_lease(acquisitions, lease_factory):
+    """Wrap a lease factory so every REAL acquisition increments `acquisitions`.
+
+    This is what makes `assert not acquisitions` mean something. Without a caller
+    that appends, the list stays empty for every possible execution and the
+    assertion is a tautology -- a counter with no increment is not evidence, it is
+    decoration. test_the_acquisition_counter_is_wired drives a real acquisition
+    through this wrapper and requires the count to reach 1, so a later refactor
+    that stops wiring it fails a test instead of silently disarming the check.
+    """
+    def factory():
+        acquisitions.append(1)
+        return lease_factory()
+    return factory
+
+
 def _run_under(mutant_gate):
     """Run the stubbed harness against a mutant module; return (log, acquisitions).
 
@@ -1627,28 +1667,15 @@ def _run_under(mutant_gate):
     suite run, so a test could block a teammate. That is asserted, not assumed.
     """
     log = []
-    # Counts REAL lock acquisitions. The lease stub below records separately, so
-    # "the stub ran" can never be mistaken for "the team lock was taken" -- the two
-    # are opposite outcomes and conflating them inverts the assertion.
+    # Counts REAL lock acquisitions. WIRED, not decorative: _counted_lease() below
+    # is the only thing that increments it, and
+    # test_the_acquisition_counter_is_wired proves it actually reaches 1 on a real
+    # acquisition. An unwired counter would make every `assert not acquisitions`
+    # below vacuously true -- the same vacuity this whole commit exists to remove.
     acquisitions = []
     stub_leases = []
 
-    class _Lease:
-        """Yields the lease RECORD the Gate expects (a dict), not None.
-
-        Returning None made gate_device raise AttributeError on `lease.get(...)`,
-        which the per-mutant `except Exception` then swallowed -- so the log stayed
-        empty and the control looked merely "unobservable" rather than broken.
-        """
-
-        def __enter__(self):
-            stub_leases.append(1)
-            return {"held": True, "stubbed": True, "canonical": False}
-
-        def __exit__(self, *exc):
-            return False
-
-    stubs = _stub_defaults(call_log=log)
+    stubs = _stub_defaults(call_log=log, stub_leases=stub_leases)
     for name, value in stubs.items():
         if name in mutant_gate.__dict__:
             setattr(mutant_gate, name, value)
@@ -1656,8 +1683,6 @@ def _run_under(mutant_gate):
     # this test owns, so a stub regression still cannot grab the team lock.
     if "DEVICE_LOCK_PATH" in mutant_gate.__dict__:
         mutant_gate.DEVICE_LOCK_PATH = _TEST_LOCK_PATH
-    if "device_lock_lease" in mutant_gate.__dict__:
-        mutant_gate.device_lock_lease = _Lease
 
     # Evidence that the CANONICAL lock was never touched: its mtime must not move.
     # The stub counters alone cannot prove this -- they prove the stub was reached,
@@ -1842,6 +1867,62 @@ def test_wiring_no_op_mutation_is_NOT_caught():
     assert log, "the no-op mutant produced an EMPTY log, so this control is vacuous"
     _assert_wiring_order(log)  # must NOT raise
 
+
+def test_no_stubbed_gate_call_acquires_the_canonical_team_lock():
+    """The IN-PLACE harness must not take the team lock either.
+
+    Stubbing the lease only in the mutant runner was not enough: _stub_device_gate
+    reaches the same code path, so every stubbed gate call acquired and released
+    the CANONICAL lock /home/.tf_device0.lock -- measured as a 20-second mtime jump
+    across one suite run. Running the tests must never take the lock that
+    coordinates the whole team.
+
+    The lease stub is part of _stub_defaults for exactly this reason.
+    """
+    canonical = getattr(G, "TEAM_LOCK_PATH", None)
+    before = _mtime(canonical)
+    code, out = _stub_device_gate({})
+    after = _mtime(canonical)
+    assert code == 0, (code, out[-400:])
+    print("      canonical lock mtime: %r -> %r" % (before, after))
+    assert before == after, (
+        "a stubbed gate call acquired the canonical team lock %r (mtime moved "
+        "%r -> %r). The lease must be part of _stub_defaults so BOTH the in-place "
+        "harness and the mutant runner are covered." % (str(canonical), before, after))
+
+def test_the_acquisition_counter_is_wired():
+    """The counter must reach 1 on a REAL acquisition, or it proves nothing.
+
+    Reviewer finding N4: `acquisitions` had no append site, so `assert not
+    acquisitions` was a tautology and the printed "0" carried no evidence. This
+    test deliberately BYPASSES the stub, performs one real acquisition against a
+    test-owned path (never the canonical lock), and requires the count to be 1.
+
+    If a later refactor unwires the counter, this test fails -- rather than the
+    guarantee quietly degrading to decoration.
+    """
+    import shutil
+    import tempfile
+
+    sandbox = tempfile.mkdtemp(prefix="tf-lock-witness-")
+    saved = G.DEVICE_LOCK_PATH
+    acquisitions = []
+    try:
+        # Point the real lease at a path this test owns. The canonical team lock is
+        # never touched.
+        G.DEVICE_LOCK_PATH = sandbox + "/.tf-device.lock"
+        with _counted_lease(acquisitions, G.device_lock_lease)() as lease:
+            assert isinstance(lease, dict), (
+                "the real lease must yield a record, got %r" % (type(lease),))
+    finally:
+        G.DEVICE_LOCK_PATH = saved
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+    print("      counter after one real acquisition: %d" % len(acquisitions))
+    assert len(acquisitions) == 1, (
+        "the acquisition counter did not record a REAL acquisition (%d), so every "
+        "`assert not acquisitions` in this file is vacuously true"
+        % len(acquisitions))
 
 def test_wiring_mutant_run_never_takes_the_team_lock():
     """A test must never acquire the canonical team lock that coordinates the team.
