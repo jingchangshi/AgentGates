@@ -69,10 +69,14 @@ cat > "$FAKE" <<'EOPY'
 import json
 import pathlib
 import sys
+import sysconfig
 
 if "--findings" not in sys.argv:
     raise SystemExit(2)
-site = pathlib.Path(sys.executable).resolve().parents[1] / "lib" / "python3.12" / "site-packages"
+# Use the interpreter's OWN purelib, not "parents of the executable": with a venv
+# whose bin/python is a symlink to another env, resolve() points at the target env
+# and the write would land where the verifier is NOT looking.
+site = pathlib.Path(sysconfig.get_paths()["purelib"])
 d = site / "verify_negative_probe-0.0.1.dist-info"
 if not d.exists():
     d.mkdir()

@@ -50,7 +50,7 @@
     "tests/test_verify_evidence_integrity.py": "341e88fa2f4e6f82894af22947dd0ef1ce221130846391ed950d163a614f40be",
     "tests/test_verify_tf_cpu_chain.py": "9bb5853ec53cdfe031b749e5774679a870f690d4c96b01605c7eb9dfad7d82e1",
     "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae",
-    "tests/verify_negatives.sh": "cf1075dacb8662a18a84f387b4ac53e88f5e8ed5e959ec80ecf34a603152ae1b"
+    "tests/verify_negatives.sh": "607c527db9fab36ca80a71843bc703009bdd999b65ebdb1116587bd82270851c"
   },
   "recipes": [
     {
