@@ -259,12 +259,21 @@ fails over only on a **driver-no-response** result.
 | --device-backoff-seconds | **30 s** | TFNU_DEVICE_BACKOFF | one natural window for transient congestion to clear before moving to the next card, without burning the run. |
 | attempts | visible-list length | -- | today 2 cards, so worst case 2 x (20 + 30) ~= **100 s**, fully bounded. |
 
-Rules:
+Rules (H addendum: attribution is strict):
 
-- **Only** a driver-unresponsive probe (bounded timeout + a child that had to be
-  killed/abandoned; timed_out/unreaped/wchan/pid recorded) may move to the next
-  card. A card that is merely **occupied** by another tenant is normal shared
-  use: it is recorded, never a retry/refusal/switch reason.
+| Probe result | Classification | Backoff / next card? | Run verdict |
+|---|---|---|---|
+| timeout **and** unreaped **and** a driver wchan (e.g. devdrv_sync_non_tran) | BUSY_DEVICE_NOT_RESPONDING | yes: one 30 s backoff, then the next card | NOT_RUN only if **all** cards are BUSY |
+| timeout and unreaped, wchan missing/unsupported (cannot attribute to driver) | DEVICE_PROBE_UNATTRIBUTED | **no** | BLOCKED, named |
+| timed out but child reclaimed (not unreaped) | DEVICE_PROBE_TIMEOUT | no | BLOCKED, named |
+| fast rc != 0 (missing library/permission/command) | DEVICE_PROBE_FAILED | **no**; rc and stderr recorded | CONFIG/BLOCKED, named |
+| rc == 0 but empty output | DEVICE_PROBE_EMPTY_OUTPUT | **no** | BLOCKED, named |
+| responsive (even if occupied by another tenant) | RESPONSIVE | use immediately; no retry/refusal | normal phase continues |
+
+- A card that is merely **occupied** by another tenant is normal shared use: it is
+  recorded, never a retry/refusal/switch reason.
+- Only BUSY_DEVICE_NOT_RESPONDING may fail over. Any other non-responsive result
+  stops the run at that card (attempt count = 1, no backoff, no next card).
 - Every card is tried **once** per run; the attempt count is bounded by the
   visible list.
 - After a failover, the selected card performs its **own fresh**

@@ -399,23 +399,33 @@ def acquire_team_lock(lock_path):
     return handle
 
 
+#: A wchan proves the child is parked in a DRIVER wait only when it NAMES the
+#: driver. A missing or unrelated wchan means the timeout cannot be attributed to
+#: the driver, so it must NOT become BUSY_DEVICE_NOT_RESPONDING (and must not switch).
+_WCHAN_MARKERS = ("devdrv", "ascend", "npu", "hisi", "drv")
+
+
+def wchan_supports_driver_wait(wchan) -> bool:
+    text = str(wchan or "").strip().lower()
+    return bool(text) and any(marker in text for marker in _WCHAN_MARKERS)
+
+
 def probe_card(physical_id: int, timeout: float) -> dict:
     """One BOUNDED call that asks whether THIS card's driver queue answers.
 
-    Only a DRIVER-no-response result (bounded timeout, and a child that had to be
-    killed or abandoned; wchan/pid recorded) is BUSY_DEVICE_NOT_RESPONDING and is
-    eligible for failover. "The card is busy with someone else's job" is NOT this:
-    occupancy is normal shared use, is recorded elsewhere, and never causes a
-    retry, a refusal, or a card switch.
-
-    TFNU_PROBE_OVERRIDE is a TEST seam ("0=unresponsive,1=responsive"). It exists
-    because a D-state queue cannot be created on demand; when it is used every
-    attempt carries simulated=true so the evidence never pretends it was hardware.
+    Classification is strict (architect H addendum):
+      * timed_out + unreaped + a DRIVER wchan  -> BUSY_DEVICE_NOT_RESPONDING
+        (the only case eligible for backoff/failover);
+      * timed_out + unreaped, no usable wchan  -> DEVICE_PROBE_UNATTRIBUTED (no switch);
+      * timed_out but the child died           -> DEVICE_PROBE_TIMEOUT (no switch);
+      * fast rc != 0 (missing library/permission/command) -> DEVICE_PROBE_FAILED
+        (CONFIG/BLOCKED, with rc and stderr; NO backoff, NO next card);
+      * rc == 0 but empty output               -> DEVICE_PROBE_EMPTY_OUTPUT (no switch);
+      * otherwise                              -> RESPONSIVE (use immediately).
+    "Busy with someone else's job" is normal shared use and is not any of these.
     """
     started = time.time()
     forced = None
-    # A seam must never be active by accident: the override is honoured ONLY under
-    # the explicit test switch, and every attempt it drives is marked simulated.
     spec = ""
     if (os.environ.get("TFNU_ALLOW_TEST_SEAMS") or "").strip() == "1":
         spec = (os.environ.get("TFNU_PROBE_OVERRIDE") or "").strip()
@@ -424,26 +434,54 @@ def probe_card(physical_id: int, timeout: float) -> dict:
             key, _, value = part.partition("=")
             if key.strip().isdigit() and int(key.strip()) == int(physical_id):
                 forced = value.strip()
-    if forced is not None:
-        unresponsive = forced == "unresponsive"
-        result = {"rc": None if unresponsive else 0,
-                  "out": "" if unresponsive else "forced-responsive",
-                  "err": "", "pid": -1,
-                  "timed_out": unresponsive, "unreaped": unresponsive,
-                  "wchan": "forced" if unresponsive else None}
+    if forced == "unresponsive":
+        result = {"rc": None, "out": "", "err": "", "pid": -1,
+                  "timed_out": True, "unreaped": True,
+                  "wchan": "devdrv_sync_non_tran"}
+        simulated = True
+    elif forced == "unattributed":
+        result = {"rc": None, "out": "", "err": "", "pid": -1,
+                  "timed_out": True, "unreaped": True, "wchan": None}
+        simulated = True
+    elif forced == "fail":
+        result = {"rc": 2, "out": "", "err": "libc_sec.so: cannot open shared object file",
+                  "pid": -1, "timed_out": False, "unreaped": False, "wchan": None}
+        simulated = True
+    elif forced == "empty":
+        result = {"rc": 0, "out": "   \n", "err": "", "pid": -1,
+                  "timed_out": False, "unreaped": False, "wchan": None}
+        simulated = True
+    elif forced == "responsive":
+        result = {"rc": 0, "out": "forced-responsive", "err": "", "pid": -1,
+                  "timed_out": False, "unreaped": False, "wchan": None}
         simulated = True
     else:
         result = bounded_run(
             ["npu-smi", "info", "-t", "board", "-i", str(physical_id)], timeout=timeout)
         simulated = False
-    responsive = ((not result["timed_out"]) and result["rc"] == 0
-                  and bool((result["out"] or "").strip()))
+    output = result["out"] or ""
+    stderr = result["err"] or ""
+    wchan = result.get("wchan")
+    if result["timed_out"]:
+        if result["unreaped"] and wchan_supports_driver_wait(wchan):
+            classification = BUSY_CODE
+        elif result["unreaped"]:
+            classification = "DEVICE_PROBE_UNATTRIBUTED"
+        else:
+            classification = "DEVICE_PROBE_TIMEOUT"
+    elif result["rc"] != 0:
+        classification = "DEVICE_PROBE_FAILED"
+    elif not output.strip():
+        classification = "DEVICE_PROBE_EMPTY_OUTPUT"
+    else:
+        classification = "RESPONSIVE"
     return {"physical_id": int(physical_id), "simulated": simulated,
             "probe": "npu-smi info -t board -i %s" % physical_id,
-            "responsive": responsive,
+            "responsive": classification == "RESPONSIVE",
+            "classification": classification,
             "timed_out": result["timed_out"], "unreaped": result["unreaped"],
             "rc": result["rc"], "pid": result.get("pid"),
-            "wchan": result.get("wchan"),
+            "wchan": wchan, "stderr_tail": stderr.strip()[-400:],
             "seconds": round(time.time() - started, 2)}
 
 
@@ -451,21 +489,26 @@ def first_responsive_card(candidates, visible, probe, backoff_seconds,
                           sleeper=time.sleep) -> tuple:
     """Walk the VISIBLE list in order, one bounded probe per card.
 
-    Only a driver-unresponsive probe moves to the next card; a responsive card is
-    selected immediately even if another tenant is using it. The attempt count is
-    bounded by the candidate list, and a fixed backoff (the policy's 30 s) is
-    waited once after each failed attempt except the last. Returns
-    (attempts, selected) where selected is None iff every card was unresponsive.
+    Only BUSY_DEVICE_NOT_RESPONDING (driver timeout + unreaped + driver wchan) may
+    back off and move to the next card. Any other non-responsive classification is a
+    FAILURE for this run: it stops immediately (no backoff, no next card) and is
+    returned as the third element. A responsive card is used immediately, even when
+    another tenant is using it (normal shared use is not a refusal).
+
+    Returns (attempts, selected, failure); selected is None and failure is None iff
+    every card was BUSY (all unresponsive).
     """
     attempts = []
     selected = None
+    failure = None
     for position, logical_index in enumerate(candidates):
         physical_id = visible[logical_index]
         result = probe(physical_id)
         attempt = {"attempt": position + 1, "logical_index": logical_index, **result}
-        if result["responsive"]:
-            attempt["outcome"] = "RESPONSIVE"
-            attempts.append(attempt)
+        classification = result.get("classification", BUSY_CODE if not result.get("responsive") else "RESPONSIVE")
+        attempt["outcome"] = classification
+        attempts.append(attempt)
+        if classification == "RESPONSIVE":
             selected = {
                 "logical_index": logical_index,
                 "physical_device_id": physical_id,
@@ -475,12 +518,21 @@ def first_responsive_card(candidates, visible, probe, backoff_seconds,
                     "first RESPONSIVE entry of the ordered visible list"),
             }
             break
-        attempt["outcome"] = BUSY_CODE
-        attempts.append(attempt)
+        if classification != BUSY_CODE:
+            failure = {
+                "code": classification,
+                "physical_device_id": physical_id,
+                "rc": result.get("rc"),
+                "timed_out": result.get("timed_out"),
+                "unreaped": result.get("unreaped"),
+                "wchan": result.get("wchan"),
+                "stderr_tail": result.get("stderr_tail", ""),
+            }
+            break
         if position < len(candidates) - 1:
             attempt["backoff_seconds"] = float(backoff_seconds)
             sleeper(float(backoff_seconds))
-    return attempts, selected
+    return attempts, selected, failure
 
 
 def smi(tag: str, out_dir: Path) -> dict:
@@ -978,11 +1030,22 @@ def main(argv=None) -> int:
                  "backoff_basis": (
                      "one window for transient congestion to clear; attempts are "
                      "bounded by the visible list, worst case 2x(20+30)=100 s")}
-        attempts, selected = first_responsive_card(
+        attempts, selected, failure = first_responsive_card(
             candidates, visible,
             lambda physical: probe_card(physical, attempt_timeout), backoff)
         facts["device_attempts"] = attempts
-        facts["all_cards_unresponsive"] = selected is None
+        facts["all_cards_unresponsive"] = selected is None and failure is None
+        if failure is not None:
+            # A named probe failure (fast rc!=0, empty output, unattributed timeout)
+            # is NOT driver unresponsiveness: no backoff was waiting, no later card
+            # was probed, and this run is not a PASS.
+            facts["device_probe_failure"] = failure
+            return ("BLOCKED", failure["code"],
+                    "device probe failed on physical id %s: %s (rc=%r timed_out=%r "
+                    "unreaped=%r wchan=%r stderr=%r); no backoff, no failover, not PASS"
+                    % (failure["physical_device_id"], failure["code"], failure["rc"],
+                       failure["timed_out"], failure["unreaped"], failure["wchan"],
+                       failure["stderr_tail"]), facts, EXIT_BLOCKED)
         if selected is None:
             return ("NOT_RUN", BUSY_CODE,
                     "every visible card was driver-unresponsive: %d bounded attempt(s), "
