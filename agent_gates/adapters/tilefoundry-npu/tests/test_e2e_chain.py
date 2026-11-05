@@ -59,9 +59,21 @@ PAYLOAD_OK = json.dumps({
 EXPOSED = "/dev/davinci0\n/dev/davinci1\n/dev/davinci_manager\n"
 
 
+class SkipCase(Exception):
+    """Not a failure: this case is OPT-IN and was not requested."""
+
+
+SKIP = []
+
+
 def check(name, fn):
     try:
         fn()
+    except SkipCase as exc:
+        SKIP.append(name)
+        print("  SKIP  %s" % name)
+        print("        %s" % (str(exc)[:240],))
+        return
     except Exception as exc:  # noqa: BLE001
         text = "%s: %s" % (type(exc).__name__, str(exc)[:240])
         FAIL.append("%s: %s" % (name, text))
@@ -258,8 +270,8 @@ def _worker_spans(results):
     return spans
 
 
-def _two_real_workers(env_extra=None, workers=2, canonical=True):
-    """Run N SEPARATE PROCESSES competing for the one lock.
+def _two_real_workers(env_extra=None, workers=2, canonical=False):
+    """Run N SEPARATE PROCESSES competing for ONE lock; return (outputs, lock_path).
 
     Threads would be the wrong instrument twice over: a flock is per open file
     description, and contextlib.redirect_stdout is process-global and not
@@ -267,19 +279,32 @@ def _two_real_workers(env_extra=None, workers=2, canonical=True):
     and silently swallowed every later result). Real processes also model what a
     second team job actually is.
 
-    canonical=True exercises the REAL team lock path, because only that can support a
-    claim about team serialisation. A private path proves the lease mechanism works;
-    it says nothing about whether two team members are serialised, since neither
-    touched the file the team shares.
+    The lock is TEST-OWNED BY DEFAULT, and that is not a weakening of the test.
+    A test suite must not take the team's coordination lock to exercise a lease:
+    doing so makes every run of the suite a real device-lock event, so a red test
+    run and a live device job look the same to the rest of the team, and a suite
+    that hangs wedges everyone. The COMPETITION SEMANTICS are what this test is
+    about -- two processes, one lock file, no overlap -- and those are identical on
+    a private path.
+
+    What a private path does NOT prove is that the SHIPPED DEFAULT is the team
+    lock. That is asserted separately and statically by
+    test_default_lock_path_is_the_canonical_team_lock, so the two claims stay
+    distinct instead of one test overclaiming for both.
+
+    canonical=True is OPT-IN (see test_canonical_lock_serialises_TWO_REAL_...):
+    it touches the real team lock and is therefore not run by default.
     """
     import subprocess
     env = dict(os.environ)
     env.pop("TF_DEVICE_LOCK_HELD", None)
     if canonical:
         env.pop("TF_DEVICE_LOCK_PATH", None)  # use the shipped default
+        lock_path = "/home/.tf_device0.lock"
     else:
         lock_dir = Path(tempfile.mkdtemp(prefix="p0e-proc-lock-"))
-        env["TF_DEVICE_LOCK_PATH"] = str(lock_dir / "device.lock")
+        lock_path = str(lock_dir / "device.lock")
+        env["TF_DEVICE_LOCK_PATH"] = lock_path
     env.update(env_extra or {})
     procs = [
         subprocess.Popen(
@@ -291,7 +316,7 @@ def _two_real_workers(env_extra=None, workers=2, canonical=True):
     for proc in procs:
         stdout, stderr = proc.communicate(timeout=120)
         out.append(stdout.strip() + stderr.strip())
-    return out
+    return out, lock_path
 
 
 def test_two_workers_never_enter_the_payload_together():
@@ -303,16 +328,19 @@ def test_two_workers_never_enter_the_payload_together():
     require(hasattr(gate, "device_lock_lease"),
             "the gate has no team lock lease at all, so two jobs can enter the device "
             "payload concurrently and neither would notice")
-    results = _two_real_workers(canonical=True)
+    results, lock_path = _two_real_workers()
     entered = [line for line in results if line.startswith("ENTERED")]
     require(len(entered) == 2,
-            "with a bounded wait both team jobs should eventually run (serialised); got %r"
+            "with a bounded wait both jobs should eventually run (serialised); got %r"
             % (results,))
-    # Guard against this case silently degrading into a private-lock run: the claim
-    # below is about the TEAM, so the canonical path must really be in use.
-    require(all("LOCKPATH=/home/.tf_device0.lock" in line for line in entered),
-            "the workers did not use the canonical team lock, so this case cannot "
-            "support a team-serialisation claim: %r" % (results,))
+    # The workers must contend on the SAME test-owned file. If they had drifted onto
+    # different paths there would be no contention at all and this test would pass
+    # while proving nothing, which is the failure mode worth guarding against.
+    require(all(lock_path in line for line in entered),
+            "the workers did not all use the test-owned lock %r, so there was no "
+            "contention to measure: %r" % (lock_path, results))
+    require(not lock_path.startswith("/home/.tf_device0.lock"),
+            "this case must not take the canonical team lock; it used %r" % (lock_path,))
     # Serialisation, not refusal: the two must not OVERLAP. Each worker stamps entry
     # and exit, so the intervals must be disjoint.
     spans = sorted(_worker_spans(results))
@@ -332,7 +360,7 @@ def test_forged_lock_held_env_cannot_bypass_the_lock():
     require(hasattr(gate, "device_lock_lease"),
             "the gate has no team lock lease, so a forged TF_DEVICE_LOCK_HELD=1 skips "
             "nothing because there is nothing to skip")
-    results = _two_real_workers(env_extra={"TF_DEVICE_LOCK_HELD": "1"})
+    results, _lock_path = _two_real_workers(env_extra={"TF_DEVICE_LOCK_HELD": "1"})
     entered = [line for line in results if line.startswith("ENTERED")]
     require(len(entered) < 2,
             "with TF_DEVICE_LOCK_HELD=1 forged by both jobs, %d entered at once; the flag "
@@ -340,6 +368,74 @@ def test_forged_lock_held_env_cannot_bypass_the_lock():
     for line in entered:
         require("False" in line or "n/a" in line,
                 "an unverified handoff was recorded as verified: %r" % (line,))
+
+
+def test_default_lock_path_is_the_canonical_team_lock():
+    """The SHIPPED DEFAULT must be the team's lock. Static: it acquires nothing.
+
+    Deliberately separate from the contention test. "Two processes serialise on one
+    lock file" and "the default path is the one the whole team shares" are DIFFERENT
+    claims; asserting both in one test lets either hide behind the other. Here the
+    default is inspected, not exercised, so this case can never take the real lock.
+    """
+    saved = os.environ.pop("TF_DEVICE_LOCK_PATH", None)
+    try:
+        gate = load_gate()
+        require(hasattr(gate, "TEAM_LOCK_PATH"),
+                "the gate exposes no TEAM_LOCK_PATH, so the shipped default cannot be "
+                "identified")
+        require(str(gate.TEAM_LOCK_PATH) == "/home/.tf_device0.lock",
+                "the canonical team lock is %r, not /home/.tf_device0.lock, so every "
+                "team job would coordinate on a different file"
+                % (str(gate.TEAM_LOCK_PATH),))
+        require(str(gate.DEVICE_LOCK_PATH) == str(gate.TEAM_LOCK_PATH),
+                "with no TF_DEVICE_LOCK_PATH set the gate resolves its lock to %r "
+                "instead of the team lock %r, so the default would NOT serialise the "
+                "team" % (str(gate.DEVICE_LOCK_PATH), str(gate.TEAM_LOCK_PATH)))
+        # An override must move it, or isolation would be impossible; and it must be
+        # reported as non-canonical, so a private run cannot claim team serialisation.
+        os.environ["TF_DEVICE_LOCK_PATH"] = "/tmp/tf-override-probe.lock"
+        over = load_gate()
+        require(str(over.DEVICE_LOCK_PATH) == "/tmp/tf-override-probe.lock",
+                "TF_DEVICE_LOCK_PATH was ignored: lock still resolves to %r"
+                % (str(over.DEVICE_LOCK_PATH),))
+        identity = over.device_lock_identity()
+        require(identity["canonical"] is False,
+                "an override run still reports canonical=True, so it would be cited as "
+                "evidence that team jobs are serialised: %r" % (identity,))
+        require(not identity["team_serialisation_claimed"],
+                "an override run still claims team serialisation: %r" % (identity,))
+    finally:
+        os.environ.pop("TF_DEVICE_LOCK_PATH", None)
+        if saved is not None:
+            os.environ["TF_DEVICE_LOCK_PATH"] = saved
+
+
+def test_canonical_lock_serialises_two_real_jobs_OPT_IN():
+    """OPT-IN: contention on the REAL team lock. Skipped unless asked to run.
+
+    A private path proves the lease MECHANISM; it does not prove the file the team
+    actually shares behaves the same way (that one is root-owned, mode 0666, and
+    recreated from the container side). Someone may want that evidence deliberately,
+    inside an approved device window.
+
+    It must never be the default, because then every ordinary test run would become a
+    real device-lock event for the whole team: a red suite and a live device job
+    would be indistinguishable to everyone else, and a hung suite would hold up the
+    team's card.
+    """
+    if os.environ.get("TF_TEST_CANONICAL_LOCK") != "1":
+        raise SkipCase(
+            "opt-in: set TF_TEST_CANONICAL_LOCK=1 inside an approved device window")
+    results, lock_path = _two_real_workers(canonical=True)
+    entered = [line for line in results if line.startswith("ENTERED")]
+    require(len(entered) == 2,
+            "the two real jobs did not both get through the canonical lock: %r"
+            % (results,))
+    spans = sorted(_worker_spans(results))
+    require(len(spans) == 2, "the workers did not both report a span: %r" % (results,))
+    require(spans[0][1] <= spans[1][0],
+            "the two jobs OVERLAPPED on the canonical team lock: %r" % (spans,))
 
 
 def test_lock_is_released_after_a_failing_payload():
@@ -1052,14 +1148,59 @@ def test_reference_verifier_discriminates_every_negative():
                 "the %s record was refused as %r, not %s, so that case does not isolate "
                 "its defect" % (label, refused, expected))
 
+CANONICAL_LOCK = Path("/home/.tf_device0.lock")
+
+
+def _canonical_lock_signature():
+    """Identity of the real team lock: inode, mtime, size and mode.
+
+    mtime alone is not enough. A lock that is deleted and recreated can carry the
+    same mtime to the second, and an inode change with an unchanged mtime is exactly
+    what a "removed and remade" lock looks like -- which is a much bigger event than
+    a lease being taken and released.
+    """
+    try:
+        st = CANONICAL_LOCK.stat()
+    except OSError:
+        return None
+    return {"inode": st.st_ino, "mtime_ns": st.st_mtime_ns, "size": st.st_size,
+            "mode": oct(st.st_mode & 0o777)}
+
+
 def main() -> int:
     print("P0-E/F/G/H behavioural contract against the gate at:")
     print("  %s" % GATE_PATH)
+    before = _canonical_lock_signature()
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             check(name, fn)
+    after = _canonical_lock_signature()
+    # This suite must leave the team's lock exactly as it found it. Without this
+    # assertion "the tests avoid the canonical lock" is only a claim in a comment;
+    # with it, any future case that starts taking the real lock fails HERE, by name.
+    # It is evaluated BEFORE the tallies so the failure is counted, not printed after
+    # a summary that would then read as green.
     print()
-    print("%d passed, %d failed" % (len(PASS), len(FAIL)))
+    opt_in_ran = "test_canonical_lock_serialises_two_real_jobs_OPT_IN" in PASS
+    if opt_in_ran:
+        print("CANONICAL LOCK: unchanged check SKIPPED, because the opt-in canonical")
+        print("  case ran deliberately. It is expected to move the lock; that is why")
+        print("  it is opt-in. Pre-run state: %r" % (before,))
+    elif before is None and after is None:
+        print("CANONICAL LOCK: absent before and after (nothing to disturb)")
+    elif before != after:
+        print("CANONICAL LOCK WAS TOUCHED BY THIS SUITE -- the suite must not take the")
+        print("  team's coordination lock; a test-owned path proves the same semantics.")
+        print("  before: %r" % (before,))
+        print("  after : %r" % (after,))
+        FAIL.append("this suite modified the canonical team lock %s: %r -> %r"
+                    % (CANONICAL_LOCK, before, after))
+    else:
+        print("CANONICAL LOCK: unchanged (inode=%s mtime_ns=%s mode=%s)"
+              % (before["inode"], before["mtime_ns"], before["mode"]))
+    print()
+    print("%d passed, %d failed%s" % (len(PASS), len(FAIL),
+                                      (", %d skipped" % len(SKIP)) if SKIP else ""))
     if FAIL:
         print()
         print("GAPS (each line is a behaviour that did not happen):")
