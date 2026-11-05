@@ -109,7 +109,10 @@ def _wheel_for(name: str, version: str | None = None) -> Path | None:
     stem = name.lower().replace("-", "_").replace(".", "_")
     want = (version or "").lower().replace(".", "_").replace("-", "_")
     for candidate in sorted(E.WHEEL_CACHE.glob("*.whl")):
-        low = candidate.name.lower().replace("-", "_")
+        # Normalise DOTS too: the version in a filename keeps them ("pyyaml_6.0.3"),
+        # while the pin is compared as "6_0_3". Without this every pin looks absent
+        # offline, which would send a converge to the network for no reason.
+        low = candidate.name.lower().replace("-", "_").replace(".", "_")
         if not (low.startswith(stem + "-") or low.startswith(stem + "_")):
             continue
         if not want:
