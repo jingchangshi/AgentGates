@@ -16,7 +16,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_gate.py": "24da3c8c97ba30881bf1b2d6976678b080a05f42d7e5c494e6b628355708ba67",
+    "scripts/tilefoundry_gate.py": "857fec2141c8352365e88c426522c633cce7d77cd347a72bd5138f414dae512a",
     "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
     "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",
     "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae"
@@ -126,15 +126,15 @@
       "gateType": "deterministic-test",
       "observationChecks": {
         "exitCodeZero": true,
-        "explicitDeviceId": true,
         "ranAsRoot": true,
-        "deviceCountOne": true,
+        "multiDeviceCoverage": true,
         "assertionInsidePayload": true,
         "deviceBoundIntoContainer": true,
-        "occupancyReported": true,
-        "busyRecorded": true
+        "occupancyRecorded": true,
+        "deviceWorkloadExecuted": true,
+        "deviceIdentityRecorded": true
       },
-      "description": "Runs one device workload as root inside the container, on an explicitly named device, with the identity assertion executed in-payload. A SHARED card is normal (HANDOFF section 4): occupancy is read first (before torch_npu/aclInit) and a busy card is RECORDED (busyRecorded=true), not refused; timings are provisional. Only health/readability (npu-smi unreadable/failed), identity (device id/binding/in-payload assertion) and ffi errors yield 75 BLOCKED_ENV."
+      "description": "Runs a real device workload (set_device + tensor add + synchronize + numeric check) on every device in the requested ASCEND_RT_VISIBLE_DEVICES list, as root inside the container, with the exact list asserted in-payload. Occupancy is read ONCE and recorded as non-verdict metadata; busy and idle run the same workload, with the same verdict rule. No busy wait, poll, skip, fallback, or exclusive refusal exists. BLOCKED_ENV is reserved for real faults: missing root, unreadable/failed npu-smi, health not OK, requested device not bound into the container, or authentication failure."
     }
   ],
   "provenance": {
@@ -208,16 +208,24 @@
       ]
     },
     "busyDevicePolicy": {
-      "default": "RECORD occupancy and PROCEED: a shared card is normal and busy is allowed (HANDOFF section 4). busyRecorded=true; timings are provisional, numerics unaffected by contention.",
-      "refusalSet": "ONLY health/readability (npu-smi unreadable or failed -> occupancy UNKNOWN), identity (device id, device not bound, in-payload assertion), and ffi errors yield 75 BLOCKED_ENV. Occupancy itself is NEVER a refusal reason.",
-      "ordering": "Occupancy is still read in gate_device BEFORE torch_npu is imported, so a health problem is reported before any device node is opened. tests/device_policy.py enforces: occupancy precedes the probe, and NO branch returns BLOCKED_ENV conditioned on occupied.",
-      "legacy": "TF_ALLOW_BUSY_DEVICE=1 is accepted but no longer needed; a busy card is allowed by default.",
-      "superseded": "The previous policy REFUSED a busy card by default (with TF_ALLOW_BUSY_DEVICE as an override). That contradicted HANDOFF section 4 (shared card multi-user is normal; busy only recorded, never refused) and is replaced."
+      "default": "RECORD occupancy once and PROCEED. All Ascend cards are shared; busy is non-verdict metadata. Busy and idle run the same workload with the same verdict rule.",
+      "refusalSet": "ONLY real faults: missing root/auth/lock, unreadable/failed npu-smi, health not OK, requested device not bound into the container.",
+      "ordering": "Occupancy is read before torch_npu is imported, so a health fault is reported before a device node opens; the read is not an admission test.",
+      "legacy": "TF_ALLOW_BUSY_DEVICE and TF_REQUIRE_EXCLUSIVE are RETIRED and ignored; neither can change dispatch, selection, verdict, retry, or skip.",
+      "superseded": "A prior policy refused a held card by default and required TF_ALLOW_BUSY_DEVICE=1 to share. That is abrogated and must not be restored."
     },
     "registryStatus": {
       "registeredWithAgentGates": false,
-      "why": "list_workspaces returns ascendnpu-ir and tilelang; tilefoundry-npu is not listed. No server-side gate record or run id exists for this adapter, so the local evidence JSON is not a verified service receipt.",
+      "why": "list_workspaces does not list tilefoundry-npu. No server-side gate record or run id exists, so local JSON is self-described evidence, not a service receipt.",
       "localJsonIs": "self-described evidence from the gate process, with no independent attestation"
+    },
+    "reachableDeviceChain": {
+      "targetInEngineDeviceMaps": false,
+      "targetInEngineExclusiveMap": false,
+      "targetInEngineEnvPrefixMap": false,
+      "callsDeviceSelectSh": false,
+      "callsDeviceRunSh": false,
+      "note": "tilefoundry-npu is not in engine.DEVICE_ADAPTERS, EXCLUSIVE_VARIABLE, OWN_PREFIX, or DEVICE_LEASE maps. gate_device does not call TF docker/ascend950pr/device-select.sh or device-run.sh, so their legacy --exclusive branch is unreachable from this adapter. Generic AgentGates exclusivity remains for other adapters but cannot reach this one; do not add this adapter to those maps."
     }
   }
 }

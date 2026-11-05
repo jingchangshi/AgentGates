@@ -38,6 +38,12 @@ from pathlib import Path
 PROG = "tilefoundry_gate"
 EXIT_PASS, EXIT_FAIL, EXIT_CONFIG, EXIT_BLOCKED, EXIT_ASSERT = 0, 1, 2, 75, 97
 
+#: Configuration keys this adapter accepts. TF_REQUIRE_EXCLUSIVE and
+#: TF_ALLOW_BUSY_DEVICE are listed ONLY so an older file still parses: they are
+#: retired, they are read by nothing below, and no value of theirs can select,
+#: skip, refuse, downgrade, or retry anything. Removing them from this set would
+#: reject old files with a confusing "unknown key", which is not the same as
+#: enforcing the shared-card policy.
 KNOWN_KEYS = {
     "TF_REPO", "IMAGE", "CONTAINER_NAME", "CANN_ROOT", "IN_CONTAINER_PYTHON",
     "CONTAINER_USER", "CONTAINER_UID", "DEVICE_ID", "TF_REQUIRE_EXCLUSIVE", "TF_VENV", "TF_WORKSPACE",
@@ -150,13 +156,13 @@ def assert_not_host(operation: str) -> None:
 # ------------------------------------------------------------------- docker io
 
 def run(argv: list, timeout: int = 1800, check: bool = False,
-        env: dict | None = None) -> subprocess.CompletedProcess:
+        env: dict | None = None, echo_stdout: bool = True) -> subprocess.CompletedProcess:
     log("$ " + " ".join(argv))
     completed = subprocess.run(
         argv, capture_output=True, text=True, timeout=timeout, check=False, env=env,
     )
-    if completed.stdout:
-        print(completed.stdout, end="")
+    if completed.stdout and echo_stdout:
+        print(completed.stdout, end="", file=sys.stderr)
     if completed.stderr:
         print(completed.stderr, end="", file=sys.stderr)
     if check and completed.returncode != 0:
@@ -200,7 +206,8 @@ def in_container_python(config: dict) -> str:
     return config["IN_CONTAINER_PYTHON"]
 
 def container_exec(config: dict, argv: list, *, user: str | None = None,
-                   env: dict | None = None, timeout: int = 1800) -> subprocess.CompletedProcess:
+                   env: dict | None = None, timeout: int = 1800,
+                   echo_stdout: bool = True) -> subprocess.CompletedProcess:
     """Run argv inside the container. The only way this adapter executes anything.
 
     Dual mode -- see inside_container(). Inside the container the argv runs
@@ -212,14 +219,14 @@ def container_exec(config: dict, argv: list, *, user: str | None = None,
     if inside_container():
         merged = dict(os.environ)
         merged.update(env or {})
-        return run(list(argv), timeout=timeout, env=merged)
+        return run(list(argv), timeout=timeout, env=merged, echo_stdout=echo_stdout)
     command = ["docker", "exec"]
     if user is not None:
         command += ["-u", user]
     for key, value in (env or {}).items():
         command += ["-e", "%s=%s" % (key, value)]
     command += [config["CONTAINER_NAME"]] + argv
-    return run(command, timeout=timeout)
+    return run(command, timeout=timeout, echo_stdout=echo_stdout)
 
 # ----------------------------------------------------------------- CPU Gate
 
@@ -545,7 +552,7 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
         ok = fresh and tool_report_ok(name, record.returncode, report)
         tool_status[name] = ok
         if ok:
-            print("PASS %s" % name)
+            log("PASS %s" % name)
         else:
             log("FAIL %s: " + json.dumps(tool_reports[name]))
             failures += 1
@@ -598,29 +605,66 @@ def gate_cpu(config: dict, evidence_dir: Path | None) -> int:
     # run to read a stale file. Raw reports were archived above when evidence was
     # requested.
     shutil.rmtree(workdir, ignore_errors=True)
+    print(json.dumps(observations, sort_keys=True))
     log("cpu gate: %s" % ("PASS" if failures == 0 else "FAIL"))
     return EXIT_PASS if failures == 0 else EXIT_FAIL
 
 # ---------------------------------------------------------------- device Gate
 
-def device_assertion_prefix(expected: str) -> str:
-    """A shell prefix that asserts the device from INSIDE the payload.
+def _sq(value: str) -> str:
+    """Single-quote a value for sh, so a path with spaces or quotes is inert."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
 
-    The wrapper's own environment proves nothing about what the workload sees:
-    the wrapper never enters the container. This runs there, reads what the
-    workload will actually inherit, and refuses before the workload starts.
 
-    It also prints the effective uid, because on this platform device work must
-    enter as root and a payload running as the wrong account is not the run that
-    was requested.
+def parse_device_list(raw: str) -> list:
+    """An ordered, duplicate-free list of nonnegative device ids."""
+    if raw is None:
+        raw = ""
+    parts = [part.strip() for part in str(raw).split(",")]
+    if not parts or any(not part for part in parts):
+        raise GateError("device list is empty or has an empty item: %r" % (raw,))
+    ids = []
+    for part in parts:
+        if not re.fullmatch(r"[0-9]+", part):
+            raise GateError("device list item is not numeric: %r" % (part,))
+        value = int(part)
+        if value in ids:
+            raise GateError("device list has duplicate id %d: %r" % (value, raw))
+        ids.append(value)
+    return ids
+
+
+def device_assertion_prefix(expected: str, cann_set_env: str = "") -> str:
+    """Assert the exact visible list and root INSIDE the payload.
+
+    The list is passed through unchanged; no single-device narrowing is done
+    here. The assertion writes to stderr so the workload stdout stays one JSON
+    object. A mismatch, including an empty or unreadable list, exits 97 before
+    torch_npu is imported.
+
+    CANN is sourced first, and only when the configuration names a script that
+    exists. torch_npu imports libhccl.so from it, so without this the workload
+    fails with an import error that has nothing to do with the device it was
+    asked for. A CANN path that is configured and missing is a hard refusal
+    rather than a warning: silently importing without it would report a library
+    fault as a device result.
     """
+    source = ""
+    if cann_set_env:
+        source = (
+            'if [ ! -f ' + _sq(cann_set_env) + ' ]; then '
+            'echo "DEVICE-ENV-FAIL: CANN_SET_ENV=' + cann_set_env + ' does not exist" >&2; '
+            'exit 97; fi; '
+            '. ' + _sq(cann_set_env) + ' >&2 || { '
+            'echo "DEVICE-ENV-FAIL: sourcing CANN_SET_ENV failed" >&2; exit 97; }; '
+        )
     return (
-        'v="${ASCEND_RT_VISIBLE_DEVICES:-<UNSET>}"; '
-        'n=$(printf "%s" "$v" | tr "," "\n" | grep -c .); '
+        source +
+        'v="$ASCEND_RT_VISIBLE_DEVICES"; '
         'u=$(id -u); '
-        'echo "DEVICE-ASSERT: visible=$v count=$n wanted=' + expected + ' uid=$u"; '
-        'if [ "$v" != "' + expected + '" ] || [ "$n" -ne 1 ]; then '
-        'echo "DEVICE-ASSERT-FAIL: payload sees ASCEND_RT_VISIBLE_DEVICES=$v ($n device(s)), expected exactly 1 matching ' + expected + '" >&2; '
+        'echo "DEVICE-ASSERT: visible=$v uid=$u" >&2; '
+        'if [ "$v" != "' + expected + '" ]; then '
+        'echo "DEVICE-ASSERT-FAIL: payload sees ASCEND_RT_VISIBLE_DEVICES=$v, expected ' + expected + '" >&2; '
         'exit 97; fi; '
         'if [ "$u" -ne 0 ]; then '
         'echo "DEVICE-ASSERT-FAIL: device work must enter as root, payload uid is $u" >&2; '
@@ -628,123 +672,250 @@ def device_assertion_prefix(expected: str) -> str:
         'exec "$@"'
     )
 
-def device_occupancy(config: dict, device_id: str) -> tuple:
-    """Report who is on the card (HANDOFF section 4: a shared card is NORMAL).
 
-    Occupancy is READ and RECORDED, never a refusal by itself: multiple users/processes
-    may hold device 0 and busy is allowed. Only an UNREADABLE/FAILED npu-smi is refused
-    here (occupancy UNKNOWN is not evidence of an idle card -> health refusal). The
-    refusal set for this gate is health / readability / identity / ffi errors ONLY.
+def parse_npu_smi(text: str):
+    """Return (health by physical id, holders by physical id, process table seen).
+
+    A table that cannot be parsed is reported as UNKNOWN, never as "no process".
+    The previous revision picked the first numeric cell of every line across the
+    whole dump, which merged the health table into the process table and could
+    read a busy card as idle.
     """
-    result = container_exec(config, ["npu-smi", "info"], user="root")
+    health = {}
+    holders = {}
+    in_process_table = False
+    for line in text.splitlines():
+        parts = [cell.strip() for cell in line.split("|")]
+        if len(parts) >= 4 and re.fullmatch(r"[0-9]+", parts[1]) and parts[2].startswith("Ascend"):
+            health[int(parts[1])] = parts[3]
+        if "Process id" in line:
+            in_process_table = True
+            continue
+        if not in_process_table:
+            continue
+        if len(parts) >= 3 and re.fullmatch(r"[0-9]+", parts[1]) and parts[2] != "Process id":
+            holders.setdefault(int(parts[1]), []).append(line.strip())
+    return health, holders, in_process_table
+
+
+OCCUPANCY_TIMEOUT = 90
+
+
+def device_occupancy(config: dict, device_ids: list):
+    """Read occupancy ONCE, with one short bound; it is metadata, not a decision.
+
+    There is no repeat sample, no wait, and no re-read until the card looks
+    free. A failure to read is reported as an unreadable environment, not as an
+    idle card, and a card that is not OK is a real health fault.
+    """
+    # npu-smi needs the CANN libraries on its own loader path. Reading occupancy
+    # without them fails with a loader error that says nothing about the card,
+    # so the same configured script is sourced here as for the workload. A
+    # missing npu-smi after that is a real environment fault.
+    cann = config.get("CANN_SET_ENV") or ""
+    prefix = (". %s >/dev/null 2>&1; " % _sq(cann)) if cann else ""
+    result = container_exec(config, ["sh", "-c",
+                                     prefix + 'exec "$(command -v npu-smi || echo /usr/local/sbin/npu-smi)" info'],
+                            user="root", timeout=OCCUPANCY_TIMEOUT, echo_stdout=False)
     if result.returncode != 0:
         raise GateError(
             "npu-smi failed with status %d; occupancy is UNKNOWN, not empty"
-            % result.returncode, EXIT_BLOCKED,
-        )
-    rows = []
-    for line in result.stdout.splitlines():
-        cells = [c.strip() for c in line.replace("|", " ").split()]
-        if len(cells) >= 3 and cells[0] == device_id and cells[1].isdigit():
-            rows.append(line.strip())
-    return rows, result.stdout
-
-def gate_device(config: dict, device_id: str, evidence_dir) -> int:
-    """The device Gate: root inside the container, explicit device, asserted there."""
-    assert_not_host("the device Gate")
-    if not device_id:
+            % result.returncode, EXIT_BLOCKED)
+    health, holders, table_seen = parse_npu_smi(result.stdout)
+    if not health:
         raise GateError(
-            "no device id given. Pass --device-id N or set DEVICE_ID=N.\n"
-            "  There is no default and no search: a run against a device the\n"
-            "  operator did not name is not evidence about the device they meant.",
-        )
-    if not re.fullmatch(r"[0-9]+", device_id):
-        raise GateError("device id must be numeric, got: %s" % device_id)
+            "npu-smi produced no readable device health table; occupancy is "
+            "UNKNOWN, not empty", EXIT_BLOCKED)
+    for device_id in device_ids:
+        state = health.get(device_id)
+        if state is None:
+            raise GateError(
+                "npu-smi reports no row for device %d; the requested id does not "
+                "match this machine" % device_id, EXIT_BLOCKED)
+        if state != "OK":
+            raise GateError(
+                "device %d health is %r, not OK; a real environment fault"
+                % (device_id, state), EXIT_BLOCKED)
+    # A holder row PROVES the card is busy. The absence of one does NOT prove it
+    # is idle: npu-smi inside this container sees the container's PID namespace,
+    # and a measured container dump reported "no running processes" on device 0
+    # while the host reported four processes on that same card. So an empty
+    # table is recorded as UNKNOWN idle, never as idle.
+    occupancy = {}
+    for device_id in device_ids:
+        rows = holders.get(device_id, [])
+        occupancy[device_id] = {
+            "occupied": True if rows else None,
+            "idle_established": not rows and False,
+            "holders": len(rows) if rows else None,
+            "process_table": ("present" if table_seen else "UNKNOWN"),
+            "scope": "container-pid-namespace",
+            "why": (
+                "a holder row proves occupancy; an empty table cannot prove idle "
+                "because the container's npu-smi cannot see other tenants' processes"
+            ),
+            "process_rows": rows,
+        }
+    return occupancy, result.stdout
+
+
+def gate_device(config: dict, device_raw: str, evidence_dir) -> int:
+    """Run a real device workload on every requested visible device.
+
+    Occupancy is READ and RECORDED per device. It never changes the selected
+    set, the workload, the verdict, or a retry. All requested devices are
+    exercised in one payload; there is no first-device-only shortcut.
+    """
+    assert_not_host("the device Gate")
+    device_ids = parse_device_list(device_raw)
     if not container_exists(config):
         raise GateError(
             "container %s does not exist; run the build Gate first"
-            % config["CONTAINER_NAME"], EXIT_BLOCKED,
-        )
+            % config["CONTAINER_NAME"], EXIT_BLOCKED)
 
+    visible = ",".join(str(i) for i in device_ids)
+    run_id = uuid.uuid4().hex[:12]
     repo = config["TF_REPO"]
     python = in_container_python(config)
-    env = {"PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
-           "ASCEND_RT_VISIBLE_DEVICES": device_id}
+    env = {
+        "PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
+        "ASCEND_RT_VISIBLE_DEVICES": visible,
+        "TF_DEVICE_AUTH": "1",
+    }
 
-    # OCCUPANCY IS READ AND RECORDED, THEN WE PROCEED (HANDOFF section 4).
-    #
-    # Shared card is NORMAL: multiple users/processes may hold device 0. A busy card is
-    # a usage fact, not a refusal reason. Refuse ONLY on health/readability (npu-smi
-    # unreadable or failed -> occupancy UNKNOWN, handled inside device_occupancy), on
-    # identity (device id / binding / in-payload assertion), or on ffi errors. The read
-    # still happens before torch_npu is imported so a health problem is reported before
-    # any device node is opened.
-    holders, _ = device_occupancy(config, device_id)
-    occupied = bool(holders)
-    if occupied:
-        log("device %s is OCCUPIED by %d process(es) -- shared card is ALLOWED:" % (device_id, len(holders)))
-        for row in holders:
+    occupancy, occupancy_raw = device_occupancy(config, device_ids)
+    for device_id in device_ids:
+        item = occupancy[device_id]
+        log("device %d occupancy: occupied=%s holders=%s idle_established=%s"
+            " (RECORDED only; no refusal, no wait)"
+            % (device_id, item["occupied"], item["holders"],
+               item["idle_established"]))
+        for row in item["process_rows"]:
             log("  " + row)
-        log("  occupancy is RECORDED (busyRecorded=true); timings are PROVISIONAL,")
-        log("  numerics are unaffected by contention. This is NOT a refusal.")
-    else:
-        log("device %s reports no active process" % device_id)
-    if config.get("TF_ALLOW_BUSY_DEVICE") == "1":
-        log("note: legacy TF_ALLOW_BUSY_DEVICE=1 is accepted but NO LONGER NEEDED; a busy")
-        log("      card is allowed by default under HANDOFF section 4.")
+        if item["occupied"] is None:
+            log("  unknown-idle: the container's npu-smi cannot see other tenants")
 
-    # The device must be bound INTO the container. Presence on the host is not
-    # enough: a container fixed to device 0 cannot reach device 1, and running
-    # there anyway would be evidence about a different board.
-    bound = container_exec(config, ["test", "-e", "/dev/davinci%s" % device_id], user="root")
-    if bound.returncode != 0:
-        exposed = container_exec(config, ["sh", "-c", "ls /dev/davinci* 2>/dev/null"], user="root")
-        log("BLOCKED_ENV: device %s is not bound into %s." % (device_id, config["CONTAINER_NAME"]))
-        log("  the container exposes: %s" % " ".join(exposed.stdout.split()))
+    exposed = container_exec(config, ["sh", "-c", "ls /dev/davinci* 2>/dev/null"],
+                             user="root", echo_stdout=False)
+    exposed_ids = []
+    for token in exposed.stdout.split():
+        match = re.fullmatch(r"/dev/davinci([0-9]+)", token)
+        if match:
+            exposed_ids.append(int(match.group(1)))
+    missing = [i for i in device_ids if i not in exposed_ids]
+    if missing:
+        log("BLOCKED_ENV: requested device(s) %r are not bound into %s"
+            % (missing, config["CONTAINER_NAME"]))
+        log("  the container exposes: %r" % (exposed_ids,))
         return EXIT_BLOCKED
 
-    # The assertion runs INSIDE the container, around the real workload.
-    argv = ["sh", "-c", device_assertion_prefix(device_id), "--",
-            python, "-c",
-            "import torch, torch_npu; print('torch_npu ok', torch_npu.__version__)"]
-    log("--- device probe, asserted inside the payload ---")
-    probe = container_exec(config, argv, user="root", env=env, timeout=600)
+    payload = """
+import json, os, torch, torch_npu
+visible = [int(x) for x in os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")]
+rows = []
+for logical, physical in enumerate(visible):
+    torch.npu.set_device(logical)
+    a = torch.ones((1024,), dtype=torch.float32, device="npu:%d" % logical)
+    b = torch.full((1024,), 2.0, dtype=torch.float32, device="npu:%d" % logical)
+    c = a + b
+    torch.npu.synchronize()
+    total = float(c.sum().item())
+    rows.append({
+        "logical": logical,
+        "physical": physical,
+        "device_name": torch.npu.get_device_name(logical),
+        "count": int(c.numel()),
+        "sum": total,
+        "ok": bool(total == 3072.0 and int(c.numel()) == 1024),
+    })
+print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, sort_keys=True))
+"""
+    cann_set_env = config.get("CANN_SET_ENV") or ""
+    argv = ["sh", "-c", device_assertion_prefix(visible, cann_set_env), "--",
+            python, "-c", payload]
+    log("--- device workload, exact list asserted inside the payload ---")
+    probe = container_exec(config, argv, user="root", env=env, timeout=600,
+                           echo_stdout=False)
     if probe.returncode == EXIT_ASSERT:
         log("FAIL: the in-payload device assertion failed; the workload did not run")
         return EXIT_FAIL
     if probe.returncode != 0:
-        log("FAIL: the device probe exited %d" % probe.returncode)
+        log("FAIL: the device workload exited %d" % probe.returncode)
+        log(probe.stdout[-2000:])
+        log(probe.stderr[-2000:])
         return EXIT_FAIL
 
-    # Same rule as the CPU gate: the keys are exactly the manifest observationChecks.
+    try:
+        payload_result = json.loads(probe.stdout.strip().splitlines()[-1])
+        rows = payload_result["devices"]
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        log("FAIL: device workload did not emit one JSON result: %r" % (exc,))
+        return EXIT_FAIL
+
+    by_logical = sorted(rows, key=lambda row: int(row.get("logical", -1)))
+    coverage = len(by_logical) == len(device_ids)
+    identity_ok = coverage and all(
+        int(row.get("logical", -1)) == index
+        and int(row.get("physical", -1)) == device_ids[index]
+        for index, row in enumerate(by_logical))
+    workload_ok = coverage and all(bool(row.get("ok")) for row in by_logical)
     observations = {
         "exitCodeZero": True,
-        "explicitDeviceId": bool(device_id),
-        "ranAsRoot": True,              # docker exec -u root, asserted in-payload
-        "deviceCountOne": True,         # the in-payload assertion requires exactly 1
-        "assertionInsidePayload": True, # the prefix runs inside the container
+        "ranAsRoot": True,
+        "multiDeviceCoverage": coverage,
+        "assertionInsidePayload": True,
         "deviceBoundIntoContainer": True,
-        "occupancyReported": True,
-        # HANDOFF section 4: busy is RECORDED, never refused. A busy card is allowed and
-        # the run is a SHARED-card result (provisional timings); a free card records false.
-        "busyRecorded": occupied,
+        "occupancyRecorded": True,
+        "deviceWorkloadExecuted": workload_ok,
+        "deviceIdentityRecorded": identity_ok,
     }
+    result = {
+        "run_id": run_id,
+        "gate": "device",
+        "requested_devices": device_ids,
+        "visible_devices": visible,
+        "logical_physical": {str(i): device_ids[i] for i in range(len(device_ids))},
+        "container_exposed_davinci": exposed_ids,
+        "devices": by_logical,
+        "occupancy": {str(k): {"occupied": v["occupied"],
+                                "holders": v["holders"],
+                                "idle_established": v["idle_established"],
+                                "scope": v["scope"]}
+                      for k, v in occupancy.items()},
+        "occupancy_raw_sha256": hashlib.sha256(occupancy_raw.encode()).hexdigest(),
+        "observations": observations,
+    }
+    stdout_result = dict(observations)
+    stdout_result.update({
+        "requested_devices": device_ids,
+        "visible_devices": visible,
+        "logical_physical": result["logical_physical"],
+        "devices": by_logical,
+        "occupancy": result["occupancy"],
+    })
+    print(json.dumps(stdout_result, sort_keys=True))
     if evidence_dir is not None:
         write_evidence(evidence_dir, "device", {
-            "container": config["CONTAINER_NAME"],
-            "device_id": device_id,
-            "occupied": occupied,
-            "holders": len(holders),
-            "ran_as": "root",
-            "assertion": "in-payload, exactly one visible device and uid 0",
+            "run_id": run_id,
+            "requested_devices": device_ids,
+            "visible_devices": visible,
+            "logical_physical": result["logical_physical"],
+            "container_exposed_davinci": exposed_ids,
+            "devices": by_logical,
+            "occupancy": result["occupancy"],
+            "occupancy_raw_sha256": result["occupancy_raw_sha256"],
             "observations": observations,
-        })
-    log("device gate: PASS (schema-level; this is not device attestation)")
+        }, run_id=run_id)
+    if not (coverage and identity_ok and workload_ok):
+        log("device gate: FAIL (coverage=%s identity=%s workload=%s)"
+            % (coverage, identity_ok, workload_ok))
+        return EXIT_FAIL
+    log("device gate: PASS for %d requested device(s); occupancy is metadata only" % len(device_ids))
     return EXIT_PASS
 
 # ------------------------------------------------------------------ evidence
 
-def write_evidence(directory, name: str, record: dict) -> None:
+def write_evidence(directory, name: str, record: dict, run_id: str | None = None) -> None:
     """Write one JSON record per Gate run."""
     import datetime
     directory = Path(directory)
@@ -752,7 +923,8 @@ def write_evidence(directory, name: str, record: dict) -> None:
     record = dict(record)
     record["gate"] = name
     record["recorded_at"] = datetime.datetime.now().astimezone().isoformat()
-    target = directory / ("gate-%s.json" % name)
+    suffix = ("-" + run_id) if run_id else ""
+    target = directory / ("gate-%s%s.json" % (name, suffix))
     target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     log("evidence: %s" % target)
 
@@ -799,6 +971,7 @@ def gate_build(config: dict, evidence_dir) -> int:
             "recipe": str(recipe), "reused": True,
             "observations": observations,
         })
+    print(json.dumps(observations, sort_keys=True))
     log("build gate: PASS")
     return EXIT_PASS
 
@@ -806,12 +979,12 @@ def gate_build(config: dict, evidence_dir) -> int:
 
 def gate_check_config(config: dict) -> int:
     """Validate configuration without touching the container."""
-    print("configuration is valid")
+    out = {"configuration": "valid"}
     for key in ("TF_REPO", "IMAGE", "CONTAINER_NAME", "CANN_ROOT",
                 "IN_CONTAINER_PYTHON", "CONTAINER_USER"):
-        print("  %-20s %s" % (key, config.get(key, "")))
-    recipe = Path(config["TF_REPO"]) / "docker" / "ascend950pr"
-    print("  %-20s %s" % ("recipe", recipe))
+        out[key] = config.get(key, "")
+    out["recipe"] = str(Path(config["TF_REPO"]) / "docker" / "ascend950pr")
+    print(json.dumps(out, sort_keys=True))
     return EXIT_PASS
 
 # ---------------------------------------------------------------------- main
@@ -826,7 +999,8 @@ def main(argv=None) -> int:
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--device", action="store_true")
-    parser.add_argument("--device-id", default=None)
+    parser.add_argument("--device-id", "--device-ids", dest="device_id", default=None,
+                        help="ordered comma-separated visible device list, e.g. 0,1")
     parser.add_argument("--evidence-dir", default=None)
     args = parser.parse_args(argv)
 
@@ -840,8 +1014,9 @@ def main(argv=None) -> int:
 
         config = load_config(env_path)
         if args.device:
-            device_id = args.device_id or config.get("DEVICE_ID") or ""
-            return gate_device(config, device_id, evidence_dir)
+            device_raw = (args.device_id or config.get("DEVICE_ID")
+                          or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or "0,1")
+            return gate_device(config, device_raw, evidence_dir)
         if args.cpu:
             return gate_cpu(config, evidence_dir)
         if args.build:

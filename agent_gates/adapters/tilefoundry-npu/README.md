@@ -48,32 +48,22 @@ puts on the loader path. The order is fixed: CANN, then conda activate, then
 `ASCEND_RT_VISIBLE_DEVICES`, then import. Two traps: the script breaks under
 `set -u`, and the path has an `ascend-toolkit/` component that is easy to omit.
 
-### A held card is refused, not entered
+### A shared card is entered, not refused
 
-Before anything imports `torch_npu` or reaches `aclInit`, the device Gate reads
-occupancy. If another tenant already holds the card it **refuses with exit 75
-`BLOCKED_ENV`** and the workload never runs.
+All Ascend cards are shared. Before anything imports `torch_npu` or reaches
+`aclInit`, the device Gate reads occupancy once and records it. It then runs the
+same workload whether `occupied` is true or false. **Busy is metadata, never a
+dispatch decision.**
 
-This is the default, and it was learned the hard way. In this program a device open at
-`13:46:26` was followed **32 s later** by a host-wide `docker exec` stall, with the
-card already held by other tenants. A failed `aclInit` still *opens the device node*, so
-"it only errored" is not a defence: the open happens either way.
+This section replaces an earlier policy that refused a held card by default. That
+policy and its `TF_ALLOW_BUSY_DEVICE` override are **retired: do not restore them.**
+No current instruction in this adapter asks an operator to set a busy override,
+and the legacy keys are accepted only so old configuration files parse; they
+cannot change dispatch, selection, verdict, or a retry.
 
-The ordering is the point, so the check lives **above** the probe and must not be moved
-below it. The previous default was the opposite — record occupancy, proceed, refuse only
-when `TF_REQUIRE_EXCLUSIVE=1` — which made walking onto somebody else's card the normal
-case.
-
-An override exists and is deliberately loud:
-
-```
-TF_ALLOW_BUSY_DEVICE=1
-```
-
-It prints an unmissable banner, records `overriddenBusyDevice=true` in the evidence, and
-the result is labelled a **shared-card** result: timings provisional, numerics
-unaffected. The flag is named for what it does, so nobody sets it by accident. There is
-no way to reach a device while hiding that the card was busy.
+The occupancy read stays **above** the probe only so a real health/readability
+fault is reported before a device node is opened. It is not an admission test and
+must not acquire one.
 
 ### Network
 
@@ -153,7 +143,7 @@ found to be incapable of failing:
 
 | check | why it could not fail | what replaced it |
 |---|---|---|
-| busy-card refusal (grep) | reverting the refusal to the opt-in form keeps every string a grep looks for, so it passed on the regression it existed to catch | `tests/device_policy.py`, reading the AST and asserting ORDER and DEFAULT |
+| busy-card refusal (grep) | a grep passed on both the refusal and the opt-in form because every string survived | `tests/device_policy.py`, reading the AST and asserting no busy branch, no wait, and the same workload for busy/idle |
 | manifest/script parity (first version) | read only inline dicts, so it found zero keys and compared two empty sets | name resolution to the nearest assignment *before* each call |
 | manifest/script parity (second version) | resolved to the last assignment in the file, so every Gate reported the final Gate's keys | position-scoped resolution |
 
@@ -162,17 +152,18 @@ above was confirmed by deliberately breaking the thing it watches and observing 
 failure, then restoring it. Those negative controls are part of the record:
 
 ```
-opt-in revert            -> FAIL "the refusal is conditional on an opt-in flag" (1)
-occupancy moved later    -> FAIL on order (1)
-one declared key deleted -> FAIL "declared but never reported: importOk" (1)
-restored                 -> 0
+busy -> skip mutation     -> FAIL "busy changed execution"
+sleep/idle poll inserted  -> FAIL "a wait primitive appeared"
+exclusive refusal restored -> FAIL "an exclusive dispatch branch appeared"
+one declared key deleted  -> FAIL "declared but never reported: importOk"
+restored                  -> 0
 ```
 
-This matters most for properties a runtime assertion cannot observe. "A held card
-returns 75" is testable at runtime; "occupancy is read **before** the device is opened"
-and "the refusal is not conditional on an opt-in flag" are not, because both are about
-code that has not run yet. Grep is not enough for those either — the regression they
-guard against is a change of *structure* that preserves every string. Hence the AST.
+This matters most for properties a runtime assertion cannot observe. "Busy and idle
+execute the same workload the same number of times" and "no branch can be conditioned
+on occupancy" are structural claims. Grep is not enough: the regression they guard
+against is a change of *structure* that preserves every string. Hence the AST plus an
+executed two-state harness.
 
 ## Provision
 
@@ -190,7 +181,7 @@ for rather than substituting something else.
 python3 scripts/tilefoundry_gate.py --check-config   # configuration only
 python3 scripts/tilefoundry_gate.py --build          # image + container
 python3 scripts/tilefoundry_gate.py --cpu            # CPU Gate
-python3 scripts/tilefoundry_gate.py --device --device-id 0
+python3 scripts/tilefoundry_gate.py --device --device-ids 0,1
 ```
 
 Exit codes: `0` PASS, `1` FAIL, `2` configuration, `75` BLOCKED_ENV, `97` the
@@ -207,9 +198,11 @@ as **data**, never sourced: unknown keys, duplicate keys and malformed lines all
 fail. Exporting these names in a shell has no effect, so a stale export cannot
 override what the file says the machine is.
 
-`DEVICE_ID` is deliberately empty. A device id authorizes one run, not a
-machine, so it comes from `--device-id` or `DEVICE_ID` and is never discovered
-or defaulted.
+`DEVICE_ID` is deliberately empty. A device list authorizes one run, not a
+machine. Precedence is explicit: `--device-id/--device-ids` (an ordered comma
+list) wins over `DEVICE_ID`, then the inherited `ASCEND_RT_VISIBLE_DEVICES`,
+then the default `0,1`. Every requested id must be bound into the container; a
+missing node is a real binding fault, not a busy condition.
 
 ## Device Gate
 
@@ -219,22 +212,48 @@ convenience: the Ascend driver holds davinci cards per user namespace
 opener gets `EBUSY` even when it is in the device group. The Gate records that
 it ran as root instead of hiding it.
 
+The workload is real, not an import. For **every** device in the requested
+list, in one payload, the Gate calls `torch.npu.set_device(logical)`, adds two
+`float32` tensors of length 1024 on that device, synchronizes, reads the sum
+back to the host, and checks it equals 3072.0. The per-device result carries
+`logical`, `physical`, `device_name`, `count`, `sum` and `ok`. A device that
+is requested but does not appear in the result makes `multiDeviceCoverage`
+false, which fails the Gate; there is no first-device-only shortcut and no
+import-only fallback.
+
 The assertion runs **inside the container**, wrapping the payload, because the
 wrapper's own environment says nothing about what the workload sees -- the
-wrapper never enters the container. It reads `ASCEND_RT_VISIBLE_DEVICES` as the
-workload will see it, requires exactly one device matching the authorized id,
-requires uid 0, and exits `97` before the workload starts on any mismatch.
+wrapper never enters the container. It sources `CANN_SET_ENV` first (without it
+`torch_npu` cannot load `libhccl.so`, and `npu-smi` cannot load `libc_sec.so`),
+asserts `ASCEND_RT_VISIBLE_DEVICES` equals the requested list **exactly**, in
+order, and asserts uid 0. Any mismatch exits `97` before the workload starts.
 
-Occupancy is **reported, not enforced**. This is a shared server; a busy card is
-not a fact about the code under test. Timings taken while another tenant is
-active are therefore labelled provisional, and numerics are unaffected by
-sharing. `TF_REQUIRE_EXCLUSIVE=1` turns a held card into exit **75** -- not a
-pass, not a failure: there is no result to report.
+Occupancy is **reported, never enforced**. This is a shared server; a busy card
+is not a fact about the code under test. Busy and idle runs execute the same
+workload, with the same verdict rule, and record `occupied`/holders as
+non-verdict metadata. `TF_REQUIRE_EXCLUSIVE` and `TF_ALLOW_BUSY_DEVICE` are
+retired legacy keys and are ignored.
+
+One measured fact makes the metadata honest: `npu-smi` **inside this container**
+reported `No running processes` on device 0 while the **host** reported four
+processes on that same card, because the container sees only its own PID
+namespace. So a holder row proves occupancy, and an empty table proves nothing:
+
+```
+occupancy per device: {"occupied": true|NONE, "holders": n|NONE,
+                       "idle_established": false,
+                       "scope": "container-pid-namespace"}
+```
+
+`occupied: NONE` means UNKNOWN, never "idle". The Gate does not act on it
+either way, and it never re-samples until the table looks the way it prefers.
 
 ## What a PASS does not mean
 
 - **It is not device attestation.** The receipt is written by the same process
   it describes; a schema check cannot detect a deliberate one.
+- **It is not a service receipt.** This adapter is not registered with the
+  AgentGates service; local JSON is evidence, not a signed gate record.
 - **A timing number is provisional** on a shared card and is never a claim
   about the hardware.
 - **A PASS only proves this run, as recorded, under this configuration.**
@@ -246,5 +265,5 @@ tests/negatives.sh
 ```
 
 Covers: missing config, unknown key, duplicate key, empty required value, a repo
-without the docker recipe, host invocation refused, device Gate without an id,
-a non-numeric id, and no subcommand selected.
+without the docker recipe, host invocation refused, device Gate with an empty or
+non-numeric list, a duplicate id, and no subcommand selected.

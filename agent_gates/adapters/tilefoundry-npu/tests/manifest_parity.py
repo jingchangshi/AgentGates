@@ -18,7 +18,9 @@ Exit codes: 0 the two agree, 1 they do not, 2 the inputs could not be read.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -144,6 +146,41 @@ def main() -> int:
             print("  FAIL  %s: recipeId %r is not among the recipes"
                   % (gate.get("id"), gate.get("recipeId")))
             failures += 1
+
+    # The pinned hash and the live script are the same bargain as the checks: a
+    # manifest that pins a digest the script no longer has will refuse to load,
+    # but only when someone runs it. Check it here, statically.
+    pinned = manifest.get("files", {}).get("scripts/tilefoundry_gate.py")
+    live = hashlib.sha256(GATE.read_bytes()).hexdigest()
+    if pinned != live:
+        print("  FAIL  pinned script hash %s does not match the script %s"
+              % (pinned, live))
+        failures += 1
+    else:
+        print("  PASS  the pinned script hash matches the script on disk")
+
+    # A recipe may use only the one supported placeholder. Anything else is
+    # expanded by nobody, so the Gate would receive a literal token and fail at
+    # run time instead of at load time.
+    allowed = {"{pack}"}
+    for recipe in manifest.get("recipes", []):
+        for argument in recipe.get("argv", []):
+            if not isinstance(argument, str):
+                failures += 1
+                print("  FAIL  %s: argv item is not a string" % recipe.get("id"))
+                continue
+            for token in re.findall(r"\{[^}]*\}", argument):
+                if token not in allowed:
+                    failures += 1
+                    print("  FAIL  %s: unsupported placeholder %r in %r"
+                          % (recipe.get("id"), token, argument))
+    device_recipe = next((r for r in manifest.get("recipes", [])
+                          if r.get("id") == "tilefoundry-npu.device"), None)
+    if device_recipe is None or "--device" not in device_recipe.get("argv", []):
+        failures += 1
+        print("  FAIL  the device recipe does not select the device Gate")
+    else:
+        print("  PASS  the device recipe selects the device Gate")
 
     if failures:
         print("RESULT: FAIL (%d)" % failures)

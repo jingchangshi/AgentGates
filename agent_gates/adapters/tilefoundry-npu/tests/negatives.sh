@@ -110,8 +110,14 @@ echo "== device negatives =="
 expect 2 "device Gate without a device id is refused" \
     python3 -B "$GATE" --device --env-file "$TMP/good.sh"
 
-expect 2 "non-numeric device id is refused" \
+expect 2 "non-numeric device list is refused" \
     python3 -B "$GATE" --device --device-id banana --env-file "$TMP/good.sh"
+
+expect 2 "duplicate device list is refused" \
+    python3 -B "$GATE" --device --device-id 0,0 --env-file "$TMP/good.sh"
+
+expect 2 "empty device list is refused" \
+    python3 -B "$GATE" --device --device-id "" --env-file "$TMP/good.sh"
 
 echo "== no Gate selected =="
 expect 2 "no subcommand refuses rather than guessing" \
@@ -138,9 +144,9 @@ else
     fail=$((fail + stale))
 fi
 
-echo "== busy-device policy: refusal first, and by default =="
+echo "== shared-card policy: record only, no wait or refusal =="
 
-expect 0 "busy-device policy holds (order + default + override)" \
+expect 0 "busy and idle run the same workload with the same verdict" \
     python3 "$HERE/device_policy.py"
 echo "== a non-interpreter must be refused, not passed =="
 

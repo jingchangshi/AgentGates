@@ -43,15 +43,13 @@ CONTAINER_USER=s00653124
 
 # --- device ---------------------------------------------------------------
 
-# DELIBERATELY EMPTY. A device id authorizes one Gate run, not a machine, so it
-# is passed per invocation with --device-id or DEVICE_ID. The Gate refuses
-# without one and never discovers or substitutes a device.
+# Empty means: use --device-id/--device-ids, then the inherited
+# ASCEND_RT_VISIBLE_DEVICES, then the default 0,1. A value here is an ordered
+# comma list such as 0,1; it is never a single mandatory id.
 DEVICE_ID=
 
-# HANDOFF section 4: a shared card is NORMAL. Occupancy is RECORDED (busyRecorded)
-# and the run proceeds; a busy card is never a refusal reason. Only health/readability,
-# identity and ffi errors yield BLOCKED_ENV (exit 75). TF_REQUIRE_EXCLUSIVE is a legacy
-# key kept for config compatibility and is IGNORED by the gate.
+# RETIRED legacy keys. They parse so old files still load, but they are IGNORED:
+# busy is recorded only, and no flag can restore an exclusive/busy refusal.
 TF_REQUIRE_EXCLUSIVE=0
 
 # --- optional -------------------------------------------------------------
@@ -76,10 +74,9 @@ CONDA_SH=/data/miniconda3/etc/profile.d/conda.sh
 # ascend-toolkit/ component: /data/pri/cann-9.2.0/set_env.sh does not exist.
 CANN_SET_ENV=/data/pri/cann-9.2.0/ascend-toolkit/set_env.sh
 
-# A card another tenant already holds is REFUSED by default (exit 75 BLOCKED_ENV):
-# occupancy is read before torch_npu is imported, because a failed aclInit still
-# opens the device node. Set this to 1 only to deliberately accept a shared card;
-# the run is then recorded as a shared-card result with provisional timings.
+# RETIRED and IGNORED. A shared card is normal: occupancy is recorded as
+# non-verdict metadata and the same workload runs. Do not set this to request,
+# refuse, skip, downgrade, or wait for a card.
 TF_ALLOW_BUSY_DEVICE=
 
 # The host proxy script. Its exports are passed into docker exec with -e; direct
