@@ -66,6 +66,9 @@ REQUIRED_CLOSURE = (
     "tests/test_verify_tf_cpu_chain.py",
     "tests/manifest_parity.py",
     "tests/fixtures/docker-inspect-foreign.json",
+    # The clean-archive fixture: provision_negatives.sh must not need the
+    # git-ignored env.sh, so the checked-in input it uses is part of the closure.
+    "tests/fixtures/provision.env.fixture",
 )
 
 HELPER_RECIPES = ("tilefoundry-npu.provision",

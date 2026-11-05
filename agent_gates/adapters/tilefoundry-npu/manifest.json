@@ -31,22 +31,23 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_gate.py": "829aee9e953b3dd52ee35520ec86a5c3dc1666d664924db3f17372e3f32b0c42",
-    "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
+    "deployment_profile.json": "2050686838356529cc46a9da01ff1b51cbb8421d975c815a7629babd9a595ec8",
     "scripts/configure.py": "b24174488b83347a6731be6f060fb266097b9ea0dada2a3170f9691f095a1287",
     "scripts/env_context.py": "7c44f47e2c3f5509264e246f62b1470c0007f6bd1dbe656876e504e7fef7f112",
-    "scripts/provision.py": "d7ffd8934bf1943b8fc309f50a064f0bd49a93201be1826b8e9417b4daaf05cc",
+    "scripts/provision.py": "f0cafa3445171ff55e03cf2f3787be7da954365e0c1997504753eaae1abdcd7a",
+    "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
+    "scripts/tilefoundry_gate.py": "829aee9e953b3dd52ee35520ec86a5c3dc1666d664924db3f17372e3f32b0c42",
     "scripts/verify_environment.py": "7fd996c563afbc8c5bf95365751761074268a6455b197d073e002c6a876390db",
-    "deployment_profile.json": "2050686838356529cc46a9da01ff1b51cbb8421d975c815a7629babd9a595ec8",
+    "tests/fixtures/docker-inspect-foreign.json": "c5dfeb005023f83eb0b3ac181d38e72a3ce82032fae6f4a34f2ed3ae5982db61",
+    "tests/fixtures/provision.env.fixture": "7be66866ccb12f1d89dc9326d39eb55a8b598cc61f3e2431204e91a94909c48f",
     "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",
-    "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae",
-    "tests/provision_negatives.sh": "f4ef4a2573e6d2a9b63e743dc8362fbcc527199b8478afa6af0bb21e02ea535a",
-    "tests/verify_negatives.sh": "cf1075dacb8662a18a84f387b4ac53e88f5e8ed5e959ec80ecf34a603152ae1b",
-    "tests/test_no_bare_device_subprocess.py": "d6511753b2b09045c364b618d625c21e3b8052cad9af02dadb3a7f27f0099d04",
+    "tests/manifest_parity.py": "66087cbc88321d707cdcaabb6984da4c388e2a5a8f3cfed2826d98649549e5b3",
+    "tests/provision_negatives.sh": "babf88337d3e42822826547102959d8f0f861385f224f8ba0d56906ba84d07fb",
     "tests/test_configure_negatives.py": "0b680a989b069b5e372a051228e22d0a204b08a202a9efd711d479b383e43ef8",
+    "tests/test_no_bare_device_subprocess.py": "d6511753b2b09045c364b618d625c21e3b8052cad9af02dadb3a7f27f0099d04",
     "tests/test_verify_tf_cpu_chain.py": "9bb5853ec53cdfe031b749e5774679a870f690d4c96b01605c7eb9dfad7d82e1",
-    "tests/manifest_parity.py": "622a695437d8d2222bdb2b55c420a2eb7c26fdf590f7226d26a5f82baa6c2c7b",
-    "tests/fixtures/docker-inspect-foreign.json": "c5dfeb005023f83eb0b3ac181d38e72a3ce82032fae6f4a34f2ed3ae5982db61"
+    "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae",
+    "tests/verify_negatives.sh": "cf1075dacb8662a18a84f387b4ac53e88f5e8ed5e959ec80ecf34a603152ae1b"
   },
   "recipes": [
     {

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +41,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PACK = HERE.parent
 PROFILE_PATH = PACK / "deployment_profile.json"
-ENV_FILE = PACK / "env.sh"
+#: The machine-local half (container name, image tag). It is deliberately untracked:
+#: it is NOT part of the adapter identity. TFNU_ENV_FILE / --env-file exist so tests
+#: and every other caller can name a checked-in fixture instead of depending on a
+#: file that is absent in a clean checkout -- a suite that only passes in a working
+#: tree with an env.sh is not a reproducible suite.
+ENV_FILE = Path(os.environ.get("TFNU_ENV_FILE") or (PACK / "env.sh"))
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -274,7 +280,9 @@ def main(argv=None) -> int:
                         help="inspect a RECORDED docker inspect document instead of the live "
                              "daemon (the drift negatives). Read-only: --apply refuses it.")
     parser.add_argument("--profile", default=str(PROFILE_PATH))
-    parser.add_argument("--env-file", default=str(ENV_FILE))
+    parser.add_argument("--env-file", default=str(ENV_FILE),
+                        help="machine profile file (default: $TFNU_ENV_FILE, else "
+                             "env.sh next to the pack). Tests pass a checked-in fixture.")
     parser.add_argument("--dry-run", action="store_true",
                         help="with --apply, print the docker argv and create nothing")
     parser.add_argument("--start", action="store_true",
