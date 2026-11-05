@@ -1464,12 +1464,100 @@ def _mutant_gate(mutator):
     return module
 
 
-def _call_site(source, name):
-    """The first line that CALLS name (not its def)."""
-    import re
-    return next((line for line in source.splitlines()
-                 if re.search(re.escape(name) + r"\(", line)
-                 and not line.lstrip().startswith("def ")), None)
+def _call_statement(source, name, index=0, same_scope_as=None):
+    """The (start, end, indent) of the statement that CALLS `name`, 1-based.
+
+    Recognises BOTH call forms, because wrapping a helper is a legitimate refactor
+    and the test must not care which one the Gate uses:
+
+        x = environment_preflight(config)
+        x = run_stage("environment", environment_preflight, config)
+
+    and a wrapper may span lines. This is parsed with `ast`, not matched with a
+    regex, precisely so that a `def` line, a comment or a string constant can never
+    be mistaken for a call -- the regex version put an injection inside a function
+    signature and produced invalid Python, which the control then "caught" as a
+    syntax error rather than as the defect it was meant to inject.
+
+    `index` selects among several call statements (occupancy is sampled both before
+    and after the payload), ordered by source position. `same_scope_as` narrows to
+    the calls sitting in the same function as another helper: occupancy has a
+    BEFORE sample (same scope as the preflight, the one that must follow it) and an
+    AFTER sample in a separate finally-scope helper, and picking the wrong one makes
+    the mutation move an unrelated call.
+    """
+    import ast
+    tree = ast.parse(source)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def callee(call):
+        fn = call.func
+        return fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+
+    def enclosing(call):
+        cur = call
+        while cur is not None and not isinstance(cur, ast.stmt):
+            cur = parents.get(cur)
+        return cur
+
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        direct = callee(node) == name
+        wrapped = any(isinstance(a, ast.Name) and a.id == name for a in node.args)
+        if not (direct or wrapped):
+            continue
+        stmt = enclosing(node)
+        if stmt is None or isinstance(stmt, ast.FunctionDef):
+            continue
+        if stmt not in hits:
+            hits.append(stmt)
+    if same_scope_as is not None:
+        def scope_of(node):
+            cur = node
+            while cur is not None:
+                if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return cur.name
+                cur = parents.get(cur)
+            return None
+        wanted = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            cname = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+            if cname == same_scope_as or any(
+                    isinstance(a, ast.Name) and a.id == same_scope_as
+                    for a in node.args):
+                wanted = scope_of(node)
+                break
+        if wanted is not None:
+            narrowed = [s for s in hits if scope_of(s) == wanted]
+            if narrowed:
+                hits = narrowed
+    if not hits:
+        return None
+    hits.sort(key=lambda s: (s.lineno, s.col_offset))
+    if index >= len(hits):
+        return None
+    stmt = hits[index]
+    lines = source.splitlines()
+    first = lines[stmt.lineno - 1]
+    return (stmt.lineno, stmt.end_lineno,
+            first[:len(first) - len(first.lstrip())])
+
+
+def _call_site(source, name, index=0, same_scope_as=None):
+    """The full source TEXT of the call statement for `name` (may span lines)."""
+    found = _call_statement(source, name, index, same_scope_as=same_scope_as)
+    if found is None:
+        return None
+    start, end, _indent = found
+    return chr(10).join(source.splitlines()[start - 1:end])
 
 
 def _run_under(mutant_gate):
@@ -1494,14 +1582,21 @@ def test_wiring_mutation_occupancy_hoisted_above_preflight_is_caught():
     assertion only ever sees correct code and nothing shows it can fail.
     """
     def hoist(source):
-        call = _call_site(source, "device_occupancy")
+        # The BEFORE sample, which lives in the same scope as the preflight; the
+        # AFTER sample belongs to a different function and hoisting it would move
+        # the wrong call. Ordering by source position makes this deterministic.
+        call = _call_site(source, "device_occupancy", index=0,
+                          same_scope_as="environment_preflight")
         preflight = _call_site(source, "environment_preflight")
         assert call and preflight, (call, preflight)
-        without = source.replace(call + chr(10), "", 1)
-        if without == source:
-            without = source.replace(call, "pass", 1)
+        # Both are whole STATEMENTS and may span lines, so they must be replaced as
+        # text blocks; a line-oriented replace would leave a dangling continuation.
+        indent = call[:len(call) - len(call.lstrip())]
+        without = source.replace(call, indent + "pass  # occupancy hoisted", 1)
         assert without != source, "could not remove the occupancy call"
-        return without.replace(preflight, call + chr(10) + preflight, 1)
+        hoisted = without.replace(preflight, call + chr(10) + preflight, 1)
+        assert hoisted != without, "could not re-insert the occupancy call"
+        return hoisted
 
     log = _run_under(_mutant_gate(hoist))
     if log:
