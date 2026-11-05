@@ -15,16 +15,20 @@ they refuse with exit 2 and print the `docker exec` that would have worked.
 The check is `/.dockerenv`, which the runtime creates. A marker this code
 exported itself would be satisfied by the act of exporting it.
 
-## One environment, and why it lives under /home
+## One formal environment
 
 ```
-/home/s00653124/.conda/envs/tilefoundry-npu/bin/python   (Python 3.12.16)
+envs/tfnpu-v2/bin/python   (Python 3.12.16; the only formal environment)
 ```
 
-A **conda** environment containing torch 2.12.0+cpu, torch_npu 2.12.0, the
-TileFoundry dependencies and z3. It lives under `/home`, which is bind-mounted,
-so it survives container recreation with no reinstall and no re-download -- and a
-rebuild costs about an hour at direct network speed.
+The only formal environment is **envs/tfnpu-v2**. It contains torch
+2.12.0+cpu, torch_npu 2.12.0, the TileFoundry dependencies and z3, plus the
+dev-only pytest tools listed in envs/ENVIRONMENT.md.
+
+`.conda/envs/tilefoundry-npu` is the adapter's conventional `.conda/envs/`
+location, but is currently invalid/legacy and paused: **do not delete, modify or
+repair it**; the user will rebuild the formal layout after all TileFoundry tasks.
+This adapter does not use or recommend it meanwhile.
 
 There used to be two environments, split by Python version, because every local
 `torch_npu` wheel was `cp311` and paired with `torch 2.10.0+cpu`. That constraint
@@ -77,8 +81,8 @@ The Gate writes a local JSON report. That report is NOT a verified service recei
 and this adapter is NOT registered with the AgentGates service.
 
 - list_workspaces on the agentgates server returns the workspaces ascendnpu-ir and
-  tilelang. It does NOT list tilefoundry-npu. There is no server-side gate record for
-  this adapter, and no run id exists for it.
+  tilelang. It does NOT list this adapter. There is no server-side gate record for it,
+  and no run id exists for it.
 - Consequently the JSON under --evidence-dir is this process describing itself. It is
   inspectable evidence that a run happened and what it observed, but it carries no
   independent attestation. Treat it as a local artifact signed by nobody, not a receipt.
@@ -316,21 +320,19 @@ ENV path and never substitutes a generic add for an unregistered workload.
 - CPU verify stays `--skip-device` by default; a device recipe needs an explicit
   `allow_device=True` request.
 
-## Environment matrix (task-78)
+## Environment matrix (task-78 cleanup)
 
-**`envs/tfnpu-v2` is the only judgment environment** (backend/TileLang/Z3/device
-conclusions). `envs/tfnpu-dev` is a thin test overlay with the SAME tilelang/z3/tvm_ffi
-bytes plus pytest; `.conda/envs/tilefoundry-npu` (z3 5.3.3) and `.venv-explorer` are
-**scratch/reference only** and must never be used for judgment. The ABI preflight
-(`envs/tfnpu-dev/abi_preflight.py`, invoked by `tools/run_solver_tests.sh`) checks the
-interpreter prefix and the tilelang/apache-tvm-ffi/z3-solver triple and fails by name
-(`ABI_PREFLIGHT_INTERPRETER`, `ABI_PREFLIGHT_VERSION`, `ABI_PREFLIGHT_SHA`) instead of
-running tests in the wrong ABI. See `envs/ENVIRONMENT.md`.
+**`envs/tfnpu-v2` is the ONLY formal environment** for backend, TileLang, Z3,
+device and test judgments. The removed/deprecated `tfnpu-dev`, `tfnpu-v1` and
+`.venv-explorer` are not kept. `.conda/envs/tilefoundry-npu` is the adapter's conventional
+`.conda/envs/` location but is currently invalid/legacy and paused: **do not delete,
+modify or repair it**; the user will rebuild the formal layout after all TileFoundry
+tasks. It is not used by tests or `run_acceptance.sh`.
 
-**sitecustomize caveat:** `sitecustomize.py` prepends the tfnpu-v2
-site-packages. If tfnpu-v2 ever gains pytest, it would shadow tfnpu-dev's pinned
-pytest. Keep tfnpu-v2 free of test tooling (the rule), or make sitecustomize
-explicitly preserve the dev pytest path.
+`tools/abi_preflight.py` (invoked by `tools/run_solver_tests.sh`) allows only
+`envs/tfnpu-v2` and fails by
+`ABI_PREFLIGHT_INTERPRETER` / `ABI_PREFLIGHT_VERSION` / `ABI_PREFLIGHT_SHA`.
+See `envs/ENVIRONMENT.md`.
 
 ## What a PASS does not mean
 
