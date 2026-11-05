@@ -15,6 +15,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -49,6 +50,11 @@ def fake_result(stdout="", returncode=0):
 #: landed the very first thing gate_device did was refuse with
 #: ENV_CANN_SCRIPT_MISSING -- a crash from a bare shell, not a policy finding.
 #: A test tool that needs an ambient environment is a test tool nobody can run.
+#: A path this tool owns. The real lease must never be entered by a test, because
+#: the canonical lock /home/.tf_device0.lock coordinates the whole team.
+TEST_LOCK_PATH = "/tmp/.tf-device-policy-test-lock"
+
+
 MINIMAL_CONFIG = {
     "TF_REPO": "/tmp",
     "CONTAINER_NAME": "fake",
@@ -64,13 +70,58 @@ MINIMAL_CONFIG = {
 }
 
 
+def stub_lease(gate, acquisitions=None):
+    """Replace the device lease so this tool never takes the REAL team lock.
+
+    gate_device enters device_lock_lease(), which opens the CANONICAL team lock
+    /home/.tf_device0.lock -- the file that coordinates every team member. Running
+    a test must never take it: doing so can block a teammate, and it made a mere
+    test run look like a real measurement that held the card.
+
+    The stub yields the lease RECORD the Gate expects (a dict), not None: returning
+    None makes gate_device raise AttributeError on `lease.get(...)`, and if that is
+    swallowed the run looks merely "unobservable" instead of broken.
+
+    Same pattern as the other adapter tests, and deliberately shared with the
+    stubbed-gate path so the two cannot drift.
+    """
+    class _StubLease:
+        def __enter__(self):
+            if acquisitions is not None:
+                acquisitions.append(1)
+            return {"held": True, "stubbed": True, "canonical": False}
+
+        def __exit__(self, *exc):
+            return False
+
+    gate.device_lock_lease = _StubLease
+    # Belt and braces: if anything reads the path directly, point it at a path this
+    # tool owns, so a stubbing regression still cannot grab the team lock.
+    if hasattr(gate, "DEVICE_LOCK_PATH"):
+        gate.DEVICE_LOCK_PATH = TEST_LOCK_PATH
+
+
+def lock_stat(path):
+    """(inode, mtime_ns) of path, or None when it does not exist."""
+    try:
+        info = os.stat(str(path))
+    except OSError:
+        return None
+    return (info.st_ino, info.st_mtime_ns)
+
+
 def _stub_container(gate, calls, occupancy, payload, exposed):
     """Replace every container-facing dependency of gate_device.
 
     gate_device grew mandatory preflight/identity/profile/cache steps. Each has to
     be stubbed here for the two-state comparison to reach the verdict at all; the
     assertions in main() then still prove busy and idle produce the SAME result.
+
+    The LEASE is part of this set. It was missing, and the consequence was real:
+    every stubbed gate_device call acquired and released the canonical team lock,
+    so running this tool took the lock that coordinates the whole team.
     """
+    stub_lease(gate)
     gate.assert_not_host = lambda *args: None
     gate.container_exists = lambda config: True
     gate.in_container_python = lambda config: "python"
@@ -158,6 +209,10 @@ def refuse_reason(config, argv=None):
     as an internal exception with a container stack trace.
     """
     gate = load_gate()
+    # The lease is entered BEFORE the configuration is examined, so this path also
+    # reaches the real team lock. Stub it here too: the property under test is the
+    # REFUSAL, and taking the canonical lock is not part of it.
+    stub_lease(gate)
     try:
         gate.load_config  # noqa: B018 - existence check only
     except AttributeError:
@@ -461,6 +516,38 @@ def main():
     else:
         for key in ("TF_REPO", "CONTAINER_NAME", "CANN_SET_ENV"):
             check(key in MINIMAL_CONFIG, "MINIMAL_CONFIG supplies %s" % key)
+    # --- LOCK HYGIENE: this tool must never take the canonical team lock ---------
+    #
+    # gate_device enters a lease. Without a stub, running this tool acquired and
+    # released /home/.tf_device0.lock -- the lock that coordinates every team member.
+    # A test run must never take it. Measured, not assumed: inode AND mtime must both
+    # be unchanged after a stubbed run.
+    canonical = getattr(gate, "TEAM_LOCK_PATH", None)
+    before = lock_stat(canonical)
+    probe_gate = load_gate()
+    _stub_container(probe_gate, [], {0: {"occupied": None, "holders": None,
+                                      "idle_established": False,
+                                      "process_rows": [],
+                                      "scope": "container-pid-namespace"}},
+                    json.dumps({"devices": [{"logical": 0, "physical": 0,
+                                              "device_name": "dev0",
+                                              "count": 1024, "sum": 3072.0}]}),
+                    "/dev/davinci0\n")
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            probe_gate.gate_device(dict(MINIMAL_CONFIG), "0", None)
+        except Exception:  # noqa: BLE001 - the verdict is irrelevant here
+            pass
+    after = lock_stat(canonical)
+    check(before == after,
+          "a stubbed gate run left the canonical team lock untouched "
+          "(inode,mtime %r -> %r)" % (before, after))
+
+    # The lease stub must actually be installed, or the assertion above could pass
+    # only because nothing ever tried. Proven on the module the run used.
+    check(getattr(probe_gate, "device_lock_lease", None) is not None
+          and getattr(probe_gate, "DEVICE_LOCK_PATH", None) == TEST_LOCK_PATH,
+          "the lease stub and the test-owned lock path are both installed")
     print("RESULT:", "PASS" if not FAILS else "FAILURES=%d" % len(FAILS))
     return 0 if not FAILS else 1
 

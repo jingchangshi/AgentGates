@@ -7,6 +7,14 @@ set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/../scripts/tilefoundry_gate.py"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# LOCK HYGIENE: the --device negatives below invoke the REAL Gate, which enters the
+# device lease BEFORE it validates its arguments. Without this override every one of
+# them would acquire and release the canonical team lock
+# /home/.tf_device0.lock -- the file that coordinates the whole team. Running the
+# tests must never take it. TF_DEVICE_LOCK_PATH is the Gate's own explicit override
+# for exactly this; no negative here asserts anything about the canonical path.
+export TF_DEVICE_LOCK_PATH="$TMP/.tf-device-negatives.lock"
 pass=0; fail=0
 
 ok()   { printf '  PASS  %s\n' "$1"; pass=$((pass + 1)); }
