@@ -390,6 +390,40 @@ def vadd_one(n: int):
     return main
 
 
+#: Set on the re-exec so the deployment interpreter does not re-exec again.
+REEXEC_ENV = "TFNU_VERIFY_REEXEC"
+LAUNCHED_BY_ENV = "TFNU_VERIFY_LAUNCHED_BY"
+
+
+def ensure_deployment_interpreter() -> None:
+    """Continue under the DEPLOYMENT interpreter, whoever launched this file.
+
+    The canonical recipe runs `python3 -B .../verify_environment.py`, and on this
+    host `python3` is the system interpreter, which has no deployed tilelang. The
+    environment contract is about the DEPLOYMENT interpreter, so the script picks
+    it from env_context (never from a coincidental PATH entry) and re-execs itself
+    into it. The launch interpreter is recorded, so "which python ran this" is a
+    fact rather than an assumption.
+
+    A missing deployment interpreter is NOT repaired here: the caller is left with
+    the old interpreter, and the phases fail by name (TILELANG_IMPORT_FAILED etc.)
+    rather than this check pretending an install happened.
+    """
+    if os.environ.get(REEXEC_ENV) == "1":
+        return
+    target = E.interpreter()
+    try:
+        same = target.exists() and Path(sys.executable).resolve() == target.resolve()
+    except OSError:
+        same = False
+    if same or not target.exists():
+        return
+    env = dict(os.environ)
+    env[REEXEC_ENV] = "1"
+    env[LAUNCHED_BY_ENV] = sys.executable
+    os.execve(str(target), [str(target), str(Path(__file__).resolve())] + sys.argv[1:], env)
+
+
 def check_configuration() -> int:
     """Validate the DECLARED configuration only: no device, no subprocess, no writes.
 
@@ -445,6 +479,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.check_config:
         return check_configuration()
+    ensure_deployment_interpreter()
     if args.watchdog:
         faulthandler.dump_traceback_later(args.watchdog, repeat=False)
 
@@ -455,8 +490,9 @@ def main(argv=None) -> int:
 
     report = {"tool": "verify_environment.py", "run_dir": str(run_dir), "side": args.side,
               "started_at": started, "python": sys.version.split()[0],
-              "executable": sys.executable, "phases": [], "mutations": [],
-              "npu_smi": {}}
+              "executable": sys.executable,
+              "launched_by": os.environ.get(LAUNCHED_BY_ENV),
+              "phases": [], "mutations": [], "npu_smi": {}}
 
     report["npu_smi"]["before"] = smi("before", run_dir)
     smi_after_done = {"flag": False}

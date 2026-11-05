@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -76,6 +77,35 @@ def test_a_structured_report_without_analysis_fails(tmp_path):
                                 tmp_path, env=dict(os.environ), timeout=30)
     assert not result["ok"], result
     assert result["code"] == "TF_ANALYZE_NO_STRUCTURED_RESULT", result
+
+
+def test_the_script_reexecs_under_the_deployment_interpreter(tmp_path):
+    """The canonical recipe launches python3; the deployment interpreter must
+    still be the one that measures. A fake prefix proves the re-exec happens before
+    any phase or run directory exists, so no device and no real install is touched."""
+    prefix = tmp_path / "fake-prefix"
+    (prefix / "bin").mkdir(parents=True)
+    marker = tmp_path / "executed.marker"
+    wrapper = prefix / "bin" / "python"
+    wrapper.write_text('#!/bin/sh\nprintf %s "$0" > "{}"\nexit 0\n'.format(marker))
+    wrapper.chmod(0o755)
+
+    env = dict(os.environ)
+    env["TFNU_PREFIX"] = str(prefix)
+    env.pop("TFNU_VERIFY_REEXEC", None)
+    env.pop("TFNU_VERIFY_LAUNCHED_BY", None)
+    out = tmp_path / "out"
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "verify_environment.py"),
+         "--out", str(out), "--skip-device"],
+        env=env, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert marker.is_file(), (
+        "the deployment interpreter was not exec'd; the script kept the launcher "
+        "interpreter: " + proc.stderr[-400:])
+    assert not out.exists(), (
+        "the re-exec must happen BEFORE a run directory is created; work was done "
+        "under the launching interpreter")
 
 
 def test_the_real_chain_produces_a_typed_artifact(tmp_path):
