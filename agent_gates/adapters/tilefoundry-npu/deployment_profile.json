@@ -10,6 +10,19 @@
     "run that used a different configuration is detectable without publishing it."
   ],
   "required_image_name": "tilefoundry-ascend950pr-dev:24.04",
+  "required_image_digest": "sha256:cde335885bb7a5213ec66a2e40ae6d94a1c91e51d2c9045088441b968e420814",
+  "required_devices": [
+    "/dev/davinci0",
+    "/dev/davinci1",
+    "/dev/davinci_manager",
+    "/dev/hisi_hdc"
+  ],
+  "required_binds": [
+    { "destination": "/home", "read_only": false },
+    { "destination": "/data", "read_only": true }
+  ],
+  "bind_source_equals_destination": true,
+  "required_container_user": "root",
   "required_control_nodes": ["/dev/davinci_manager", "/dev/hisi_hdc"],
   "required_driver_libraries": ["libc_sec.so", "libascend_hal.so", "libdrvdsmi_host.so"],
   "device_node_pattern": "/dev/davinci[0-9]+",
@@ -18,6 +31,8 @@
   "smi_requires_same_environment": true,
   "notes": {
     "character_device": "Each device node inside the container must be a character device; a regular file with the same name is a deployment fault.",
+    "pinned_by_digest": "required_image_digest pins the IMAGE ID, not the tag. A tag can be rebuilt in place; the digest cannot. provision.py refuses IMAGE_TAG_MOVED rather than measuring a silently replaced image.",
+    "binds_are_identical_paths": "The host and the container see the same path (bind_source_equals_destination). A bind whose source differs is a different filesystem even when the destination looks right.",
     "no_exclusive_or_busy_flag": "No configuration value can make the gate wait for, refuse, skip or downgrade a busy card. Occupancy is recorded metadata only."
   }
 }
