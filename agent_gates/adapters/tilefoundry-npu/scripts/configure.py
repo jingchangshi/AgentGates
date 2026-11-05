@@ -1,0 +1,320 @@
+"""Provision the shared interpreter the TileFoundry adapter runs against.
+
+One command, idempotent by construction: it INSPECTS first and only acts on what
+is actually missing or wrong. A second run must write nothing, which is the only
+way "already provisioned" is a claim anyone can check.
+
+What it does NOT do: rebuild an image, install a driver, change CANN, or touch the
+system interpreter. Everything lands under the shared workspace prefix, which the
+host and the container both see at the same path.
+
+Usage:
+    python configure.py --facts         # inspect only, print facts, change nothing
+    python configure.py                 # converge (install only what is missing)
+    python configure.py --findings      # inspect ONLY, exit non-zero if unusable
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import env_context as E  # noqa: E402
+
+
+def _run(command, *, env=None, timeout=3600, cwd=None, check=False):
+    """Run a command, returning (rc, stdout, stderr) -- never raising on failure.
+
+    Callers report raw output. A silent non-zero here would be the exact defect
+    this module exists to make visible.
+    """
+    done = subprocess.run(
+        command, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
+    )
+    if check and done.returncode != 0:
+        raise SystemExit(
+            "command failed (%s): %s\n%s\n%s"
+            % (done.returncode, " ".join(map(str, command)), done.stdout, done.stderr)
+        )
+    return done.returncode, done.stdout, done.stderr
+
+
+def _interpreter_ready() -> bool:
+    target = E.interpreter()
+    return target.exists() and os.access(str(target), os.X_OK)
+
+
+def _create_prefix() -> dict:
+    """Create the venv. Only ever called when it does not exist."""
+    base = os.environ.get("TFNU_BASE_PYTHON") or sys.executable
+    E.SHARED_PREFIX.parent.mkdir(parents=True, exist_ok=True)
+    E.WHEEL_CACHE.mkdir(parents=True, exist_ok=True)
+    rc, out, err = _run([base, "-m", "venv", str(E.SHARED_PREFIX)])
+    return {"action": "create_prefix", "base": base, "rc": rc, "tail": (out + err)[-400:]}
+
+
+def _installed() -> dict:
+    """{normalised name: version} as the SHARED interpreter sees them."""
+    if not _interpreter_ready():
+        return {}
+    code = (
+        "import json,sys;"
+        "import importlib.metadata as m;"
+        "d={};"
+        "[d.__setitem__(dist.metadata['Name'], dist.version) for dist in m.distributions()];"
+        "print(json.dumps(d))"
+    )
+    rc, out, err = _run([str(E.interpreter()), "-c", code], timeout=300)
+    if rc != 0:
+        return {}
+    for line in reversed((out or "").strip().splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return {}
+
+
+def _plan(installed: dict) -> list[dict]:
+    """What is missing or wrong. Empty list means nothing to do."""
+    steps = []
+    for name, want in sorted(E.ALL_PINS.items()):
+        have = installed.get(name)
+        if have is None:
+            steps.append({"kind": "install", "name": name, "want": want, "have": None})
+        elif have != want:
+            steps.append({"kind": "reinstall", "name": name, "want": want, "have": have})
+    return steps
+
+
+def _wheel_for(name: str, version: str | None = None) -> Path | None:
+    """The cached wheel matching the pin, if we already have one.
+
+    The VERSION must match too. Matching only the name was a real defect: with a
+    pin move (z3-solver 5.3.3.0 -> 4.15.4.0) the old wheel still matched the
+    prefix, so the plan went to pip with --no-index against a cache that could
+    not satisfy it. Offline must mean "the pinned artefact is here", not "some
+    artefact with that name is here".
+    """
+    if not E.WHEEL_CACHE.is_dir():
+        return None
+    stem = name.lower().replace("-", "_").replace(".", "_")
+    want = (version or "").lower().replace(".", "_").replace("-", "_")
+    for candidate in sorted(E.WHEEL_CACHE.glob("*.whl")):
+        low = candidate.name.lower().replace("-", "_")
+        if not (low.startswith(stem + "-") or low.startswith(stem + "_")):
+            continue
+        if not want:
+            return candidate
+        if low.startswith("%s-%s" % (stem.replace("_", "-"), want)):
+            return candidate
+        if low.startswith("%s_%s" % (stem, want)):
+            return candidate
+    return None
+
+
+def _install(steps: list[dict]) -> list[dict]:
+    """Converge on the plan, offline where the wheel cache suffices."""
+    if not steps:
+        return []
+    recipes = [
+        "%s==%s" % (step["name"], step["want"]) for step in steps
+    ]
+    env = dict(os.environ)
+    env.setdefault("PYTHONNOUSERSITE", "1")
+    argv = [
+        str(E.interpreter()), "-m", "pip", "install",
+        "--no-input", "--no-warn-script-location",
+    ]
+    if E.WHEEL_CACHE.is_dir() and all(
+        _wheel_for(step["name"], step["want"]) for step in steps
+    ):
+        argv += ["--no-index", "--find-links", str(E.WHEEL_CACHE)]
+    argv += recipes
+    rc, out, err = _run(argv, env=env, timeout=7200)
+    return [{"action": "pip", "argv": argv, "rc": rc, "tail": (out + err)[-800:]}]
+
+
+def _tilelang_state() -> dict:
+    """Source revision and dirtiness -- a wheel from an unknown tree is not pinned."""
+    root = E.TILELANG_ROOT
+    state = {"root": str(root), "commit": None, "dirty": None}
+    if not (root / ".git").exists():
+        state["error"] = "not a git checkout"
+        return state
+    rc, out, _ = _run(["git", "-C", str(root), "rev-parse", "--short=8", "HEAD"], timeout=60)
+    if rc == 0:
+        state["commit"] = out.strip()
+    rc, out, _ = _run(["git", "-C", str(root), "status", "--porcelain"], timeout=60)
+    if rc == 0:
+        state["dirty"] = bool(out.strip())
+        state["dirty_paths"] = out.strip().splitlines()[:10]
+    return state
+
+
+def _wheel_facts() -> dict:
+    """The installed tilelang wheel: name and sha256, so a rebuild is verifiable."""
+    facts = {"wheel_cache": str(E.WHEEL_CACHE), "wheels": []}
+    if E.WHEEL_CACHE.is_dir():
+        for path in sorted(E.WHEEL_CACHE.glob("tilelang*.whl")):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            facts["wheels"].append(
+                {"name": path.name, "sha256": digest, "bytes": path.stat().st_size}
+            )
+    return facts
+
+
+def gather_facts() -> dict:
+    """Everything a reader needs to decide whether this prefix is trustworthy."""
+    installed = _installed()
+    facts = {
+        "workspace": str(E.WORKSPACE),
+        "prefix": str(E.SHARED_PREFIX),
+        "prefix_exists": E.SHARED_PREFIX.is_dir(),
+        "interpreter": str(E.interpreter()),
+        "interpreter_exists": _interpreter_ready(),
+        "python_version": None,
+        "pythonpath_entries": E.python_path_entries(),
+        "pins": E.ALL_PINS,
+        "pin_problems": E.pin_problems(installed),
+        "installed_count": len(installed),
+        "tilelang_source": _tilelang_state(),
+        "tilelang_wheel": _wheel_facts(),
+        "cann_set_env": E.CANN_SET_ENV,
+        # CANN is a PRECONDITION of the import layers, not a neighbouring
+        # convenience: torch_npu dlopens libhccl.so at import time and torch's
+        # device-backend autoload turns that into "Failed to load the backend
+        # extension: torch_npu", which reads as "tilelang is broken".
+        "cann": E.cann_state(),
+        # z3's version is dictated by the wheel's libtvm_compiler.so SONAME; the
+        # intersection with tilelang's own declared range is asserted, not assumed.
+        "z3_requirement": E.z3_requirement(installed),
+        # The CCE compiler is external to tilelang (see env_context.TOOLCHAIN).
+        # Recorded here because a missing one only fails LATE, at compile-to-binary.
+        "toolchain": E.probe_toolchain(),
+    }
+    if facts["interpreter_exists"]:
+        rc, out, _ = _run([str(E.interpreter()), "-V"], timeout=60)
+        if rc == 0:
+            facts["python_version"] = out.strip()
+    facts["probe"] = E.run_probe() if facts["interpreter_exists"] else {"ok": False}
+    # Negative control: with CANN stripped, the import must fail NAMING the CANN
+    # gap. If it fails with an anonymous .so error instead, the positive probe's
+    # green is worth less -- that is the point of running both.
+    facts["cann_negative_probe"] = (
+        E.negative_probe() if facts["interpreter_exists"] else {"ok": False}
+    )
+    return facts
+
+
+def _findings(facts: dict) -> int:
+    """Exit non-zero with a NAMED reason, in dependency order.
+
+    Order is the contract: CANN first (it gates every import), then the import
+    layers, then the z3 intersection (it gates the shared object), then pins.
+    Reporting a later failure first would name a symptom of an earlier cause.
+    """
+    if not facts.get("interpreter_exists"):
+        print(
+            "NO INTERPRETER: %s does not exist; every pin below is unverifiable"
+            % facts.get("interpreter"),
+            file=sys.stderr,
+        )
+        return 1
+    cann = facts.get("cann") or {}
+    if not cann.get("sourced"):
+        print("CANN NOT SOURCED:", cann.get("code"), "-", cann.get("consequence"), file=sys.stderr)
+        print("  source %s first" % facts.get("cann_set_env"), file=sys.stderr)
+        return 1
+    probe = facts.get("probe") or {}
+    if not probe.get("ok"):
+        code = probe.get("code") or "PROBE_FAILED"
+        print("UNUSABLE:", code, "-", probe.get("error"), file=sys.stderr)
+        return 1
+    negative = facts.get("cann_negative_probe") or {}
+    if not negative.get("ok"):
+        print(
+            "NEGATIVE CONTROL FAILED: without CANN the import must report %s, got %r"
+            % (negative.get("expected_code"), negative.get("observed_code")),
+            file=sys.stderr,
+        )
+        return 1
+    z3 = facts.get("z3_requirement") or {}
+    if not z3.get("ok"):
+        print(
+            "Z3 OFF: %s installed=%s pin=%s requirement=%r source=%s"
+            % (z3.get("code"), z3.get("installed"), z3.get("pin"),
+               z3.get("requirement"), z3.get("requirement_source")),
+            file=sys.stderr,
+        )
+        return 1
+    if facts.get("pin_problems"):
+        print("PINS OFF:", json.dumps(facts["pin_problems"]), file=sys.stderr)
+        return 1
+    if not (facts.get("toolchain") or {}).get("ok"):
+        print("TOOLCHAIN UNRESOLVED:", (facts.get("toolchain") or {}).get("code"), file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--facts", action="store_true", help="inspect only, write nothing")
+    parser.add_argument("--findings", action="store_true", help="exit non-zero if unusable")
+    args = parser.parse_args(argv)
+
+    if args.facts:
+        print(json.dumps(gather_facts(), indent=1, sort_keys=True))
+        return 0
+
+    actions = []
+    if args.findings:
+        # A CHECK MUST NOT MUTATE. Measured defect this prevents: --findings was
+        # run to confirm the prefix, one pin disagreed, and the check silently
+        # reinstalled that pin -- reverting a diagnosed downgrade and breaking the
+        # very import it had been asked to confirm. Inspect, report, exit.
+        installed = _installed()
+        pending = _plan(installed)
+        if pending:
+            # Report the drift; do not "fix" it behind the caller's back.
+            actions.append({"action": "inspect_only", "would_install": pending,
+                            "reason": "--findings never installs"})
+        else:
+            actions.append({"action": "noop",
+                            "reason": "every pin already satisfied (--findings does not install)"})
+        facts = gather_facts()
+        report = {"actions": actions, "facts": facts}
+        print(json.dumps(report, indent=1, sort_keys=True))
+        return _findings(facts)
+
+    if not _interpreter_ready():
+        actions.append(_create_prefix())
+
+    installed = _installed()
+    steps = _plan(installed)
+    if steps:
+        actions.append({"action": "plan", "steps": steps})
+        actions.extend(_install(steps))
+    else:
+        # Idempotence is an assertion, not a hope: with an empty plan nothing is
+        # written, so a second run genuinely changes nothing.
+        actions.append({"action": "noop", "reason": "every pin already satisfied"})
+
+    facts = gather_facts()
+    report = {"actions": actions, "facts": facts}
+    print(json.dumps(report, indent=1, sort_keys=True))
+
+    if args.findings:
+        return _findings(facts)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
