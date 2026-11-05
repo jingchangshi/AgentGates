@@ -18,7 +18,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import device_harness as H
-from tl_vadd_one import compile_vadd_one, readback_vadd_one
 
 
 def sha(data):
@@ -37,12 +36,14 @@ def main() -> int:
         raise SystemExit("DEVICE_INDEX_NOT_VISIBLE")
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(x) for x in visible)
     os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-    if os.geteuid() != 0 and not os.environ.get("TF_ALLOW_NONROOT_DEVICE"):
-        # The canonical device entry requires root; this runner reports the fact.
-        print(json.dumps({"finished": True, "passed": False, "reason_code": "PERMISSION_DENIED",
-                          "detail": "device run requires root"}, sort_keys=True))
+    if os.geteuid() != 0:
+        print(json.dumps({"finished": True, "passed": False, "verdict": "BLOCKED_ENV",
+                          "reason_code": "DEVICE_ACCESS_REQUIRES_ROOT",
+                          "detail": "Ascend950PR device access must use root inside the canonical "
+                                    "docker container; non-root can cause exclusive behavior"}, sort_keys=True))
         return 75
 
+    from tl_vadd_one import compile_vadd_one, readback_vadd_one
     H.register_workload(H.WorkloadSpec(
         workload_id="tl-vadd-one-64", canonical_recipe="tilefoundry-npu.device",
         x_mode="TL_SOURCE_RECOMPILE", output_spec={"dtype": "float32", "shape": [64]},
@@ -120,7 +121,8 @@ def main() -> int:
                 "n_elements": int(got.size), "atol": 0.0, "rtol": 0.0}
     result = H.evaluate_run(request, evidence, t_report, allow_unobserved=("binary",))
     result["t_report"] = t_report
-    result["nonroot_override"] = bool(os.environ.get("TF_ALLOW_NONROOT_DEVICE"))
+    result["nonroot_override"] = False
+    result["device_access_policy"] = "ROOT_ONLY_DOCKER"
     result["input_sha256"] = sha(input_bytes)
     result["output_sha256"] = outputs[0]["sha256"]
     result["attempts"] = [a.__dict__ if hasattr(a, "__dict__") else a for a in attempts]

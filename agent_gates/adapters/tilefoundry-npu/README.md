@@ -312,13 +312,28 @@ ENV path and never substitutes a generic add for an unregistered workload.
   identities `source/CCE/binary/load` (OBSERVED or UNOBSERVED) are written under the
   run directory; every case gets its own directory.
 - **FINISHED is not PASS**: `finished` means the run ended, including failures;
-  `passed` additionally requires all required phases, complete coverage, observed
-  artifact identities, raw output bytes, and a passing T report. Exit 0, a finished
-  flag, an all-skipped run, or a stale payload cannot pass.
+  `passed` additionally requires all required phases, complete coverage, required
+  observed artifact identities (a named build limitation may be passed through the
+  explicit `allow_unobserved` seam), raw output bytes, and a passing T report. Exit 0,
+  a finished flag, an all-skipped run, or a stale payload cannot pass.
 - Local evidence and any AgentGates service execution/receipt are separate fields; an
   unregistered local run reports `service_receipt=None` and never invents a run id.
 - CPU verify stays `--skip-device` by default; a device recipe needs an explicit
   `allow_device=True` request.
+
+### H4 canonical root evidence / non-root is refused
+
+`run_h4_tl_vadd.py` requires root inside the canonical container (ENV-05). A non-root
+attempt is refused by name `DEVICE_ACCESS_REQUIRES_ROOT`: uid 1071 may be in
+HwHiAiUser and able to open `/dev/davinci*`, but that bypasses the docker-root path
+and can cause exclusive behavior or disturb other tenants. Do not add a non-root
+override; historical non-root records are `non_canonical_environment=true` and
+diagnostic-only. The canonical H4 root run has source/CCE/load OBSERVED; binary is
+**`UNOBSERVED_BY_BUILD`** because this TileLang build exposes no `JITKernel.artifact`
+path, which is a toolchain fact, not a skipped check. X3 consumes this exact chain:
+for the TL Ascend C source path, a claim needs source+CCE+load OBSERVED and binary
+explicitly UNOBSERVED_BY_BUILD; a fabricated binary hash or a generic UNOBSERVED
+is refused, and UNOBSERVED is never relabeled PASS.
 
 ## Environment matrix (task-78 cleanup)
 
