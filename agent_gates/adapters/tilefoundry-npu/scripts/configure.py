@@ -178,6 +178,16 @@ def gather_facts() -> dict:
         "workspace": str(E.WORKSPACE),
         "prefix": str(E.SHARED_PREFIX),
         "prefix_exists": E.SHARED_PREFIX.is_dir(),
+        # Which environment this run is about. v2 (main) is the default; the v1
+        # rollback prefix is legitimate but must be VISIBLE, so it is a fact, not a
+        # local convention.
+        "env": {
+            "prefix": str(E.SHARED_PREFIX),
+            "rollback_prefix": E.prefix_is_rollback(),
+            "rollback_prefix_path": str(E.ROLLBACK_PREFIX),
+            "expected_tilelang_wheel_version": E.TILELANG_WHEEL_VERSION,
+            "tilelang_source_commit": E.TILELANG_COMMIT,
+        },
         "interpreter": str(E.interpreter()),
         "interpreter_exists": _interpreter_ready(),
         "python_version": None,

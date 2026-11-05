@@ -24,13 +24,16 @@ from pathlib import Path
 WORKSPACE = Path(os.environ.get("TFNU_WORKSPACE") or "/home/s00653124/workspace")
 
 #: The shared prefix. A venv, so the interpreter path is part of the contract.
-#: v1 stays the default so every existing run is unchanged; TFNU_PREFIX selects
-#: another one (e.g. the main-pinned rebuild in envs/tfnpu-v2) so two deployments
-#: can be verified side by side without editing this file.
+#: DEFAULT IS v2: tilelang built from main@0e687c17. v1 is the feat/hivm branch and
+#: is kept ONLY as a rollback/control environment -- it must be selected explicitly
+#: (TFNU_PREFIX=.../envs/tfnpu-v1), and that selection is reported as
+#: env.rollback_prefix=true so a run can never quietly still be the old wheel.
 SHARED_PREFIX = Path(os.environ.get("TFNU_PREFIX")
-                     or (WORKSPACE / "envs" / "tfnpu-v1"))
+                     or (WORKSPACE / "envs" / "tfnpu-v2"))
 
-#: Every wheel ever installed here, kept so a rebuild needs no network.
+#: The rollback/control prefix. Selecting it is legitimate, but it must be visible.
+ROLLBACK_PREFIX = WORKSPACE / "envs" / "tfnpu-v1"
+
 #: Every wheel ever installed here, kept so a rebuild needs no network.
 #: TFNU_WHEELS points at a different cache (a rebuilt wheel lives in its own dir).
 WHEEL_CACHE = Path(os.environ.get("TFNU_WHEELS") or (WORKSPACE / "envs" / "wheels"))
@@ -45,14 +48,30 @@ CANN_SET_ENV = os.environ.get(
 
 #: The tilelang source revision the wheel is built from. A wheel built from an
 #: unknown tree is not reproducible, so the commit is recorded and checked.
-TILELANG_COMMIT = "8e2d3c82"
+TILELANG_COMMIT = "0e687c17"
+
+#: The feat/hivm revision the v1 ROLLBACK prefix was built from. Recorded so a
+#: control run can say which tree it came from; never used as the default.
+TILELANG_COMMIT_ROLLBACK = "8e2d3c82"
 
 #: The version string the INSTALLED wheel must report. It is not cosmetic: the
 #: wheel and the source tree disagree on the tag by construction -- the wheel is
 #: +cpu (built CPU-only) while the same commit in the tree reports +cuda. A probe
 #: that accepts either cannot tell "the wheel is installed" from "someone put the
 #: tree on PYTHONPATH", which are completely different deployments.
-TILELANG_WHEEL_VERSION = "0.1.15+cpu.git8e2d3c82"
+TILELANG_WHEEL_VERSION = "0.1.15+cpu.git0e687c17"
+
+
+def prefix_is_rollback() -> bool:
+    """True when the selected prefix is the feat-branch rollback environment.
+
+    Reported in configure facts as env.rollback_prefix. A control environment is
+    allowed; an UNLABELLED one is the defect this exists to prevent.
+    """
+    try:
+        return Path(SHARED_PREFIX).resolve() == Path(ROLLBACK_PREFIX).resolve()
+    except OSError:
+        return False
 
 #: Exact pins. tvm_ffi is pinned to 0.1.12 for a specific reason: a newer tvm_ffi
 #: (0.1.15.post2 was measured) fails with
@@ -652,6 +671,8 @@ __all__ = [
     "toolchain_env",
     "TOOLCHAIN",
     "probe_toolchain",
+    "ROLLBACK_PREFIX",
+    "prefix_is_rollback",
     "REQUIRED_TOOLS",
     "TILELANG_Z3_REQUIREMENT",
     "TILELANG_Z3_REQUIREMENT_SOURCE",
