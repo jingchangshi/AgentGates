@@ -168,6 +168,21 @@ def record_kernel_artifacts(kernel, out_dir, facts: dict) -> None:
     _source("kernelsource", lambda: getattr(kernel, "kernel_source", "") or "")
 
 
+#: Measured on THIS machine (all numbers are observations, not guesses):
+#:   healthy npu-smi: host 0.77/0.78 s, container 1.02/1.00 s; a full device
+#:   phase saw the driver answer in 1.4 s; the non-blocking health probe's worst
+#:   HEALTHY observation was 6 s. A D-state probe (wchan devdrv_sync_non_tran)
+#:   took >20 s and could not be reclaimed even after SIGKILL -- it is unbounded,
+#:   so waiting longer tells us nothing.
+#: Therefore ONE card attempt is bounded at 20 s (separates <=6 s healthy from
+#: >20 s wedged), and a failed attempt waits 30 s before the NEXT card -- one
+#: natural window for transient congestion to clear without burning the run.
+#: The attempt count is bounded by the visible list (2 cards today), so the worst
+#: case is 2 x (20 + 30) ~= 100 s. Both numbers are env-overridable, in seconds.
+DEVICE_ATTEMPT_TIMEOUT_DEFAULT = 20.0
+DEVICE_BACKOFF_DEFAULT = 30.0
+
+
 def bounded_run(argv, timeout, kill_grace=5, env=None):
     """Run *argv* with a bound that survives an UNKILLABLE child.
 
@@ -184,8 +199,15 @@ def bounded_run(argv, timeout, kill_grace=5, env=None):
     try:
         out, err = proc.communicate(timeout=timeout)
         return {"rc": proc.returncode, "out": out, "err": err, "pid": child_pid,
-                "timed_out": False, "unreaped": False}
+                "timed_out": False, "unreaped": False, "wchan": None}
     except subprocess.TimeoutExpired:
+        # Read the kernel wait channel BEFORE killing: it is the difference between
+        # "the driver queue is wedged" (D state) and "the command is merely slow".
+        wchan = None
+        try:
+            wchan = Path("/proc/%d/wchan" % proc.pid).read_text().strip() or None
+        except OSError:
+            wchan = None
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
@@ -193,7 +215,7 @@ def bounded_run(argv, timeout, kill_grace=5, env=None):
         try:
             out, err = proc.communicate(timeout=kill_grace)
             return {"rc": proc.returncode, "out": out, "err": err, "pid": child_pid,
-                    "timed_out": True, "unreaped": False}
+                    "timed_out": True, "unreaped": False, "wchan": wchan}
         except subprocess.TimeoutExpired:
             for stream in (proc.stdout, proc.stderr):
                 try:
@@ -201,7 +223,7 @@ def bounded_run(argv, timeout, kill_grace=5, env=None):
                 except Exception:  # noqa: BLE001
                     pass
             return {"rc": None, "out": "", "err": "", "pid": child_pid,
-                    "timed_out": True, "unreaped": True}
+                    "timed_out": True, "unreaped": True, "wchan": wchan}
 
 
 def _json_document(text):
@@ -338,22 +360,102 @@ BUSY_CODE = "BUSY_DEVICE_NOT_RESPONDING"
 
 
 def device_responsiveness(timeout: int = 20) -> dict:
-    """Is the DRIVER answering at all? A D-state card is BUSY, not a software failure.
+    """A GLOBAL driver pulse (not per-card). Used only as a diagnostic record.
 
-    Measured: npu-smi blocked in uninterruptible sleep (wchan devdrv_sync_non_tran)
-    behind another tenant's job. It cannot be killed and it never returns while the
-    card is held, so it must be classified as BUSY and the device phase left NOT_RUN.
-    No retry, no polling, no waiting, and no falling back to another card.
+    The device phase itself probes each visible card individually, because a D-state
+    wedged queue can be attached to ONE card while another still answers (user
+    policy). This helper is kept for the bounded global observation; it never
+    decides a verdict by itself.
     """
     started = time.time()
     result = bounded_run(["npu-smi", "info"], timeout=timeout)
     facts = {"probe": "npu-smi info", "timeout_s": timeout,
              "timed_out": result["timed_out"], "unreaped": result["unreaped"],
              "rc": result["rc"], "seconds": round(time.time() - started, 2),
-             "child_pid": result.get("pid")} 
+             "child_pid": result.get("pid"), "wchan": result.get("wchan")}
     responsive = (not result["timed_out"]) and result["rc"] == 0 and bool(result["out"].strip())
     facts["responsive"] = responsive
     return facts
+
+
+def probe_card(physical_id: int, timeout: float) -> dict:
+    """One BOUNDED call that asks whether THIS card's driver queue answers.
+
+    Only a DRIVER-no-response result (bounded timeout, and a child that had to be
+    killed or abandoned; wchan/pid recorded) is BUSY_DEVICE_NOT_RESPONDING and is
+    eligible for failover. "The card is busy with someone else's job" is NOT this:
+    occupancy is normal shared use, is recorded elsewhere, and never causes a
+    retry, a refusal, or a card switch.
+
+    TFNU_PROBE_OVERRIDE is a TEST seam ("0=unresponsive,1=responsive"). It exists
+    because a D-state queue cannot be created on demand; when it is used every
+    attempt carries simulated=true so the evidence never pretends it was hardware.
+    """
+    started = time.time()
+    forced = None
+    spec = (os.environ.get("TFNU_PROBE_OVERRIDE") or "").strip()
+    if spec:
+        for part in spec.split(","):
+            key, _, value = part.partition("=")
+            if key.strip().isdigit() and int(key.strip()) == int(physical_id):
+                forced = value.strip()
+    if forced is not None:
+        unresponsive = forced == "unresponsive"
+        result = {"rc": None if unresponsive else 0,
+                  "out": "" if unresponsive else "forced-responsive",
+                  "err": "", "pid": -1,
+                  "timed_out": unresponsive, "unreaped": unresponsive,
+                  "wchan": "forced" if unresponsive else None}
+        simulated = True
+    else:
+        result = bounded_run(
+            ["npu-smi", "info", "-t", "board", "-i", str(physical_id)], timeout=timeout)
+        simulated = False
+    responsive = ((not result["timed_out"]) and result["rc"] == 0
+                  and bool((result["out"] or "").strip()))
+    return {"physical_id": int(physical_id), "simulated": simulated,
+            "probe": "npu-smi info -t board -i %s" % physical_id,
+            "responsive": responsive,
+            "timed_out": result["timed_out"], "unreaped": result["unreaped"],
+            "rc": result["rc"], "pid": result.get("pid"),
+            "wchan": result.get("wchan"),
+            "seconds": round(time.time() - started, 2)}
+
+
+def first_responsive_card(candidates, visible, probe, backoff_seconds,
+                          sleeper=time.sleep) -> tuple:
+    """Walk the VISIBLE list in order, one bounded probe per card.
+
+    Only a driver-unresponsive probe moves to the next card; a responsive card is
+    selected immediately even if another tenant is using it. The attempt count is
+    bounded by the candidate list, and a fixed backoff (the policy's 30 s) is
+    waited once after each failed attempt except the last. Returns
+    (attempts, selected) where selected is None iff every card was unresponsive.
+    """
+    attempts = []
+    selected = None
+    for position, logical_index in enumerate(candidates):
+        physical_id = visible[logical_index]
+        result = probe(physical_id)
+        attempt = {"attempt": position + 1, "logical_index": logical_index, **result}
+        if result["responsive"]:
+            attempt["outcome"] = "RESPONSIVE"
+            attempts.append(attempt)
+            selected = {
+                "logical_index": logical_index,
+                "physical_device_id": physical_id,
+                "selection_reason": (
+                    "explicit --device-index (and later cards, if it is wedged)"
+                    if candidates != list(range(len(visible))) else
+                    "first RESPONSIVE entry of the ordered visible list"),
+            }
+            break
+        attempt["outcome"] = BUSY_CODE
+        attempts.append(attempt)
+        if position < len(candidates) - 1:
+            attempt["backoff_seconds"] = float(backoff_seconds)
+            sleeper(float(backoff_seconds))
+    return attempts, selected
 
 
 def smi(tag: str, out_dir: Path) -> dict:
@@ -498,6 +600,18 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=str(PACK / ".." / ".." / ".." / "artifacts" / "verify"))
     ap.add_argument("--side", default="host")
     ap.add_argument("--device-index", type=int, default=None)
+    # Defaults and their evidence live next to DEVICE_ATTEMPT_TIMEOUT_DEFAULT /
+    # DEVICE_BACKOFF_DEFAULT. Env names are documented in README (seconds).
+    ap.add_argument("--device-attempt-timeout-seconds", type=float,
+                    default=float(os.environ.get("TFNU_DEVICE_ATTEMPT_TIMEOUT",
+                                                 DEVICE_ATTEMPT_TIMEOUT_DEFAULT)),
+                    help="hard bound on ONE per-card driver probe (default 20 s: a "
+                         "healthy npu-smi answered in <=6 s, a D-state probe took >20 s)")
+    ap.add_argument("--device-backoff-seconds", type=float,
+                    default=float(os.environ.get("TFNU_DEVICE_BACKOFF",
+                                                 DEVICE_BACKOFF_DEFAULT)),
+                    help="wait before trying the NEXT visible card after a driver-"
+                         "unresponsive probe (default 30 s; worst case 2x(20+30)=100 s)")
     ap.add_argument("--configure-cmd", default=None,
                     help="override the configure command (the mutation negative)")
     ap.add_argument("--cache-dir", default=None,
@@ -564,7 +678,13 @@ def main(argv=None) -> int:
         (run_dir / "evidence.json").write_text(json.dumps(report, indent=1, sort_keys=True))
         print(json.dumps({"run_dir": str(run_dir), "verdict": verdict, "code": code,
                           "detail": detail, "json": str(run_dir / "evidence.json")}, indent=1))
-        return exit_code
+        # The evidence is on disk. Measured: after a device run the interpreter's
+        # teardown (torch_npu destructors) can block far outside any phase bound --
+        # one run wrote PASS evidence and then sat 480+ s in shutdown. Exiting here
+        # makes process lifetime as bounded as the phases it reports.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
 
     # ---------------------------------------------------------------- phases
     phases = []
@@ -773,21 +893,44 @@ def main(argv=None) -> int:
         return "PASS", None, None, facts, EXIT_PASS
 
     def phase_device():
-        # Driver health FIRST: a wedged card is BUSY, and this phase is NOT RUN.
-        health = device_responsiveness()
-        if not health["responsive"]:
+        # Per-card, bounded, with a declared backoff. ONLY a driver-unresponsive
+        # probe is eligible for failover; a card that is merely occupied by another
+        # tenant is normal shared use and is never a reason to retry or switch.
+        visible = [int(x) for x in
+                   str(os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or "").split(",")
+                   if x.strip() != ""]
+        if not visible:
+            return "BLOCKED", "DEVICE_ID_MISSING", \
+                "ASCEND_RT_VISIBLE_DEVICES is empty", {}, EXIT_BLOCKED
+        if args.device_index is not None and not 0 <= args.device_index < len(visible):
+            return "BLOCKED", "DEVICE_INDEX_NOT_VISIBLE", \
+                "visible=%r requested=%r" % (visible, args.device_index), \
+                {"visible_list": visible}, EXIT_BLOCKED
+        candidates = (list(range(args.device_index, len(visible)))
+                      if args.device_index is not None else list(range(len(visible))))
+        attempt_timeout = args.device_attempt_timeout_seconds
+        backoff = args.device_backoff_seconds
+        facts = {"visible_list": visible, "candidates": candidates,
+                 "attempt_timeout_seconds": attempt_timeout,
+                 "backoff_seconds": backoff,
+                 "attempt_timeout_basis": (
+                     "healthy npu-smi measured 0.77-1.4 s, worst healthy 6 s; D-state "
+                     "measured >20 s and unreclaimable after SIGKILL"),
+                 "backoff_basis": (
+                     "one window for transient congestion to clear; attempts are "
+                     "bounded by the visible list, worst case 2x(20+30)=100 s")}
+        attempts, selected = first_responsive_card(
+            candidates, visible,
+            lambda physical: probe_card(physical, attempt_timeout), backoff)
+        facts["device_attempts"] = attempts
+        facts["all_cards_unresponsive"] = selected is None
+        if selected is None:
             return ("NOT_RUN", BUSY_CODE,
-                    "the Ascend driver did not answer within %ss (timed_out=%s, "
-                    "unreaped=%s); this phase is NOT RUN, not failed and not passed"
-                    % (health["timeout_s"], health["timed_out"], health["unreaped"]),
-                    health, EXIT_NOT_RUN)
-        selection, code = device_selection(args.device_index,
-                                           os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
-        if code:
-            return "BLOCKED", code, \
-                "visible=%r requested=%r" % (os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
-                                             args.device_index), {}, EXIT_BLOCKED
-        facts = dict(selection)
+                    "every visible card was driver-unresponsive: %d bounded attempt(s), "
+                    "attempt_timeout=%ss, backoff=%ss; all_cards_unresponsive=true"
+                    % (len(attempts), attempt_timeout, backoff), facts, EXIT_NOT_RUN)
+        facts["selected_device"] = selected
+        facts.update(selected)
         facts["lock_path"] = str(TEAM_LOCK)
         facts["lock_canonical"] = TEAM_LOCK == TEAM_LOCK_PATH
         if os.environ.get("TF_DEVICE_LOCK_HELD", "").strip() == "1":
@@ -810,8 +953,9 @@ def main(argv=None) -> int:
         import torch_npu  # noqa: F401
         import tilelang
 
-        torch.npu.set_device(selection["logical_index"])
-        facts["device_name"] = torch.npu.get_device_name(selection["logical_index"])
+        logical_index = int(facts["logical_index"])
+        torch.npu.set_device(logical_index)
+        facts["device_name"] = torch.npu.get_device_name(logical_index)
         started_compile = time.time()
         kernel = tilelang.compile(vadd_one(N_LANES), target="ascend", out_idx=-1)
         facts["device_compile_seconds"] = round(time.time() - started_compile, 2)
@@ -824,8 +968,8 @@ def main(argv=None) -> int:
             expected = expected.copy()
             expected[7] = np.nextafter(expected[7], np.float32(1e9))
             facts["injected_error"] = "one ulp on reference lane 7"
-        tensor = torch.from_numpy(host_in.copy()).to("npu:%d" % selection["logical_index"])
-        facts["launch"] = "kernel(tensor) on npu:%d" % selection["logical_index"]
+        tensor = torch.from_numpy(host_in.copy()).to("npu:%d" % logical_index)
+        facts["launch"] = "kernel(tensor) on npu:%d" % logical_index
         produced = kernel(tensor)
         if args.negative_control == "no-sync":
             # ENV-05 control: launch and read WITHOUT synchronize. The run must not

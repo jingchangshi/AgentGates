@@ -248,6 +248,38 @@ occupancy per device: {"occupied": true|NONE, "holders": n|NONE,
 `occupied: NONE` means UNKNOWN, never "idle". The Gate does not act on it
 either way, and it never re-samples until the table looks the way it prefers.
 
+## Device attempt policy (ENV-05)
+
+The device phase probes each visible card **individually**, with a bound, and
+fails over only on a **driver-no-response** result.
+
+| Parameter | Default | Env override | Why this value (measured on this host) |
+|---|---|---|---|
+| --device-attempt-timeout-seconds | **20 s** | TFNU_DEVICE_ATTEMPT_TIMEOUT | healthy npu-smi: host 0.77/0.78 s, container 1.02/1.00 s; a full device phase saw 1.4 s; worst HEALTHY observation 6 s. A D-state probe (wchan devdrv_sync_non_tran) took >20 s and could not be reclaimed after SIGKILL -- it is unbounded. 20 s separates the two. |
+| --device-backoff-seconds | **30 s** | TFNU_DEVICE_BACKOFF | one natural window for transient congestion to clear before moving to the next card, without burning the run. |
+| attempts | visible-list length | -- | today 2 cards, so worst case 2 x (20 + 30) ~= **100 s**, fully bounded. |
+
+Rules:
+
+- **Only** a driver-unresponsive probe (bounded timeout + a child that had to be
+  killed/abandoned; timed_out/unreaped/wchan/pid recorded) may move to the next
+  card. A card that is merely **occupied** by another tenant is normal shared
+  use: it is recorded, never a retry/refusal/switch reason.
+- Every card is tried **once** per run; the attempt count is bounded by the
+  visible list.
+- After a failover, the selected card performs its **own fresh**
+  launch -> torch.npu.synchronize() -> host per-element readback. A previous
+  card's result is never reused.
+- Every attempt is written to device_attempts with
+  logical_index/physical_id/attempt/timed_out/unreaped/wchan/pid/elapsed, plus
+  selected_device and all_cards_unresponsive.
+- If **every** card is unresponsive: NOT_RUN + BUSY_DEVICE_NOT_RESPONDING +
+  all_cards_unresponsive=true. That is a declared failure of the environment,
+  never a PASS and never a software FAIL.
+
+TFNU_PROBE_OVERRIDE (e.g. 0=unresponsive,1=responsive) is a TEST seam for the
+two failover negatives; every simulated attempt carries simulated=true.
+
 ## What a PASS does not mean
 
 - **It is not device attestation.** The receipt is written by the same process
