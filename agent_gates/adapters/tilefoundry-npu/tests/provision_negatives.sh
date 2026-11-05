@@ -102,6 +102,18 @@ else
   diff <(printf '%s\n' "$ids_before") <(printf '%s\n' "$ids_after") | sed 's/^/        /'
 fi
 
+echo "== an unknown REQUIRED profile key is refused, not ignored =="
+"$PY" - "$HERE/../deployment_profile.json" "$TMP/unknown_key_profile.json" <<'PY'
+import json, sys
+profile = json.load(open(sys.argv[1]))
+profile["required_magic_gpu"] = True
+json.dump(profile, open(sys.argv[2], "w"))
+PY
+"$PY" "$PROVISION" --check --profile "$TMP/unknown_key_profile.json" > "$TMP/unknown.json" 2>&1; rc=$?
+[ "$rc" = 2 ] && ok "an unknown required key exits 2" || bad "unknown required key exit $rc, wanted 2"
+grep -q "PROFILE_UNKNOWN_KEY" "$TMP/unknown.json" && ok "the refusal is named PROFILE_UNKNOWN_KEY" || bad "unknown-key refusal not named"
+grep -q "required_magic_gpu" "$TMP/unknown.json" && ok "the unknown key is named in the refusal" || bad "the unknown key is not named"
+
 echo "== image tag resolving to a different digest =="
 "$PY" - "$HERE/../deployment_profile.json" "$TMP/bad_profile.json" <<'PY'
 import json, sys

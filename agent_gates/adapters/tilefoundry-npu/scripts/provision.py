@@ -62,6 +62,29 @@ def run(argv, timeout=120):
     return done.returncode, done.stdout, done.stderr
 
 
+#: Every key load_profile() understands. A profile that carries another
+#: required-style key is NOT "stricter than we are": it is a requirement the
+#: checker would silently ignore, so a machine could be believed to satisfy a
+#: contract that was never enforced. Unknown required keys are refused by name.
+KNOWN_PROFILE_KEYS = frozenset({
+    "schema_version",
+    "comment",
+    "required_image_name",
+    "required_image_digest",
+    "required_devices",
+    "required_binds",
+    "bind_source_equals_destination",
+    "required_container_user",
+    "required_control_nodes",
+    "required_driver_libraries",
+    "device_node_pattern",
+    "device_work_user",
+    "must_source_cann_before_npu_import",
+    "smi_requires_same_environment",
+    "notes",
+})
+
+
 def load_profile(path: Path) -> dict:
     try:
         profile = json.loads(path.read_text())
@@ -74,6 +97,16 @@ def load_profile(path: Path) -> dict:
     missing = [key for key in required if key not in profile]
     if missing:
         raise ProvisionError("PROFILE_INCOMPLETE", "missing keys: %r" % (missing,))
+    # A key the checker does not honour is a promise with no enforcement behind it.
+    unknown = sorted(key for key in profile
+                     if isinstance(key, str) and key.startswith("required")
+                     and key not in KNOWN_PROFILE_KEYS)
+    if unknown:
+        raise ProvisionError(
+            "PROFILE_UNKNOWN_KEY",
+            "the profile declares required key(s) this checker does not enforce: %r; "
+            "add them to KNOWN_PROFILE_KEYS with real enforcement, or remove them"
+            % (unknown,))
     return profile
 
 
