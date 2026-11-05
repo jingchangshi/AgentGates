@@ -981,7 +981,8 @@ def parse_device_list(raw: str) -> list:
     return ids
 
 
-def device_assertion_prefix(expected: str, cann_set_env: str = "") -> str:
+def device_assertion_prefix(expected: str, cann_set_env: str = "",
+                            verified_home: str = "") -> str:
     """Assert the exact visible list and root INSIDE the payload.
 
     The list is passed through unchanged; no single-device narrowing is done
@@ -995,6 +996,19 @@ def device_assertion_prefix(expected: str, cann_set_env: str = "") -> str:
     asked for. A CANN path that is configured and missing is a hard refusal
     rather than a warning: silently importing without it would report a library
     fault as a device result.
+
+    WHY THIS SECOND SOURCE EXISTS instead of reusing the preflight's environment.
+    The payload is a SEPARATE PROCESS. The preflight exports only a NAMED whitelist,
+    and CANN's script sets more than that whitelist enumerates, so handing the payload
+    just those values does not reproduce the environment the preflight validated. It
+    therefore sources the script itself.
+
+    That is not permitted to be a blind second environment. When verified_home is
+    supplied the payload ASSERTS that the ASCEND_HOME_PATH it ends up with equals the
+    one the preflight verified, and exits 97 on divergence BEFORE the workload runs.
+    The second source can thus never silently produce a different environment from
+    the one that was checked -- which is exactly how the historic discarded-result bug
+    happened.
     """
     source = ""
     if cann_set_env:
@@ -1005,8 +1019,18 @@ def device_assertion_prefix(expected: str, cann_set_env: str = "") -> str:
             '. ' + _sq(cann_set_env) + ' >&2 || { '
             'echo "DEVICE-ENV-FAIL: sourcing CANN_SET_ENV failed" >&2; exit 97; }; '
         )
+    verify = ""
+    if verified_home:
+        # Compare the environment this process ACTUALLY has against the one the
+        # preflight validated. Divergence is an environment fault, not a device one,
+        # and it is caught before any device work starts.
+        verify = (
+            'if [ "$ASCEND_HOME_PATH" != ' + _sq(verified_home) + ' ]; then '
+            'echo "DEVICE-ENV-DIVERGED: payload ASCEND_HOME_PATH=$ASCEND_HOME_PATH, '
+            'preflight verified ' + verified_home + '" >&2; exit 97; fi; '
+        )
     return (
-        source +
+        source + verify +
         'v="$ASCEND_RT_VISIBLE_DEVICES"; '
         'u=$(id -u); '
         'echo "DEVICE-ASSERT: visible=$v uid=$u" >&2; '
@@ -1109,7 +1133,14 @@ def build_preflight_script(cann: str, resolver: str = "loader") -> str:
         ". " + _sq(cann) + " >/dev/null 2>&1 || { echo FAIL-CANN-SOURCE; exit 12; }",
         'if [ -z "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-UNSET; exit 13; fi',
         'if [ ! -d "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-MISSING; exit 14; fi',
+        # REALPATH. The CANN script may leave a symlinked or non-canonical HOME, and a
+        # later consumer comparing strings would then see two "different" homes for one
+        # installation -- a spurious drift, or a spurious MATCH when two paths alias
+        # the same tree. Report the resolved path AND the raw one.
+        '__tf_home_raw="$ASCEND_HOME_PATH"',
+        'ASCEND_HOME_PATH=$(readlink -f "$ASCEND_HOME_PATH" 2>/dev/null || printf %s "$ASCEND_HOME_PATH")',
         'echo "HOME=$ASCEND_HOME_PATH"',
+        'echo "HOME-RAW=$__tf_home_raw"',
         # Emit the verified environment itself. A consumer must reuse EXACTLY these
         # values; re-sourcing the script on its own is a second, unverified
         # environment and is how the discarded-result bug happened.
@@ -1234,14 +1265,32 @@ def environment_preflight(config: dict) -> dict:
         elif line.startswith("LIB "):
             parts = line.split()
             name, path, real, digest = parts[1], parts[2], parts[3], parts[4]
+            # RECORDED, NOT PINNED. There is no expected digest to compare against,
+            # so a changed library cannot be detected from this record alone -- it can
+            # only be SEEN later by a reader who has an earlier run. Labeling it
+            # pinned would turn "we noted a hash" into "we verified a hash", which is
+            # the overclaim this field exists to avoid.
             facts.setdefault("libraries", {})[name] = {
                 "resolved": path,
                 "realpath": real,
                 "sha256": digest,
+                "pinned": False,
+                "recorded_only": True,
+                "why": ("no expected digest exists for this library; the hash is "
+                        "evidence for later comparison, not a verification now"),
             }
 
     # npu-smi must run in the SAME environment just verified. This is the only
     # place its loader failure may be classified.
+    #
+    # WHICH SOURCE IS IN EFFECT HERE, and why there is a second one. The preflight
+    # verified a shell brought up by sourcing CANN_SET_ENV, but it exported only the
+    # named whitelist above. This probe is a NEW sh -c, so it does NOT inherit that
+    # shell and must source the script again to reach the same state. If CANN_SET_ENV
+    # is configured and THIS source fails, the failure is attributed to the SMI probe
+    # (ENV_SMI_EXEC_FAILED) and NOT to the preflight, whose own source already
+    # succeeded. The two are deliberately different error paths, so a broken second
+    # source cannot masquerade as a broken environment.
     # npu-smi is bounded INSIDE the container as well as by the exec timeout. This
     # machine has hung the docker-exec SMI path, and an unbounded call surfaces as a
     # raw TimeoutExpired instead of a named environment fault -- which is exactly the
@@ -2748,8 +2797,11 @@ def _device_body(config: dict, device_raw: str, evidence_dir,
     state["workload_facts"] = workload_facts
     log("--- device workload: %s (readback=%s) ---" % (workload_name, readback_source))
     cann_set_env = config.get("CANN_SET_ENV") or ""
-    argv = ["sh", "-c", device_assertion_prefix(visible, cann_set_env), "--",
-            python, "-c", payload]
+    # verified_home makes the payload's own source CROSS-CHECKED against the
+    # preflight, so the second environment cannot silently differ from the verified one.
+    argv = ["sh", "-c", device_assertion_prefix(
+        visible, cann_set_env, env_facts.get("ascend_home_path") or ""), "--",
+        python, "-c", payload]
     log("exact device list asserted inside the payload")
     probe = run_stage("workload", container_exec, config, argv, user="root", env=env,
                       timeout=STAGE_TIMEOUTS["workload"] * 2, echo_stdout=False)
