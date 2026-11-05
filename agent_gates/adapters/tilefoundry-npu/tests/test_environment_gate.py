@@ -522,11 +522,363 @@ def test_preflight_script_reports_success_and_facts_on_a_real_run():
             assert len(parts[4]) == 64, "hash must be a sha256: %r" % line
 
 
+# --- HARD RULE: ask the loader, not the cache index --------------------------
+#
+# This is the rule the audit asked to be pinned, and the test below is the
+# discriminating one: a cache-index check must MISFIRE ON A HEALTHY MACHINE.
+
+def test_hard_rule_cache_resolver_misfires_where_loader_succeeds():
+    """THE discriminating test: on a HEALTHY environment the cache check misfires.
+
+    Both resolvers run over the SAME real npu-smi in the SAME environment. If the
+    cache-based mechanism ever stops reporting a missing library where the loader
+    resolves it fine, the justification for the ldd rule is gone and it must be
+    re-derived rather than kept on faith.
+
+    Runs in the CONTAINER when reachable, because that is where the case is real:
+    libc_sec.so is on npu-smi path via LD_LIBRARY_PATH but absent from the container
+    ldconfig cache. This host happens to have it cached, so testing only the host
+    would pass without demonstrating anything -- which the first version of this
+    test did.
+    """
+    import shutil
+    import subprocess
+
+    def resolution_in(prefix):
+        out = {}
+        for kind in ("loader", "cache"):
+            script = G.build_preflight_script(
+                "/data/pri/cann-9.2.0/ascend-toolkit/set_env.sh", resolver=kind)
+            done = subprocess.run(prefix + ["sh", "-c", script],
+                                  capture_output=True, text=True, timeout=180)
+            out[kind] = (done.returncode, done.stdout)
+        return out
+
+    if not shutil.which("docker"):
+        print("    SKIP: docker unavailable")
+        return
+    alive = subprocess.run(["docker", "exec", "-u", "root", "tf-ascend950pr",
+                            "sh", "-c", "true"], capture_output=True, timeout=60)
+    if alive.returncode != 0:
+        print("    SKIP: container not reachable; the host does not exhibit the case")
+        return
+    result = resolution_in(["docker", "exec", "-u", "root", "tf-ascend950pr"])
+    loader_rc, loader_out = result["loader"]
+    cache_rc, cache_out = result["cache"]
+    assert loader_rc == 0, "the loader must ACCEPT this healthy environment: %r" % (
+        loader_out[-300:],)
+    assert "PREFLIGHT-OK" in loader_out
+    assert cache_rc != 0, (
+        "the cache resolver unexpectedly ACCEPTED the environment, so it shows no "
+        "weakness and the ldd rule loses its justification")
+    assert "FAIL-LIB" in cache_out, (
+        "expected the cache resolver to name a missing library on a healthy "
+        "machine; got %r" % cache_out[-300:])
+    print("    proven: loader=PASS but cache=FAIL (%s) on the same healthy npu-smi"
+          % cache_out.strip().splitlines()[-1][:44])
+
+def test_loader_rule_is_documented_as_a_hard_rule():
+    """The hard rule must be written where the next maintainer will see it."""
+    src = (SCRIPT_DIR / "tilefoundry_gate.py").read_text()
+    assert "HARD RULE" in src, "the loader rule must be stated as a rule, not a note"
+
+
 def test_no_idle_wait_primitives_in_the_gate():
     """The shared-card policy: nothing may wait, poll, or retry until a card is free."""
     src = (SCRIPT_DIR / "tilefoundry_gate.py").read_text()
     for banned in ("while True", "time.sleep(", "wait_for_idle", "until_idle"):
         assert banned not in src, "found idle-wait primitive %r in the gate" % banned
+
+
+# --- P0-DEPLOY attestation: eight negative controls -------------------------
+#
+# Each of these is a way the host half could lie to the container half. All are
+# CPU-only: they operate on a synthetic attestation and never touch a device.
+
+def _attestation(**over):
+    """A well-formed attestation; tests mutate exactly one field."""
+    body = {
+        "schema_version": G.DEPLOYMENT_SCHEMA_VERSION,
+        "kind": "host-deployment-attestation",
+        "attested_at": __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc).isoformat(),
+        "container_name": "tf-test",
+        "container_id": "a" * 64,
+        "created": "2026-11-05T00:00:00.000000000Z",
+        "image": "sha256:" + "b" * 64,
+        "image_digest": "sha256:" + "b" * 64,
+        "host_config_devices": [
+            {"path_in_container": "/dev/davinci0", "path_on_host": "/dev/davinci0",
+             "permissions": "rwm"},
+            {"path_in_container": "/dev/davinci1", "path_on_host": "/dev/davinci1",
+             "permissions": "rwm"},
+            {"path_in_container": "/dev/davinci_manager",
+             "path_on_host": "/dev/davinci_manager", "permissions": "rwm"},
+            {"path_in_container": "/dev/hisi_hdc", "path_on_host": "/dev/hisi_hdc",
+             "permissions": "rwm"},
+        ],
+        "mounts": [
+            {"type": "bind", "source": "/data", "destination": "/data",
+             "mode": "ro", "read_only": True},
+            {"type": "bind", "source": "/home", "destination": "/home",
+             "mode": "rw", "read_only": False},
+            {"type": "bind", "source": "/usr/local/Ascend/driver",
+             "destination": "/usr/local/Ascend/driver", "mode": "ro",
+             "read_only": True},
+        ],
+        "config_visible_devices": "0,1",
+        "privileged": False,
+        "user": "",
+    }
+    body.update(over)
+    canonical = __import__("json").dumps(body, sort_keys=True, separators=(",", ":"))
+    body["content_sha256"] = __import__("hashlib").sha256(
+        canonical.encode()).hexdigest()
+    return body
+
+
+def _reseal(attestation):
+    """Recompute the hash as an EDITOR would, to test non-hash checks in isolation."""
+    import hashlib as _h
+    import json as _j
+    body = {k: v for k, v in attestation.items() if k != "content_sha256"}
+    attestation["content_sha256"] = _h.sha256(
+        _j.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return attestation
+
+
+def _linkage_ok(destinations):
+    return {"checked": list(destinations), "missing": [],
+            "writable": {"/data": False, "/home": True,
+                         "/usr/local/Ascend/driver": False}}
+
+
+def _verify(attestation, devices=(0, 1), observe=None, **cfg_over):
+    return G.verify_attestation(attestation, cfg(**cfg_over), list(devices),
+                                node_facts={"/dev/davinci0": "CHAR",
+                                            "/dev/davinci1": "CHAR",
+                                            "/dev/davinci_manager": "CHAR",
+                                            "/dev/hisi_hdc": "CHAR"},
+                                observe=observe)
+
+
+def test_attestation_well_formed_is_accepted():
+    """Positive control: with nothing wrong, all seven checks pass."""
+    detail = _verify(_attestation(), observe=_linkage_ok)
+    assert detail["mount_linkage"], detail
+    assert detail["image_digest"].startswith("sha256:"), detail
+
+
+def test_negative_stale_attestation_is_refused():
+    """(1) An old attestation describes a container that may no longer exist."""
+    import datetime as _dt
+    old = (_dt.datetime.now(_dt.timezone.utc)
+           - _dt.timedelta(seconds=G.ATTESTATION_MAX_AGE_SECONDS + 60)).isoformat()
+    att = _attestation(attested_at=old)
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok),
+                   "ATTESTATION_STALE", "ATTESTATION_STALE")
+
+
+def test_negative_container_id_mismatch_is_refused():
+    """(2) An attestation about a DIFFERENT container must not be accepted."""
+    cfg_with_id = cfg()
+    cfg_with_id["_attested_container_id"] = "c" * 64
+    try:
+        G.verify_attestation(_attestation(), cfg_with_id, [0, 1],
+                             node_facts={"/dev/davinci0": "CHAR",
+                                         "/dev/davinci1": "CHAR"},
+                             observe=_linkage_ok)
+    except G.GateError as exc:
+        assert "ATTESTATION_WRONG_CONTAINER" in str(exc), exc
+        assert exc.code == G.EXIT_BLOCKED
+        return
+    raise AssertionError("a container id mismatch must be refused")
+
+
+def test_negative_requested_device_absent_from_attested_devices():
+    """(3) Asking for davinci1 when Devices never bound it."""
+    att = _attestation(host_config_devices=[
+        {"path_in_container": "/dev/davinci0", "path_on_host": "/dev/davinci0",
+         "permissions": "rwm"},
+        {"path_in_container": "/dev/davinci_manager",
+         "path_on_host": "/dev/davinci_manager", "permissions": "rwm"},
+        {"path_in_container": "/dev/hisi_hdc", "path_on_host": "/dev/hisi_hdc",
+         "permissions": "rwm"}])
+    msg = expect_blocked(lambda: _verify(att, observe=_linkage_ok),
+                         "/dev/davinci1", "ATTESTATION_DEVICE_NOT_BOUND")
+    assert "not in the attested" in msg, msg
+
+
+def test_negative_regular_file_pretending_to_be_davinci():
+    """(4) A regular file named davinci1 is not a device."""
+    def verify_with_notchar():
+        return G.verify_attestation(
+            _attestation(), cfg(), [0, 1],
+            node_facts={"/dev/davinci0": "CHAR", "/dev/davinci1": "NOTCHAR"},
+            observe=_linkage_ok)
+    msg = expect_blocked(verify_with_notchar, "not character devices",
+                         "ATTESTATION_NODE_NOT_CHAR")
+    assert "regular file" in msg, msg
+
+
+def test_negative_missing_driver_mount():
+    """(5) No Ascend driver mount attested."""
+    att = _attestation(mounts=[
+        {"type": "bind", "source": "/data", "destination": "/data",
+         "mode": "ro", "read_only": True}])
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok),
+                   "no Ascend driver mount", "ATTESTATION_DRIVER_MOUNT_MISSING")
+
+
+def test_negative_image_digest_missing():
+    """(6) Image drift: the attestation carries no digest to compare."""
+    att = _attestation(image_digest="")
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok),
+                   "no image_digest", "ATTESTATION_INVALID")
+
+
+def test_negative_tampered_attestation_hash_mismatch():
+    """(7) Editing any field after sealing must invalidate the whole file."""
+    att = _attestation()
+    att["config_visible_devices"] = "0,1,2,3,4,5,6,7"   # edit WITHOUT resealing
+    msg = expect_blocked(lambda: _verify(att, observe=_linkage_ok),
+                         "ATTESTATION_TAMPERED", "ATTESTATION_TAMPERED")
+    assert "modified after it was produced" in msg, msg
+
+
+def test_negative_created_after_attested_at():
+    """(8) An attestation cannot predate the container it describes."""
+    att = _attestation(created="2099-01-01T00:00:00.000000000Z")
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok),
+                   "AFTER the attestation time", "ATTESTATION_INCONSISTENT")
+
+
+def test_negative_mount_not_linked_to_this_container():
+    """(4c) An mount that is not present in here means this is another container."""
+    def linkage(destinations):
+        return {"checked": list(destinations), "missing": ["/usr/local/Ascend/driver"],
+                "writable": {}}
+    expect_blocked(lambda: _verify(_attestation(), observe=linkage),
+                   "ATTESTATION_MOUNT_NOT_LINKED", "ATTESTATION_MOUNT_NOT_LINKED")
+
+
+def test_negative_read_only_mount_is_actually_writable():
+    """(4c) A mount attested ro but writable in here is mode drift."""
+    def linkage(destinations):
+        return {"checked": list(destinations), "missing": [],
+                "writable": {"/data": True, "/home": True,
+                             "/usr/local/Ascend/driver": False}}
+    expect_blocked(lambda: _verify(_attestation(), observe=linkage),
+                   "ATTESTATION_MOUNT_MODE_DRIFT", "ATTESTATION_MOUNT_MODE_DRIFT")
+
+
+# --- npu-smi parsing: the function whose return I once deleted --------------
+#
+# Real output captured from this machine, so the parser is exercised against the
+# actual table shape rather than a convenient invention.
+
+SMI_SAMPLE = """
++-------------------------------------------------------------------------------------------------+
+| npu-smi 25.7.rc1                 Version: 25.7.rc1                                              |
++--------+------------------+---------------+-----------------------------------------------------+
+| NPU ID | Name             | Health        | Power(W)    Temp(C)           Hugepages-Usage(page) |
+|        |                  | Bus-Id        | NPU Util(%) Memory-Usage(MB)  HBM-Usage(MB)         |
++========+==================+===============+=====================================================+
+| 0      | Ascend950PR      | OK            | 463.8       70                0     / 0             |
+|        |                  | 0000:55:00.0  | 100         0    / 0          16312 / 131072        |
++========+==================+===============+=====================================================+
+| 1      | Ascend950PR      | OK            | 455.0       71                0     / 0             |
+|        |                  | 0000:56:00.0  | 0           0    / 0          100   / 131072        |
++========+==================+===============+=====================================================+
+| NPU ID | Process id       | Process name  | Process memory(MB)                                  |
++========+==================+===============+=====================================================+
+| 1      | 12345            | python        | 2048                                                |
++========+==================+===============+=====================================================+
+"""
+
+
+def test_parse_npu_smi_returns_a_three_tuple_of_real_tables():
+    """The contract is a THREE-tuple. Deleting the return once broke the device Gate.
+
+    That deletion produced a ValueError only on a real run, because no CPU test called
+    this function at all. This test exists so the absence of that return fails here.
+    """
+    parsed = G.parse_npu_smi(SMI_SAMPLE)
+    assert parsed is not None, (
+        "parse_npu_smi returned None: its return statement is missing")
+    assert isinstance(parsed, tuple) and len(parsed) == 3, (
+        "parse_npu_smi must return (health, holders, table_seen); got %r" % (parsed,))
+    health, holders, table_seen = parsed
+    assert health == {0: "OK", 1: "OK"}, health
+    assert table_seen is True, table_seen
+    assert 1 in holders and not holders.get(0), holders
+
+
+def test_parse_npu_smi_unreadable_table_is_not_reported_as_idle():
+    """An unparsable dump must yield NO health rows, never "no processes, idle"."""
+    health, holders, table_seen = G.parse_npu_smi("complete garbage")
+    assert health == {}, health
+    assert holders == {}, holders
+    assert table_seen is False, table_seen
+
+
+def test_parse_npu_smi_health_row_is_not_confused_with_process_row():
+    """A holder row must not be read as a health row (the old bug could)."""
+    health, holders, table_seen = G.parse_npu_smi(SMI_SAMPLE)
+    # The process row starts with id 1 too; it must not overwrite health.
+    assert health[1] == "OK", health
+    assert table_seen is True
+
+
+# --- occupancy must REUSE the verified environment, not re-source ------------
+
+def test_occupancy_reuses_the_verified_environment_verbatim():
+    """The occupancy read must run in the SAME environment the preflight verified.
+
+    A second `source` is a second environment -- not the one that was checked -- and
+    the old open-coded prefix discarded the source result entirely. This pins the
+    reuse: the exact verified values must reach npu-smi, and no source call may be
+    issued for it.
+    """
+    captured = {}
+    original = G.container_exec
+
+    def fake(config, argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+
+        class R:
+            pass
+
+        r = R()
+        r.returncode = 0
+        r.stderr = ""
+        r.stdout = SMI_SAMPLE
+        return r
+
+    verified = {"LD_LIBRARY_PATH": "/data/cann/lib64:/usr/local/Ascend/driver/lib64",
+                "ASCEND_HOME_PATH": "/data/cann",
+                "PATH": "/usr/local/sbin:/usr/bin"}
+    G.container_exec = fake
+    try:
+        G.device_occupancy(cfg(), [0], {"env": verified})
+    finally:
+        G.container_exec = original
+
+    assert captured["env"] == verified, (
+        "occupancy did not receive the verified environment verbatim: %r"
+        % (captured["env"],))
+    command = " ".join(captured["argv"])
+    assert "set_env.sh" not in command, (
+        "occupancy re-sourced CANN instead of reusing the verified environment: %r"
+        % command)
+    assert "npu-smi" in command, command
+
+
+def test_occupancy_refuses_without_a_verified_environment():
+    """No verified env means NO silent fallback to an unverified source."""
+    expect_blocked(lambda: G.device_occupancy(cfg(), [0], {}),
+                   "did not return a verified environment", "ENV_LIBRARY_UNRESOLVED")
 
 
 TESTS = [(k, v) for k, v in sorted(globals().items())

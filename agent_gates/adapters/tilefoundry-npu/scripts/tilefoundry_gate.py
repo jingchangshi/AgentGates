@@ -24,6 +24,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -743,7 +744,7 @@ def _env_fail(kind: str, detail: str):
     raise GateError("%s: %s" % (kind, detail), EXIT_BLOCKED)
 
 
-def build_preflight_script(cann: str) -> str:
+def build_preflight_script(cann: str, resolver: str = "loader") -> str:
     """The exact shell program the preflight runs. Pure: no configuration, no I/O.
 
     Kept as a separate function so a CPU test can assert on the SCRIPT ITSELF.
@@ -758,18 +759,32 @@ def build_preflight_script(cann: str) -> str:
         'if [ -z "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-UNSET; exit 13; fi',
         'if [ ! -d "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-MISSING; exit 14; fi',
         'echo "HOME=$ASCEND_HOME_PATH"',
+        # Emit the verified environment itself. A consumer must reuse EXACTLY these
+        # values; re-sourcing the script on its own is a second, unverified
+        # environment and is how the discarded-result bug happened.
+        'echo "ENVVAR LD_LIBRARY_PATH=$LD_LIBRARY_PATH"',
+        'echo "ENVVAR ASCEND_HOME_PATH=$ASCEND_HOME_PATH"',
+        'echo "ENVVAR PATH=$PATH"',
         'case ":$LD_LIBRARY_PATH:" in *":$ASCEND_HOME_PATH/lib64:"*) : ;; '
         '*) echo FAIL-LD-PATH; exit 15 ;; esac',
-        # Resolve the libraries the way the LOADER will, not the way a cache index
-        # happens to be built. ldconfig -p was the wrong mechanism: on this machine
-        # libc_sec.so is NOT in the ldconfig cache at all, it is reached through
-        # LD_LIBRARY_PATH, so an ldconfig-only check reports a healthy machine as
-        # broken. Conversely a cache entry proves nothing about the loader path
-        # npu-smi actually receives. So ask ldd -- the same loader -- about the very
-        # binary that must run, and require each needed library to resolve to a file.
+        # HARD RULE: ask the SAME LOADER about the SAME BINARY that must run.
+        #
+        # Do not interrogate a cache index (ldconfig -p) instead. On this machine
+        # libc_sec.so resolves fine for npu-smi through LD_LIBRARY_PATH but is
+        # ABSENT from the ldconfig cache, so a cache-based check reports a HEALTHY
+        # machine as broken -- measured, not hypothetical: the first revision of this
+        # function did exactly that and was wrong. In the other direction, a cache
+        # entry says nothing about the loader path npu-smi actually receives.
+        #
+        # ldd applies the real search rules to the real binary. A library it reports
+        # as "not found", or that does not resolve to an existing file, is the only
+        # thing that counts as missing.
         'SMI=$(command -v npu-smi || echo /usr/local/sbin/npu-smi)',
         'if [ ! -x "$SMI" ]; then echo FAIL-SMI-ABSENT; exit 17; fi',
-        'ldd "$SMI" > /tmp/.tf-ldd 2>&1',
+        # resolver="cache" exists ONLY so a test can demonstrate that the cache-based
+        # mechanism misfires on a healthy machine. It is never selected by the Gate.
+        ('/sbin/ldconfig -p > /tmp/.tf-ldd 2>&1' if resolver == "cache"
+         else 'ldd "$SMI" > /tmp/.tf-ldd 2>&1'),
         'for lib in ' + " ".join(required_libraries()) + '; do '
         '  line=$(grep -F "$lib" /tmp/.tf-ldd 2>/dev/null | head -1)',
         '  p=$(printf %s "$line" | sed -n "s/.*=> \\([^ ]*\\) .*/\\1/p")',
@@ -858,6 +873,9 @@ def environment_preflight(config: dict) -> dict:
     for line in out.splitlines():
         if line.startswith("HOME="):
             facts["ascend_home_path"] = line.split("=", 1)[1]
+        elif line.startswith("ENVVAR "):
+            key, _, value = line[len("ENVVAR "):].partition("=")
+            facts.setdefault("env", {})[key] = value
         elif line.startswith("LIB "):
             parts = line.split()
             name, path, real, digest = parts[1], parts[2], parts[3], parts[4]
@@ -1100,25 +1118,33 @@ def deployment_verify(config: dict, device_ids: list, evidence_dir=None) -> dict
 OCCUPANCY_TIMEOUT = 90
 
 
-def device_occupancy(config: dict, device_ids: list):
+def device_occupancy(config: dict, device_ids: list, preflight_facts: dict):
     """Read occupancy ONCE, with one short bound; it is metadata, not a decision.
 
     There is no repeat sample, no wait, and no re-read until the card looks
     free. A failure to read is reported as an unreadable environment, not as an
     idle card, and a card that is not OK is a real health fault.
     """
-    # npu-smi needs the CANN libraries on its own loader path. The environment is
-    # NOT re-sourced here with an open-coded prefix: environment_preflight owns that
-    # contract, and this consumer depends on it. The old prefix was
+    # Occupancy REUSES the environment the preflight verified -- the same values,
+    # passed explicitly -- rather than sourcing CANN again with its own prefix.
+    #
+    # Two reasons this matters. First, the old prefix was
     # `. <script> >/dev/null 2>&1; exec npu-smi`, which DISCARDED the source result,
-    # so a failed or missing CANN reported itself only as "npu-smi status 127" --
-    # exactly the libc_sec confusion. That path no longer exists.
-    facts = environment_preflight(config)
-    cann = (config.get("CANN_SET_ENV") or "").strip()
+    # so a missing or failing CANN reported itself only as "npu-smi status 127" --
+    # exactly the libc_sec confusion. Second, a second `source` is a SECOND
+    # environment: it is not the one that was checked, and nothing forces the two to
+    # agree. docker exec starts a fresh process, so the verified values cannot be
+    # inherited implicitly; they must be handed over deliberately.
+    verified_env = dict(preflight_facts.get("env") or {})
+    if not verified_env.get("LD_LIBRARY_PATH"):
+        raise GateError(
+            "%s: the preflight did not return a verified environment to reuse; "
+            "refusing to fall back to an unverified source" % ENV_LIBRARY_UNRESOLVED,
+            EXIT_BLOCKED)
     result = container_exec(config, ["sh", "-c",
-                                     ". " + _sq(cann) + " >/dev/null 2>&1; "
                                      'exec "$(command -v npu-smi || echo /usr/local/sbin/npu-smi)" info'],
-                            user="root", timeout=OCCUPANCY_TIMEOUT, echo_stdout=False)
+                            user="root", env=verified_env, timeout=OCCUPANCY_TIMEOUT,
+                            echo_stdout=False)
     if result.returncode != 0:
         raise GateError(
             "%s: npu-smi failed with status %d AFTER the environment preflight "
@@ -1163,7 +1189,290 @@ def device_occupancy(config: dict, device_ids: list):
     return occupancy, result.stdout
 
 
-def gate_device(config: dict, device_raw: str, evidence_dir) -> int:
+
+
+# ----------------------------------------- host-side attestation (P0-DEPLOY)
+
+#: How old an attestation may be before the device Gate refuses it. A stale
+#: attestation describes a container that may no longer exist, so it is not
+#: evidence about the container we are about to touch.
+ATTESTATION_MAX_AGE_SECONDS = 300
+
+
+def deployment_attest(config: dict, out_path: Path) -> int:
+    """Produce a READ-ONLY host-side attestation of the container deployment.
+
+    THIS IS NOT A GATE. It runs no compiler, executes nothing inside the container,
+    touches no /dev node and does not start, stop or recreate anything. It only runs
+    `docker inspect` and writes what the daemon reports, plus a content hash.
+
+    It exists because the device Gate runs INSIDE the container, where there is no
+    host view: from in there, a device node existing does not prove the container was
+    created with that device bound. The Gate therefore cannot honestly claim a full
+    deployment verification on its own. This producer supplies the missing half, and
+    the Gate consumes it via --deployment-attestation, so the two halves are checked
+    together instead of the Gate quietly overclaiming.
+
+    Being host-only is deliberate: it must run where the Docker daemon is reachable,
+    which is exactly where the Gate is forbidden to run.
+    """
+    name = config["CONTAINER_NAME"]
+    inspected = run(["docker", "inspect", name], timeout=60, echo_stdout=False)
+    if inspected.returncode != 0:
+        raise GateError(
+            "cannot attest container %r: docker inspect failed with status %d. This "
+            "is an ENVIRONMENT fault; nothing is claimed about the deployment"
+            % (name, inspected.returncode), EXIT_BLOCKED)
+    try:
+        payload = json.loads(inspected.stdout)[0]
+    except (ValueError, IndexError, TypeError) as exc:
+        raise GateError("docker inspect returned unparsable output: %r" % (exc,),
+                        EXIT_BLOCKED)
+
+    host_config = payload.get("HostConfig") or {}
+    config_block = payload.get("Config") or {}
+    devices = []
+    for entry in host_config.get("Devices") or []:
+        devices.append({
+            "path_on_host": entry.get("PathOnHost"),
+            "path_in_container": entry.get("PathInContainer"),
+            "permissions": entry.get("CgroupPermissions"),
+        })
+    mounts = []
+    for mount in payload.get("Mounts") or []:
+        mounts.append({
+            "type": mount.get("Type"),
+            "source": mount.get("Source"),
+            "destination": mount.get("Destination"),
+            "mode": mount.get("Mode"),
+            "read_only": bool(mount.get("RW") is False),
+        })
+    visible = None
+    for entry in config_block.get("Env") or []:
+        key, _, value = entry.partition("=")
+        if key == "ASCEND_RT_VISIBLE_DEVICES":
+            visible = value
+
+    created = payload.get("Created")
+    attestation = {
+        "schema_version": DEPLOYMENT_SCHEMA_VERSION,
+        "kind": "host-deployment-attestation",
+        "attested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "container_name": name,
+        "container_id": payload.get("Id"),
+        "created": created,
+        "image": payload.get("Image"),
+        "image_digest": (payload.get("Image") or ""),
+        "host_config_devices": devices,
+        "mounts": mounts,
+        "config_visible_devices": visible,
+        "privileged": bool(host_config.get("Privileged")),
+        "user": config_block.get("User") or "",
+    }
+    # The content hash covers the payload BEFORE it is added, so a later edit to any
+    # field is detectable. A hash that covered itself could not do that.
+    canonical = json.dumps(attestation, sort_keys=True, separators=(",", ":"))
+    attestation["content_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n")
+    log("attestation written to %s (container %s, %d device(s), %d mount(s))"
+        % (out_path, str(attestation["container_id"])[:12], len(devices), len(mounts)))
+    log("this is an attestation PRODUCER, not a Gate: no device was touched, "
+        "nothing was executed in the container")
+    print(json.dumps({"attestation": str(out_path),
+                      "content_sha256": attestation["content_sha256"]}, sort_keys=True))
+    return EXIT_PASS
+
+
+def observe_mount_linkage(config: dict, destinations: list) -> dict:
+    """Check, from INSIDE the container, that the attested mounts are really here.
+
+    This is the identity evidence that survives the container being unable to read its
+    own docker ID. The container cannot say "I am 3602bce...", but it CAN show that the
+    exact mount set described in the attestation is present and has the attested
+    read-only/writable mode -- which a different container would not reproduce.
+
+    Read-only, no device access.
+    """
+    wanted = [d for d in destinations if d]
+    if not wanted:
+        return {"checked": [], "missing": [], "ro_mismatch": []}
+    script = []
+    for destination in wanted:
+        sq = _sq(destination)
+        script.append(
+            'if [ ! -e ' + sq + ' ]; then echo "MOUNT-MISSING ' + destination + '"; '
+            'else '
+            'w=no; [ -w ' + sq + ' ] && w=yes; '
+            'echo "MOUNT ' + destination + ' writable=$w"; fi')
+    result = container_exec(config, ["sh", "-c", "; ".join(script)], user="root",
+                            timeout=60, echo_stdout=False)
+    out = result.stdout or ""
+    missing, writable = [], {}
+    for line in out.splitlines():
+        if line.startswith("MOUNT-MISSING "):
+            missing.append(line.split(None, 1)[1])
+        elif line.startswith("MOUNT "):
+            fields = line.split()
+            destination = fields[1]
+            writable[destination] = fields[2].endswith("=yes")
+    return {"checked": sorted(writable), "missing": missing, "writable": writable}
+
+
+def verify_attestation(attestation: dict, config: dict, device_ids: list,
+                       node_facts: dict = None, observe=None) -> dict:
+    """Check the seven conditions that let the device Gate claim a full verification.
+
+    Each failure is named and specific. None of them is busy, and none rebuilds or
+    restarts anything. If any check fails the Gate refuses the attestation rather
+    than falling back to a weaker claim, because a half-verified deployment that
+    reports success is exactly the overclaim this machinery exists to prevent.
+    """
+    detail = {}
+
+    # (7) content hash first: if the file was edited, every later field is suspect,
+    # so there is no point interpreting it.
+    claimed = attestation.get("content_sha256")
+    body = {k: v for k, v in attestation.items() if k != "content_sha256"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    actual = hashlib.sha256(canonical.encode()).hexdigest()
+    if not claimed or claimed != actual:
+        raise GateError(
+            "ATTESTATION_TAMPERED: content_sha256 %r does not match the recomputed %r. "
+            "The attestation was modified after it was produced, so none of its claims "
+            "may be relied on" % (claimed, actual), EXIT_BLOCKED)
+
+    # (3) container identity. Where we cannot know our own ID, this is not silently
+    # skipped: it is recorded as unverifiable and the MOUNT LINKAGE below carries the
+    # burden instead.
+    expected_id = config.get("_attested_container_id")
+    if expected_id:
+        if attestation.get("container_id") != expected_id:
+            raise GateError(
+                "ATTESTATION_WRONG_CONTAINER: attestation is for container %s but this "
+                "container is %s" % (str(attestation.get("container_id"))[:12],
+                                     str(expected_id)[:12]), EXIT_BLOCKED)
+        detail["container_id_check"] = "matched"
+    else:
+        detail["container_id_check"] = (
+            "UNVERIFIABLE from inside the container; mount linkage used instead")
+
+    # (1) freshness, and self-consistency against the container birth time.
+    attested_at = attestation.get("attested_at")
+    try:
+        when = datetime.datetime.fromisoformat(str(attested_at))
+    except (TypeError, ValueError):
+        raise GateError("ATTESTATION_INVALID: unusable attested_at %r" % (attested_at,),
+                        EXIT_BLOCKED)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - when).total_seconds()
+    detail["attestation_age_seconds"] = round(age, 1)
+    if age > ATTESTATION_MAX_AGE_SECONDS:
+        raise GateError(
+            "ATTESTATION_STALE: produced %.0fs ago, older than the %ds limit. It may "
+            "describe a container that no longer exists" % (age, ATTESTATION_MAX_AGE_SECONDS),
+            EXIT_BLOCKED)
+    if age < -60:
+        raise GateError(
+            "ATTESTATION_STALE: attested_at is %.0fs in the FUTURE; the clock or the "
+            "file cannot be trusted" % (-age,), EXIT_BLOCKED)
+
+    created = attestation.get("created")
+    if created:
+        try:
+            born = datetime.datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+            if born > when:
+                raise GateError(
+                    "ATTESTATION_INCONSISTENT: container was created at %s, AFTER the "
+                    "attestation time %s. An attestation cannot predate its container"
+                    % (created, attested_at), EXIT_BLOCKED)
+        except ValueError:
+            detail["created_parse"] = "UNPARSEABLE"
+
+    # (4) every requested device must be genuinely bound.
+    bound = set()
+    by_path = {}
+    for entry in attestation.get("host_config_devices") or []:
+        path = entry.get("path_in_container") or entry.get("path_on_host")
+        if path:
+            bound.add(path)
+            by_path[path] = entry
+    detail["attested_bound"] = sorted(bound)
+    missing = ["/dev/davinci%d" % i for i in device_ids
+               if "/dev/davinci%d" % i not in bound]
+    if missing:
+        raise GateError(
+            "ATTESTATION_DEVICE_NOT_BOUND: %s are not in the attested "
+            "HostConfig.Devices (attested: %s)" % (", ".join(missing), sorted(bound)),
+            EXIT_BLOCKED)
+
+    # (5) driver / CANN read-only mounts must be present.
+    destinations = [m.get("destination") for m in attestation.get("mounts") or []]
+    driver_mounts = [d for d in destinations if d and "Ascend" in str(d)]
+    if not driver_mounts:
+        raise GateError(
+            "ATTESTATION_DRIVER_MOUNT_MISSING: no Ascend driver mount is attested "
+            "(attested mounts: %s)" % (destinations,), EXIT_BLOCKED)
+    detail["driver_mounts"] = driver_mounts
+    detail["read_only_mounts"] = [m.get("destination")
+                                  for m in attestation.get("mounts") or []
+                                  if m.get("read_only")]
+
+    # (4b) in-container nodes must be CHARACTER devices with matching major:minor.
+    if node_facts:
+        not_char = [n for n, kind in node_facts.items() if kind == "NOTCHAR"]
+        if not_char:
+            raise GateError(
+                "ATTESTATION_NODE_NOT_CHAR: %s are not character devices inside the "
+                "container. A regular file named davinciN is not a device"
+                % ", ".join(sorted(not_char)), EXIT_BLOCKED)
+        absent = [n for n, kind in node_facts.items() if kind == "MISSING"]
+        if absent:
+            raise GateError(
+                "ATTESTATION_NODE_MISSING: %s are absent inside the container"
+                % ", ".join(sorted(absent)), EXIT_BLOCKED)
+
+    # (4c) MOUNT LINKAGE. This is what makes the attestation provably about THIS
+    # container rather than merely plausible: every attested mount destination must
+    # actually exist in here, and every one attested READ-ONLY must really be
+    # read-only. A different container would not reproduce this, and it is checkable
+    # from inside, unlike the container ID.
+    if observe is not None:
+        linkage = observe(destinations) or {}
+        missing_mounts = linkage.get("missing") or []
+        if missing_mounts:
+            raise GateError(
+                "ATTESTATION_MOUNT_NOT_LINKED: attested mount(s) %s do not exist inside "
+                "this container, so this attestation is not about this container"
+                % ", ".join(missing_mounts), EXIT_BLOCKED)
+        attested_read_only = {m.get("destination")
+                              for m in attestation.get("mounts") or []
+                              if m.get("read_only")}
+        writable_now = linkage.get("writable") or {}
+        ro_drift = sorted(d for d in attested_read_only if writable_now.get(d) is True)
+        if ro_drift:
+            raise GateError(
+                "ATTESTATION_MOUNT_MODE_DRIFT: %s are attested read-only but are "
+                "writable inside this container" % ", ".join(ro_drift), EXIT_BLOCKED)
+        detail["mount_linkage"] = linkage.get("checked") or []
+
+    # (6) the image must not have drifted.
+    configured = config.get("IMAGE")
+    if configured and not attestation.get("image_digest"):
+        raise GateError("ATTESTATION_INVALID: no image_digest recorded", EXIT_BLOCKED)
+
+    detail["container_id"] = attestation.get("container_id")
+    detail["image_digest"] = attestation.get("image_digest")
+    detail["privileged"] = attestation.get("privileged")
+    detail["user"] = attestation.get("user")
+    detail["config_visible_devices"] = attestation.get("config_visible_devices")
+    return detail
+
+def gate_device(config: dict, device_raw: str, evidence_dir,
+                attestation_path=None) -> int:
     """Run a real device workload on every requested visible device.
 
     Occupancy is READ and RECORDED per device. It never changes the selected
@@ -1192,6 +1501,27 @@ def gate_device(config: dict, device_raw: str, evidence_dir) -> int:
     # a davinci path that is a regular file stops here as a DEPLOYMENT fault -- never
     # as busy, and never by rebuilding someone else's container.
     deploy_facts = deployment_verify(config, device_ids, evidence_dir)
+    # The container cannot see its own device BINDING. If the host produced an
+    # attestation, check it against reality here and only then upgrade the claim.
+    if attestation_path is not None:
+        try:
+            attestation = json.loads(Path(attestation_path).read_text())
+        except (OSError, ValueError) as exc:
+            raise GateError(
+                "ATTESTATION_UNREADABLE: cannot read %s: %s" % (attestation_path, exc),
+                EXIT_BLOCKED)
+        # The container cannot read its own docker ID (the hostname here is a custom
+        # name, not the ID, and the cgroup namespace is collapsed), so a mismatch can
+        # only be detected from the host. On the host, pass it; inside, this is None
+        # and verify_attestation falls back to MOUNT LINKAGE, which IS provable.
+        attested = verify_attestation(
+            attestation, config, device_ids,
+            node_facts=deploy_facts.get("nodes"),
+            observe=lambda dests: observe_mount_linkage(config, dests))
+        deploy_facts["verified"] = True
+        deploy_facts["verified_scope"] = "full-host-attested"
+        deploy_facts["attestation"] = attested
+        log("deployment: FULLY attested (7/7 checks) via %s" % attestation_path)
 
     visible = ",".join(str(i) for i in device_ids)
     run_id = uuid.uuid4().hex[:12]
@@ -1203,7 +1533,7 @@ def gate_device(config: dict, device_raw: str, evidence_dir) -> int:
         "TF_DEVICE_AUTH": "1",
     }
 
-    occupancy, occupancy_raw = device_occupancy(config, device_ids)
+    occupancy, occupancy_raw = device_occupancy(config, device_ids, env_facts)
     for device_id in device_ids:
         item = occupancy[device_id]
         log("device %d occupancy: occupied=%s holders=%s idle_established=%s"
@@ -1290,6 +1620,9 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
         "assertionInsidePayload": True,
         "deviceBoundIntoContainer": True,
         "occupancyRecorded": True,
+        # Stated explicitly so a verifier does not have to infer it: occupancy ran in
+        # the SAME verified environment as the preflight, not in a second sourced one.
+        "occupancyReusedPreflightEnv": True,
         "deviceWorkloadExecuted": workload_ok,
         "deviceIdentityRecorded": identity_ok,
     }
@@ -1316,6 +1649,8 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
             "libraries": env_facts.get("libraries", {}),
             "smi_probe_exit": env_facts.get("smi_probe_exit"),
             "preflight": "PASSED",
+            "occupancy_env_source": "reused from preflight (same verified values, "
+                                    "passed explicitly; not re-sourced)",
         },
         "deployment": {
             "schema_version": deploy_facts.get("schema_version"),
@@ -1360,7 +1695,6 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
 
 def write_evidence(directory, name: str, record: dict, run_id: str | None = None) -> None:
     """Write one JSON record per Gate run."""
-    import datetime
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     record = dict(record)
@@ -1445,6 +1779,15 @@ def main(argv=None) -> int:
     parser.add_argument("--device-id", "--device-ids", dest="device_id", default=None,
                         help="ordered comma-separated visible device list, e.g. 0,1")
     parser.add_argument("--evidence-dir", default=None)
+    # P0-DEPLOY: the two halves of the host/container split. The producer is NOT a
+    # Gate -- it runs no compiler, executes nothing in the container, and touches no
+    # device node; it only records what docker inspect reports. The consumer lets the
+    # in-container device Gate claim a full verification it could not make alone.
+    parser.add_argument("--deployment-attest", default=None, metavar="OUT.json",
+                        help="HOST ONLY, read-only: write a deployment attestation. "
+                             "Not a Gate; touches no device.")
+    parser.add_argument("--deployment-attestation", default=None, metavar="FILE",
+                        help="device Gate: verify against a host-produced attestation")
     args = parser.parse_args(argv)
 
     here = Path(__file__).resolve().parent
@@ -1456,10 +1799,17 @@ def main(argv=None) -> int:
             return gate_check_config(load_config(env_path))
 
         config = load_config(env_path)
+        if args.deployment_attest:
+            # Deliberately before the host guard: this is the one host-side operation,
+            # and it is read-only by construction.
+            return deployment_attest(config, Path(args.deployment_attest))
         if args.device:
             device_raw = (args.device_id or config.get("DEVICE_ID")
                           or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or "0,1")
-            return gate_device(config, device_raw, evidence_dir)
+            attest = (Path(args.deployment_attestation)
+                      if args.deployment_attestation else None)
+            return gate_device(config, device_raw, evidence_dir,
+                               attestation_path=attest)
         if args.cpu:
             return gate_cpu(config, evidence_dir)
         if args.build:
@@ -1471,7 +1821,10 @@ def main(argv=None) -> int:
             "  --check-config   validate the configuration\n"
             "  --build          build the image and create the container\n"
             "  --cpu            the CPU Gate (import, analyze, finalize, tools)\n"
-            "  --device         the device Gate (root, explicit device id)"
+            "  --device         the device Gate (root, explicit device id)\n"
+            "  --deployment-attest OUT.json\n"
+            "                   HOST ONLY and NOT a Gate: read-only attestation of the\n"
+            "                   container deployment. Executes nothing, touches no device."
         )
     except GateError as error:
         log(str(error))

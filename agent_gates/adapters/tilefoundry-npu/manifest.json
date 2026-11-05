@@ -10,13 +10,25 @@
   "skills": [],
   "permissions": {
     "sourceWrite": false,
-    "hostExecution": true
+    "hostExecution": true,
+    "hostReadOnlyCapabilities": [
+      {
+        "id": "deployment-attest",
+        "argv": ["--deployment-attest", "OUT.json"],
+        "hostOnly": true,
+        "isGate": false,
+        "deviceAccess": false,
+        "executesInContainer": false,
+        "mutatesState": false,
+        "description": "Read-only producer of a host-side deployment attestation. Runs only 'docker inspect' and writes a JSON file with a content hash. It is NOT a Gate, is NOT listed in gates, starts/stops/creates nothing, executes nothing inside the container, and touches no /dev node. It exists because the device Gate runs inside the container where it cannot see its own device binding, so the binding must be attested from the host and then verified in-container via --deployment-attestation."
+      }
+    ]
   },
   "runtimeCompatibility": {
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_gate.py": "857fec2141c8352365e88c426522c633cce7d77cd347a72bd5138f414dae512a",
+    "scripts/tilefoundry_gate.py": "8da7d3b03ccfd3f928206084d6ea695361b821f6f7f29f7a4a81b050c9286416",
     "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
     "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",
     "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae"
