@@ -14,7 +14,10 @@
     "hostReadOnlyCapabilities": [
       {
         "id": "deployment-attest",
-        "argv": ["--deployment-attest", "OUT.json"],
+        "argv": [
+          "--deployment-attest",
+          "OUT.json"
+        ],
         "hostOnly": true,
         "isGate": false,
         "deviceAccess": false,
@@ -28,7 +31,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_gate.py": "82631cfcf102c1b5803635ced04754257bc5a285eab02d47dd00ced8e779849b",
+    "scripts/tilefoundry_gate.py": "66185b1fbaba54f47ff8dd41a053f29ea6b6613034eff568c272733a933c1e05",
     "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
     "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",
     "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae"
@@ -138,12 +141,20 @@
       "gateType": "deterministic-test",
       "observationChecks": {
         "exitCodeZero": true,
+        "environmentPreflight": true,
+        "deploymentVerified": true,
         "ranAsRoot": true,
         "multiDeviceCoverage": true,
         "assertionInsidePayload": true,
         "deviceBoundIntoContainer": true,
         "occupancyRecorded": true,
+        "occupancyReusedPreflightEnv": true,
+        "runtimeIdentityRecorded": true,
+        "compileProfileDigestRecorded": true,
+        "cacheFreshPerRun": true,
+        "cacheDisabled": true,
         "deviceWorkloadExecuted": true,
+        "hostRecomputedVerdict": true,
         "deviceIdentityRecorded": true
       },
       "description": "Runs a real device workload (set_device + tensor add + synchronize + numeric check) on every device in the requested ASCEND_RT_VISIBLE_DEVICES list, as root inside the container, with the exact list asserted in-payload. Occupancy is read ONCE and recorded as non-verdict metadata; busy and idle run the same workload, with the same verdict rule. No busy wait, poll, skip, fallback, or exclusive refusal exists. BLOCKED_ENV is reserved for real faults: missing root, unreadable/failed npu-smi, health not OK, requested device not bound into the container, or authentication failure."

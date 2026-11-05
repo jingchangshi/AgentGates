@@ -100,6 +100,14 @@ class Harness:
     def __init__(self, payload=PAYLOAD_OK, payload_rc=0, payload_delay=0.0,
                  occupancy_delay=0.0, occupancy_raises=None, on_payload=None):
         self.gate = load_gate()
+        # PRIVATE lock, deliberately, and the claim is limited accordingly. These
+        # in-process cases measure the LEASE MECHANISM (bounds, finally sample, record)
+        # and must not depend on the state of a shared file. They therefore prove
+        # nothing about TEAM serialisation -- only the two-process case, which runs
+        # against the canonical /home/.tf_device0.lock, can support that claim. The
+        # result record carries lock.canonical so the two are never conflated.
+        self.lock_dir = Path(tempfile.mkdtemp(prefix="p0e-lock-"))
+        self.gate.DEVICE_LOCK_PATH = self.lock_dir / "device.lock"
         self.payload = payload
         self.payload_rc = payload_rc
         self.payload_delay = payload_delay
@@ -123,10 +131,28 @@ class Harness:
                 "schema_version": 1, "effective_config_sha256": "0" * 64,
                 "host_inspect": {}, "image_id": "sha256:fake", "bound_devices": list(ids),
                 "nodes": len(ids), "verified": True}
+        # P0-B facts. Without these the REAL probes run against the stubbed container
+        # and fail, so the body refuses with EXIT_BLOCKED long before the workload --
+        # which made the workload, timeout and record cases measure the wrong thing.
+        if hasattr(self.gate, "capture_runtime_identity"):
+            self.gate.capture_runtime_identity = lambda config, python, env: {
+                "acceptable": True, "version": "3.12.0-fake", "executable": "/fake/python",
+                "modules": {"torch": {"version": "2.1.0"},
+                            "torch_npu": {"version": "2.1.0"},
+                            "tilefoundry": {"version": "0.0.0"}},
+                "pythonpath": "fake", "torch_backend_autoload": "0", "failures": []}
+        if hasattr(self.gate, "capture_compile_profile"):
+            self.gate.capture_compile_profile = lambda config, python, env: {
+                "digest": "0" * 64, "roots": {}, "libraries": {}, "tools": {}}
+        if hasattr(self.gate, "prepare_empty_cache"):
+            self.gate.prepare_empty_cache = lambda config, cache_dir: {
+                "dir": cache_dir, "empty_at_start": True, "fresh_per_run": True}
         self.gate.device_occupancy = self._occupancy
         self.gate.container_exec = self._exec
+        # The lease must be real, but pointed at this test's private lock file.
+        self.gate.DEVICE_LOCK_PATH = self.lock_dir / "device.lock"
 
-    def _occupancy(self, config, device_ids):
+    def _occupancy(self, config, device_ids, preflight_facts=None):
         self.occupancy_calls += 1
         if self.occupancy_delay:
             time.sleep(self.occupancy_delay)
@@ -147,11 +173,18 @@ class Harness:
         if self.on_payload is not None:
             self.on_payload()
         if self.payload_delay:
+            # Honour an injected timeout the way the real container_exec does: the
+            # bound must cut the call short, not be noticed afterwards.
+            limit = kwargs.get("timeout")
+            if limit is not None and self.payload_delay > float(limit):
+                time.sleep(float(limit))
+                raise __import__("subprocess").TimeoutExpired(cmd=argv, timeout=float(limit))
             time.sleep(self.payload_delay)
         return FakeResult(self.payload, self.payload_rc)
 
     def run(self, device_raw="0,1", evidence_dir=None, **kwargs):
         """Call the gate; return (exit code, captured stdout, elapsed seconds)."""
+        self.run_dir = evidence_dir
         out = io.StringIO()
         started = time.time()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
@@ -169,6 +202,17 @@ class Harness:
         return code, out.getvalue(), time.time() - started
 
 
+def _last_result_file(h):
+    """The single result JSON this run wrote, or None."""
+    files = result_files(h.run_dir) if getattr(h, "run_dir", None) else []
+    if not files:
+        return None
+    try:
+        return json.loads(Path(files[-1]).read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def result_files(directory: Path):
     return sorted(p for p in Path(directory).rglob("*.json")) if Path(directory).is_dir() else []
 
@@ -176,30 +220,66 @@ def result_files(directory: Path):
 # ------------------------------------------------------------- P0-E: the lock
 
 WORKER = '''\
-import importlib.util, sys
+import importlib.util, sys, time
 spec = importlib.util.spec_from_file_location("gate_under_test", sys.argv[1])
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 try:
     with gate.device_lock_lease() as lease:
-        print("ENTERED", getattr(lease, "handoff_verified", "n/a"), flush=True)
+        enter = time.time()
+        time.sleep(0.35)
+        print("ENTERED", getattr(lease, "handoff_verified", "n/a"),
+              "LOCKPATH=%s" % gate.DEVICE_LOCK_PATH,
+              "ENTER@%.6f" % enter, "EXIT@%.6f" % time.time(), flush=True)
 except gate.GateError as exc:
     print("REFUSED", exc, flush=True)
 '''
 
 
-def _two_real_workers(env_extra=None, workers=2):
-    """Run N SEPARATE PROCESSES competing for the one team lock.
+def _worker_spans(results):
+    """(enter, exit) timestamps from the worker transcripts.
+
+    The gate writes its own log lines to stderr, which the worker transcript merges
+    with stdout, so tokens arrive glued to log text. Extract the NUMBER by regex
+    rather than splitting on whitespace.
+    """
+    import re as _re
+    pattern = _re.compile(r"ENTER@([0-9.]+)|EXIT@([0-9.]+)")
+    spans = []
+    for line in results:
+        enter = exit_ = None
+        for match in pattern.finditer(line):
+            if match.group(1):
+                enter = float(match.group(1))
+            else:
+                exit_ = float(match.group(2))
+        if enter is not None and exit_ is not None:
+            spans.append((enter, exit_))
+    return spans
+
+
+def _two_real_workers(env_extra=None, workers=2, canonical=True):
+    """Run N SEPARATE PROCESSES competing for the one lock.
 
     Threads would be the wrong instrument twice over: a flock is per open file
     description, and contextlib.redirect_stdout is process-global and not
     thread-safe (in the first version of this file two threads corrupted stdout
     and silently swallowed every later result). Real processes also model what a
     second team job actually is.
+
+    canonical=True exercises the REAL team lock path, because only that can support a
+    claim about team serialisation. A private path proves the lease mechanism works;
+    it says nothing about whether two team members are serialised, since neither
+    touched the file the team shares.
     """
     import subprocess
     env = dict(os.environ)
     env.pop("TF_DEVICE_LOCK_HELD", None)
+    if canonical:
+        env.pop("TF_DEVICE_LOCK_PATH", None)  # use the shipped default
+    else:
+        lock_dir = Path(tempfile.mkdtemp(prefix="p0e-proc-lock-"))
+        env["TF_DEVICE_LOCK_PATH"] = str(lock_dir / "device.lock")
     env.update(env_extra or {})
     procs = [
         subprocess.Popen(
@@ -223,14 +303,23 @@ def test_two_workers_never_enter_the_payload_together():
     require(hasattr(gate, "device_lock_lease"),
             "the gate has no team lock lease at all, so two jobs can enter the device "
             "payload concurrently and neither would notice")
-    results = _two_real_workers()
+    results = _two_real_workers(canonical=True)
     entered = [line for line in results if line.startswith("ENTERED")]
-    refused = [line for line in results if "REFUSED" in line]
-    require(len(entered) + len(refused) == 2,
-            "the workers did not both report an outcome: %r" % (results,))
-    require(len(refused) == 1,
-            "with two jobs and one lock exactly one must be refused; got %d entered and %d "
-            "refused (%r)" % (len(entered), len(refused), results))
+    require(len(entered) == 2,
+            "with a bounded wait both team jobs should eventually run (serialised); got %r"
+            % (results,))
+    # Guard against this case silently degrading into a private-lock run: the claim
+    # below is about the TEAM, so the canonical path must really be in use.
+    require(all("LOCKPATH=/home/.tf_device0.lock" in line for line in entered),
+            "the workers did not use the canonical team lock, so this case cannot "
+            "support a team-serialisation claim: %r" % (results,))
+    # Serialisation, not refusal: the two must not OVERLAP. Each worker stamps entry
+    # and exit, so the intervals must be disjoint.
+    spans = sorted(_worker_spans(results))
+    require(len(spans) == 2, "the workers did not both report a span: %r" % (results,))
+    require(spans[0][1] <= spans[1][0],
+            "the two team jobs overlapped in the payload (%r); the lock did not serialise "
+            "them" % (spans,))
 
 
 def test_forged_lock_held_env_cannot_bypass_the_lock():
@@ -263,14 +352,18 @@ def test_lock_is_released_after_a_failing_payload():
     require(hasattr(gate, "device_lock_lease"),
             "the gate has no team lock lease, so 'the lock is released after a failure' "
             "cannot even be asked -- there is no lock to release")
+    lock_dir = Path(tempfile.mkdtemp(prefix="p0e-release-"))
+    gate.DEVICE_LOCK_PATH = lock_dir / "device.lock"
     try:
         with gate.device_lock_lease():
             raise RuntimeError("payload blew up")
     except RuntimeError:
         pass
-    results = _two_real_workers(workers=1)
-    require(any(line.startswith("ENTERED") for line in results),
-            "after a failed payload no other job could take the lock: %r" % (results,))
+    # The lock file must be free again: a fresh acquire succeeds immediately.
+    with gate.device_lock_lease() as lease:
+        require(lease.get("held") is True,
+                "the lock could not be re-acquired after a failed payload (lease=%r); "
+                "a failure wedged the team lock" % (lease,))
 
 
 def _quiet(fn):
@@ -283,34 +376,43 @@ def _quiet(fn):
 # ------------------------------------------------- P0-E: watchdog and after-SMI
 
 def test_hung_stage_is_bounded_and_recorded_as_timeout():
-    """A payload that never returns must come back as a named TIMEOUT.
+    """A stage that exceeds its bound must come back as a NAMED timeout.
 
-    Today it simply blocks for as long as the payload does and reports whatever
-    the process eventually prints, which is indistinguishable from a slow pass.
+    The bound is injected small here on purpose. The contract is "when a stage
+    overruns its bound, the run ends as a named timeout"; it is NOT "3 seconds must
+    be enough for a device workload", which would be a benchmark, not a contract.
     """
-    h = Harness(payload_delay=3.0)
+    h = Harness(payload_delay=1.0)
+    require(isinstance(getattr(h.gate, "STAGE_TIMEOUTS", None), dict),
+            "the gate declares no STAGE_TIMEOUTS, so no stage has a bound at all")
+    h.gate.STAGE_TIMEOUTS["workload"] = 0.3
     code, output, elapsed = h.run()
-    require(elapsed < 2.5,
-            "a 3.0s payload was allowed to run %.2fs; no stage bound exists, so a hang is "
-            "indistinguishable from a slow device" % elapsed)
-    require("TIMEOUT" in output.upper() or code != 0,
-            "the hung stage returned success with no TIMEOUT record")
+    record = _last_result_file(h)
+    blob = json.dumps(record).lower() if record else ""
+    named = ("stage_timeout" in blob or "timeout" in blob or "TIMEOUT" in output.upper())
+    require(named,
+            "a stage that overran its 0.3s bound ended without a TIMEOUT record "
+            "(code=%r); a hang is then indistinguishable from a slow device" % (code,))
+    require(code != 0, "an overrun stage reported success (code=%r)" % (code,))
+    require(elapsed < 1.0,
+            "the overrun was only noticed after the full %.2fs payload, so the bound did "
+            "not actually cut the run short" % elapsed)
 
 
 def test_a_timeout_is_not_retried():
     """A timeout must not be retried, and never until the card looks idle."""
-    h = Harness(payload_delay=3.0)
-    elapsed = 0.0
+    h = Harness(payload_delay=1.0)
+    require(isinstance(getattr(h.gate, "STAGE_TIMEOUTS", None), dict),
+            "the gate declares no STAGE_TIMEOUTS, so there is no bound to fail and "
+            "'not retried' would be vacuously true")
+    h.gate.STAGE_TIMEOUTS["workload"] = 0.3
     with contextlib.suppress(Exception):
-        _, _, elapsed = h.run()
+        h.run()
+    require(h.payload_calls >= 1,
+            "the payload never ran, so this case measures nothing")
     require(h.payload_calls == 1,
             "the payload was executed %d times; a bound must not be retried, and certainly "
             "not until another tenant leaves" % h.payload_calls)
-    # "Ran once" alone is vacuously true while no bound exists, so also require that the
-    # overrun was actually cut short: a timeout that still waits the full time is not one.
-    require(elapsed < 2.5,
-            "the 3.0s payload ran %.2fs before returning; nothing bounded it, so 'not "
-            "retried' is true only because it never came back" % elapsed)
 
 
 def test_occupancy_is_sampled_before_and_after_exactly_once():
@@ -424,16 +526,44 @@ def test_a_missing_case_refuses_and_never_falls_back_to_the_generic_add():
 def test_the_device_payload_is_selected_not_hard_coded():
     """The gate must run the requested workload, not always its own smoke add."""
     h = Harness()
+    # --workload native is the generic smoke add; the older name "smoke" is not a
+    # workload and must be refused rather than silently mapped onto one.
+    h.run(workload="native")
+    require(h.payload_calls >= 1,
+            "the native workload did not execute at all (payload_calls=%d)"
+            % h.payload_calls)
+    gate = load_gate()
+    resolver = getattr(gate, "resolve_workload", None)
+    require(callable(resolver),
+            "the gate has no resolve_workload, so the payload is not selected at all")
+    # A native default is legitimate; what must NOT happen is that it is the ONLY
+    # workload, or that it is reached by falling back from a requested case.
+    # A missing case must REFUSE, never fall back to the native payload.
     try:
-        h.run(workload="smoke")
-    except AssertionError:
-        raise
-    smoke_calls = h.payload_calls
-    require(smoke_calls >= 1, "the smoke workload did not execute at all")
+        resolver("cases", "/nonexistent/p0f", ["0", "1"])
+    except gate.GateError as exc:
+        require("CASE" in str(exc).upper(),
+                "a missing cases dir refused without a named CASE_* code: %s" % exc)
+    else:
+        raise AssertionError(
+            "resolve_workload returned a payload for a nonexistent cases dir; that is the "
+            "fallback to the generic add, and its numbers would belong to another workload")
+    # The two workloads must be genuinely different payloads, or "selected" is a label
+    # on one hard-coded program.
+    native = resolver("native", None, ["0", "1"])
+    real_cases = Path(tempfile.mkdtemp(prefix="p0f-cases-")) / "case_a"
+    real_cases.mkdir(parents=True)
+    (real_cases / "plan.json").write_text("{}")
+    cases = resolver("cases", str(real_cases.parent), ["0", "1"])
+    require(native[1] != cases[1],
+            "native and cases produce the SAME payload, so the workload is not actually "
+            "dispatched")
+    require(native[2] == cases[2] == "fresh_device_output",
+            "a workload reports readback %r/%r instead of fresh_device_output"
+            % (native[2], cases[2]))
     source = GATE_PATH.read_text(encoding="utf-8")
-    require("torch.ones((1024,)" not in source,
-            "the generic ones(1024)+add payload is still baked into the gate, so no other "
-            "workload can be selected")
+    require("WORKLOADS" in source and "WORKLOAD_CASES" in source,
+            "only one workload exists, so no other workload can be selected")
 
 
 def test_a_device_run_labels_where_its_numbers_came_from():
@@ -442,10 +572,11 @@ def test_a_device_run_labels_where_its_numbers_came_from():
     Harness().run(evidence_dir=directory)
     files = result_files(directory)
     require(files, "no result record was written, so the readback cannot be labelled")
-    blob = json.dumps(json.loads(Path(files[-1]).read_text()))
-    require("readback" in blob.lower() or "device_output" in blob.lower(),
+    blob = json.dumps(json.loads(Path(files[-1]).read_text())).lower()
+    require("fresh_device_output" in blob or "readback_source" in blob,
             "the record never says whether the numbers are a fresh device readback or an "
-            "archived replay; the two claims are indistinguishable")
+            "archived replay; the two claims are indistinguishable (record keys: %r)"
+            % (list(json.loads(Path(files[-1]).read_text())),))
 
 
 # ------------------------ P0-DEPLOY boundary: the host-only attestation channel
@@ -637,6 +768,81 @@ def test_attestation_refuses_a_tampered_hash():
     _expect_refused("an attestation edited after its content hash was taken",
                     "ATTESTATION_TAMPERED", record=record)
 
+# ------------------------------- P0-G: manifest parity must be one-to-one
+#
+# A gate declares observationChecks in the manifest and the script reports what it
+# actually measured. The two must be the SAME set:
+#
+#   * declared but never reported -- the manifest promises evidence that is not
+#     produced, so a reader trusts a check that never ran;
+#   * reported but never declared -- a real measurement exists that no consumer knows
+#     to look for, which is how eight checks silently drifted out of the contract.
+#
+# Both directions are negatived here against copies, so a revision that reintroduces
+# either drift fails immediately instead of being noticed later by hand.
+
+MANIFEST_PATH = Path(__file__).resolve().parent.parent / "manifest.json"
+
+
+def _observation_keys(source_text):
+    """Keys of the observations the DEVICE gate reports.
+
+    Scoped to device_gate_verdict deliberately: the CPU gate has an identically
+    named observations literal, and an unscoped search compared the manifest
+    against the CPU gate keys, reporting 14 phantom undeclared checks.
+    """
+    import re as _re
+    start = source_text.find("def device_gate_verdict")
+    require(start >= 0,
+            "no device_gate_verdict function found")
+    match = _re.search(r"\n    observations = \{(.*?)\n    \}",
+                       source_text[start:], _re.DOTALL)
+    require(match is not None,
+            "no observations block inside device_gate_verdict")
+    return set(_re.findall(r'^\s*"([A-Za-z0-9_]+)":', match.group(1),
+                            _re.MULTILINE))
+
+def test_manifest_declares_exactly_the_checks_the_gate_reports():
+    """One-to-one. Neither a promise without evidence nor evidence without a promise."""
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    device = [g for g in manifest.get("gates", [])
+              if g.get("id") == "tilefoundry-npu-device"]
+    require(len(device) == 1, "the device gate is not declared exactly once in the manifest")
+    declared = set(device[0].get("observationChecks") or {})
+    reported = _observation_keys(GATE_PATH.read_text(encoding="utf-8"))
+    require(declared, "the device gate declares no observationChecks at all")
+    undeclared = sorted(reported - declared)
+    unproduced = sorted(declared - reported)
+    require(not undeclared,
+            "%d check(s) are REPORTED but not declared, so a consumer cannot know to "
+            "look for them: %r" % (len(undeclared), undeclared))
+    require(not unproduced,
+            "%d check(s) are DECLARED but never reported, so the manifest promises "
+            "evidence that is not produced: %r" % (len(unproduced), unproduced))
+
+
+def test_manifest_parity_rejects_a_missing_declaration():
+    """Negative: dropping one declaration must be DETECTED, not tolerated."""
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    device = [g for g in manifest["gates"] if g.get("id") == "tilefoundry-npu-device"][0]
+    victim = sorted(device["observationChecks"])[0]
+    reduced = set(device["observationChecks"]) - {victim}
+    reported = _observation_keys(GATE_PATH.read_text(encoding="utf-8"))
+    require(sorted(reported - reduced),
+            "removing the %r declaration produced no detectable gap, so the parity check "
+            "would not catch an under-declared manifest" % (victim,))
+
+
+def test_manifest_parity_rejects_an_extra_declaration():
+    """Negative: declaring a check the gate never reports must be DETECTED."""
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    device = [g for g in manifest["gates"] if g.get("id") == "tilefoundry-npu-device"][0]
+    inflated = set(device["observationChecks"]) | {"aCheckNobodyProduces"}
+    reported = _observation_keys(GATE_PATH.read_text(encoding="utf-8"))
+    require(sorted(inflated - reported) == ["aCheckNobodyProduces"],
+            "an inflated declaration produced no detectable gap, so the parity check "
+            "would not catch a manifest promising evidence that is never produced")
+
 # --------------------------------------------------- controls: these must PASS
 
 def test_control_busy_is_recorded_not_decided():
@@ -676,10 +882,15 @@ def test_control_a_busy_dependent_verdict_is_detectable():
     # a preflight_facts parameter and an exact-string anchor reported that as a broken
     # control. The control is about the busy-skip detector, not about the signature.
     import re as _re
-    match = _re.search(r"^[ \t]*(occupancy, occupancy_raw) = device_occupancy\([^)]*\)[ \t]*$",
-                       source, _re.MULTILINE)
+    # The occupancy call is now wrapped in run_stage(...) for the P0-E watchdog, so the
+    # anchor is the whole statement, matched by shape rather than by exact spelling:
+    # this control is about the busy-skip DETECTOR, not about the call's signature.
+    match = _re.search(
+        r"^[ \t]*\w[\w, ]*=?[ \t]*run_stage\([ \t]*[\"']occupancy_before[\"'][^)]*\)"
+        r"|^[ \t]*\w[\w, ]*=?[ \t]*device_occupancy\([^)]*\)[ \t]*$",
+        source, _re.MULTILINE)
     require(match is not None,
-            "no 'occupancy, occupancy_raw = device_occupancy(...)' assignment exists, so this "
+            "no occupancy sample statement (direct or run_stage-wrapped) exists, so this "
             "control cannot inject a busy-skip; update the control rather than deleting it")
     anchor = match.group(0)
     indent = " " * (len(anchor) - len(anchor.lstrip()))

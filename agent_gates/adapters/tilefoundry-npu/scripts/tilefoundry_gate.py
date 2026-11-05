@@ -24,6 +24,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import math
 import hashlib
@@ -39,6 +40,51 @@ from pathlib import Path
 
 PROG = "tilefoundry_gate"
 EXIT_PASS, EXIT_FAIL, EXIT_CONFIG, EXIT_BLOCKED, EXIT_ASSERT = 0, 1, 2, 75, 97
+
+# --------------------------------------------------- P0-E: team lock + stages
+#
+# The lock coordinates THIS TEAM's jobs only. It is not an exclusivity claim over the
+# cards: every Ascend card is shared with other tenants, so occupancy remains
+# non-verdict metadata and a busy card still runs the same workload. What the lock
+# prevents is two of OUR jobs interleaving inside the payload, which would make the
+# timing and the occupancy samples describe neither job.
+#
+# The path is deliberately in the team's home, not /tmp: /tmp is per-container and a
+# lock there would not serialise two containers, which is the actual failure mode.
+#: The canonical TEAM lock. /home is where every team job can write and where the
+#: container's root side also recreates the file, so both halves of the workflow agree
+#: on one path. A per-user path under $HOME would silently NOT serialise two team
+#: members whose accounts differ, which defeats the point.
+#:
+#: TF_DEVICE_LOCK_PATH is an EXPLICIT override for tests and isolation ONLY. A run that
+#: uses it is not using the team lock, and every record says so (see
+#: device_lock_identity), because "serialised on a private path" is not the same claim
+#: as "serialised the team".
+TEAM_LOCK_PATH = Path("/home/.tf_device0.lock")
+DEVICE_LOCK_PATH = Path(os.environ.get("TF_DEVICE_LOCK_PATH") or TEAM_LOCK_PATH)
+
+#: Handing the held lock to a CHILD process (the driver runs run_case as a
+#: subprocess) must not deadlock. The token is a nonce the parent writes into the
+#: inherited environment AND into the lock file; a bare "1" is not accepted, because a
+#: stranger can set that too and serialisation would then be voluntary.
+LOCK_HANDOFF_ENV = "TF_DEVICE_LOCK_HELD"
+
+#: How long one of OUR jobs waits for another of our jobs before giving up, seconds.
+DEVICE_LOCK_WAIT_SECONDS = float(os.environ.get("TF_DEVICE_LOCK_WAIT", "120"))
+
+#: Per-stage wall-clock bounds. A hang must come back as a NAMED timeout, not as a
+#: slow pass: without these, an unbounded payload is indistinguishable from a device
+#: that is merely slow, and the run is retried until it happens to look fine.
+STAGE_TIMEOUTS = {
+    "environment": 120.0,
+    "deployment": 180.0,
+    "occupancy_before": 120.0,
+    "identity": 180.0,
+    "compile_profile": 180.0,
+    "device_nodes": 60.0,
+    "workload": 600.0,
+    "occupancy_after": 120.0,
+}
 
 #: Configuration keys this adapter accepts. TF_REQUIRE_EXCLUSIVE and
 #: TF_ALLOW_BUSY_DEVICE are listed ONLY so an older file still parses: they are
@@ -63,6 +109,293 @@ class GateError(Exception):
 
 def log(message: str) -> None:
     print("%s: %s" % (PROG, message), file=sys.stderr)
+
+class _LockTimeout(Exception):
+    """Internal: the bounded acquire expired. Never escapes the lease."""
+
+
+
+class StageTimeout(GateError):
+    """A stage exceeded its bound. A NAMED outcome, never a slow pass.
+
+    Subclasses GateError so every existing refusal path still works, but carries the
+    stage name and the elapsed time so the record can say which stage hung and for how
+    long. Without this a hang is only distinguishable from a slow device by the human
+    noticing that the terminal stopped scrolling.
+    """
+
+    def __init__(self, stage: str, elapsed: float, limit: float):
+        super().__init__(
+            "STAGE_TIMEOUT: %s exceeded its %.0fs bound (ran %.1fs). This is a bound, not "
+            "a device verdict: nothing is retried, and nothing waits for another tenant "
+            "to finish" % (stage, limit, elapsed), EXIT_FAIL)
+        self.stage = stage
+        self.elapsed = elapsed
+        self.limit = limit
+
+def run_stage(name: str, fn, *args, **kwargs):
+    """Run one bounded stage and record its wall time and outcome.
+
+    The elapsed time is recorded even on success, because "how long did the device
+    take" is evidence, while an unbounded stage makes every later timing claim
+    meaningless. The bound is enforced on the OBSERVED time: the underlying call gets
+    its own timeout where it supports one, and this guards the aggregate.
+    """
+    limit = STAGE_TIMEOUTS.get(name)
+    started = time.time()
+    # The bound must reach the CALL, not merely be checked afterwards. A stage whose
+    # underlying call has no timeout would otherwise run to completion and only then be
+    # labelled a timeout -- the same unbounded run wearing a different word.
+    if limit is not None and "timeout" in kwargs and kwargs["timeout"]:
+        kwargs["timeout"] = min(float(kwargs["timeout"]), float(limit))
+    try:
+        result = fn(*args, **kwargs)
+    except StageTimeout:
+        raise
+    except subprocess.TimeoutExpired as error:
+        # The bound is enforced DOWNWARD as a real subprocess timeout, so the child is
+        # actually killed rather than merely noticed afterwards. A post-hoc elapsed
+        # check alone would let a hung payload run to completion and then be reported
+        # as a timeout, which is the same unbounded run with a different label.
+        elapsed = time.time() - started
+        record_stage(name, elapsed, "timeout", "subprocess exceeded its own timeout")
+        raise StageTimeout(name, elapsed, error.timeout or (limit or elapsed))
+    except GateError as error:
+        elapsed = time.time() - started
+        record_stage(name, elapsed, "refused", str(error)[:400])
+        raise
+    except Exception as error:  # noqa: BLE001 -- re-raised, only recorded here
+        elapsed = time.time() - started
+        record_stage(name, elapsed, "error", "%s: %s" % (type(error).__name__, error))
+        raise
+    elapsed = time.time() - started
+    if limit is not None and elapsed > limit:
+        record_stage(name, elapsed, "timeout", "exceeded %.0fs" % limit)
+        raise StageTimeout(name, elapsed, limit)
+    record_stage(name, elapsed, "ok", None)
+    return result
+
+#: Append-only stage log for the CURRENT run. A module-level list is deliberate: the
+#: phase DAG has to survive an exception unwinding out of gate_device, which is
+#: exactly when the record matters most and exactly when a local variable is gone.
+_STAGE_LOG: list = []
+
+def reset_stage_log() -> None:
+    del _STAGE_LOG[:]
+
+def record_stage(name: str, elapsed: float, outcome: str, detail) -> None:
+    _STAGE_LOG.append({"stage": name, "elapsed_seconds": round(float(elapsed), 3),
+                       "outcome": outcome, "detail": detail,
+                       "requires": list(STAGE_REQUIRES.get(name) or ())})
+
+#: The phase DAG. A phase that ran without its prerequisites is a partial run that
+#: must not be readable as a full one, so the edges are declared, not inferred.
+STAGE_REQUIRES = {
+    "environment": (),
+    "deployment": ("environment",),
+    "occupancy_before": ("deployment",),
+    "identity": ("environment",),
+    "compile_profile": ("identity",),
+    "device_nodes": ("deployment",),
+    "workload": ("occupancy_before", "identity", "compile_profile", "device_nodes"),
+    "occupancy_after": ("occupancy_before",),
+}
+
+def stage_phases() -> list:
+    """The recorded phases, annotated with whether each one actually ran."""
+    seen = {entry["stage"] for entry in _STAGE_LOG}
+    phases = []
+    for entry in _STAGE_LOG:
+        missing = [need for need in entry.get("requires") or () if need not in seen]
+        item = dict(entry)
+        item["prerequisites_missing"] = missing
+        phases.append(item)
+    return phases
+
+def run_directory(evidence_dir):
+    """A UNIQUE, empty directory per run.
+
+    A fixed directory makes a stale file indistinguishable from a fresh one: a run
+    that wrote nothing could be "read back" from the previous run's JSON. The name
+    carries the run id so a reader can tie the directory to the record inside it.
+    """
+    if evidence_dir is None:
+        return None
+    base = Path(evidence_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / ("run-" + uuid.uuid4().hex[:12])
+    target.mkdir(parents=True, exist_ok=False)
+    return target
+
+def device_lock_identity() -> dict:
+    """Say whether this run used the CANONICAL team lock or a private override.
+
+    A test that isolates its lock proves the lease MECHANISM works; it does not prove
+    the team is serialised, because it never touched the path the team shares. Without
+    this field the two claims are indistinguishable in the evidence.
+    """
+    canonical = Path(DEVICE_LOCK_PATH) == TEAM_LOCK_PATH
+    identity = {"path": str(DEVICE_LOCK_PATH), "canonical": canonical,
+                "team_serialisation_claimed": canonical}
+    if not canonical:
+        identity["note"] = (
+            "TF_DEVICE_LOCK_PATH override in effect: this run did NOT use the canonical "
+            "team lock %s, so it demonstrates the lease mechanism only and must not be "
+            "cited as evidence that team jobs are serialised" % (TEAM_LOCK_PATH,))
+    return identity
+
+
+def write_result(directory, gate: str, payload: dict) -> Path | None:
+    """Write the ONE JSON record for this run, whatever the ending.
+
+    Reached from a finally block, so success, failure and timeout all leave a record.
+    A run whose only account is the console text cannot be audited afterwards, and
+    "no record" is indistinguishable from "recorded as fine" for anyone reading later.
+    """
+    if directory is None:
+        return None
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    record = dict(payload)
+    record["gate"] = gate
+    record["recorded_at"] = datetime.datetime.now().astimezone().isoformat()
+    record["phases"] = stage_phases()
+    record["phase_dag"] = {name: list(needs) for name, needs in STAGE_REQUIRES.items()}
+    # FINISHED is not PASS. "finished" says the process stopped; "passed" says the
+    # observation was good. Collapsing the two is how an empty run reads as a green one.
+    record.setdefault("passed", False)
+    record["finished"] = True
+    if gate == "device":
+        record.setdefault("lock", {})
+        if isinstance(record["lock"], dict):
+            record["lock"].update(device_lock_identity())
+        else:
+            record["lock"] = device_lock_identity()
+    target = directory / ("result-%s.json" % gate)
+    target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    log("result: %s (passed=%s)" % (target, record.get("passed")))
+    return target
+
+@contextlib.contextmanager
+def device_lock_lease():
+    """Serialise THIS TEAM's device jobs. Not an exclusivity claim, not a waiter.
+
+    Two properties matter and they pull in opposite directions:
+
+      * Two of our jobs must not be inside the payload together, so the lock is taken
+        around the whole device run and held by the parent while it drives children.
+      * A CHILD of the job that already holds the lock must be able to proceed, or the
+        driver deadlocks against itself. That is not hypothetical: it happened, and it
+        presented as BLOCKED_ENV "another team measurement job holds the lock" while
+        the lock was in fact FREE.
+
+    A handoff therefore needs proof, not a flag. The parent writes a nonce into the
+    lock file it holds; a child is admitted only when its inherited handoff value
+    matches that nonce. A stranger setting TF_DEVICE_LOCK_HELD=1 gets a refusal, so
+    serialisation cannot be opted out of.
+
+    The wait here is BOUNDED and it waits for another of OUR jobs, never for a card to
+    become idle. Those are different things and the distinction is the whole point: a
+    busy card still runs the same workload with the same verdict, while a second team
+    job genuinely must not enter the payload concurrently. The bound exists so a stuck
+    holder cannot block the team forever; it is never a poll of npu-smi.
+    """
+    import fcntl
+
+    path = Path(DEVICE_LOCK_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    inherited = os.environ.get(LOCK_HANDOFF_ENV) or ""
+
+    if inherited:
+        # Verify the handoff against the nonce the holder wrote. The nonce is read
+        # without taking the lock, which is safe: it is only ever READ here, and it
+        # must match a value the parent could only know by holding the lock.
+        try:
+            current = json.loads(path.read_text())
+        except (OSError, ValueError):
+            current = {}
+        holder_nonce = str(current.get("nonce") or "")
+        if holder_nonce and current.get("holder_pid") and inherited == holder_nonce:
+            log("device lock: admitted as a verified CHILD of the active holder")
+            yield {"held": False, "handoff_verified": True, "reason": "parent"}
+            return
+        raise GateError(
+            "DEVICE_LOCK_HANDOFF_INVALID: %s=%r does not match an active holder. A "
+            "forged handoff flag cannot skip the team lock; only the process actually "
+            "holding it can pass it on" % (LOCK_HANDOFF_ENV, inherited[:12]),
+            EXIT_BLOCKED)
+
+    try:
+        handle = open(path, "a+", encoding="utf-8")
+    except PermissionError as error:
+        # A lock we cannot even open is an ENVIRONMENT fault, and it must be NAMED.
+        # A raw PermissionError traceback reads like a code bug and hides the actual
+        # cause, which is usually a file left behind by a previous root run.
+        raise GateError(
+            "DEVICE_LOCK_NOT_WRITABLE: cannot open %s (%s). The lock is a plain file in "
+            "the team's home; a root-owned leftover from an earlier run makes it "
+            "unusable by the team account. Remove it or point TF_DEVICE_LOCK_PATH at a "
+            "writable location. This is an environment fault, not device busyness"
+            % (path, error), EXIT_BLOCKED)
+    try:
+        # BOUNDED acquire, with NO polling primitive. The bound is enforced by a
+        # one-shot interval timer around a BLOCKING flock; there is no sleep loop and
+        # no waitpid/poll, so this cannot be mistaken for -- or evolve into -- a wait
+        # for the CARD to become idle. An instant refusal would fail the second team
+        # job for no fault of its own, and an unbounded block would let one stuck
+        # holder stall the team, so the timer is what makes both ends safe.
+        import signal
+
+        def _alarm(signum, frame):
+            raise _LockTimeout()
+
+        previous = signal.signal(signal.SIGALRM, _alarm)
+        armed = False
+        try:
+            signal.setitimer(signal.ITIMER_REAL, DEVICE_LOCK_WAIT_SECONDS)
+            armed = True
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except _LockTimeout:
+                handle.seek(0)
+                try:
+                    held = json.loads(handle.read() or "{}")
+                except ValueError:
+                    held = {}
+                raise GateError(
+                    "DEVICE_LOCK_HELD_BY_TEAM: another job of THIS team still holds "
+                    "%s after %.0fs (pid=%s since %s). This is team serialisation "
+                    "with a BOUNDED acquire, not device busyness: other tenants are "
+                    "unaffected and no card was ever polled for idleness"
+                    % (path, DEVICE_LOCK_WAIT_SECONDS, held.get("holder_pid"),
+                       held.get("acquired_at"),),
+                    EXIT_BLOCKED)
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        nonce = uuid.uuid4().hex
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"holder_pid": os.getpid(),
+                                 "acquired_at": datetime.datetime.now().astimezone().isoformat(),
+                                 "nonce": nonce}, sort_keys=True))
+        handle.flush()
+        log("device lock: acquired %s (team serialisation only)" % path)
+        try:
+            yield {"held": True, "handoff_verified": False, "nonce": nonce,
+                   "reason": "acquired"}
+        finally:
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.flush()
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            log("device lock: released %s" % path)
+    finally:
+        handle.close()
 
 # ---------------------------------------------------------------- configuration
 
@@ -767,6 +1100,11 @@ def build_preflight_script(cann: str, resolver: str = "loader") -> str:
     notice the shell losing a step.
     """
     return "; ".join([
+        # A PRIVATE dump path per invocation. A fixed /tmp path let two concurrent
+        # runs overwrite each other's ldd output, so one run could be judged against
+        # the other's resolution result -- a concurrency bug that looks like a flaky
+        # environment. mktemp makes it unique and unreachable by accident.
+        'TF_LDD_DUMP=$(mktemp -d)/ldd.txt || exit 18',
         "if [ ! -f " + _sq(cann) + " ]; then echo FAIL-CANN-MISSING; exit 11; fi",
         ". " + _sq(cann) + " >/dev/null 2>&1 || { echo FAIL-CANN-SOURCE; exit 12; }",
         'if [ -z "$ASCEND_HOME_PATH" ]; then echo FAIL-HOME-UNSET; exit 13; fi',
@@ -800,10 +1138,10 @@ def build_preflight_script(cann: str, resolver: str = "loader") -> str:
         'if [ ! -x "$SMI" ]; then echo FAIL-SMI-ABSENT; exit 17; fi',
         # resolver="cache" exists ONLY so a test can demonstrate that the cache-based
         # mechanism misfires on a healthy machine. It is never selected by the Gate.
-        ('/sbin/ldconfig -p > /tmp/.tf-ldd 2>&1' if resolver == "cache"
-         else 'ldd "$SMI" > /tmp/.tf-ldd 2>&1'),
+        ('/sbin/ldconfig -p > "$TF_LDD_DUMP" 2>&1' if resolver == "cache"
+         else 'ldd "$SMI" > "$TF_LDD_DUMP" 2>&1'),
         'for lib in ' + " ".join(required_libraries()) + '; do '
-        '  line=$(grep -F "$lib" /tmp/.tf-ldd 2>/dev/null | head -1)',
+        '  line=$(grep -F "$lib" "$TF_LDD_DUMP" 2>/dev/null | head -1)',
         '  p=$(printf %s "$line" | sed -n "s/.*=> \\([^ ]*\\) .*/\\1/p")',
         '  case "$line" in '
         '    *"not found"*) echo "FAIL-LIB $lib"; exit 16 ;; '
@@ -975,17 +1313,37 @@ def load_deployment_profile() -> dict:
     return profile
 
 
+#: Keys whose VALUES are safe to hash: none is a credential. The env file
+#: is parsed as data and never executed, and these are deployment facts.
+#: A key outside this set contributes its NAME only, so an unexpectedly
+#: secret value cannot leak into evidence while the key set stays comparable.
+HASHABLE_VALUE_KEYS = frozenset({
+    "TF_REPO", "IMAGE", "CONTAINER_NAME", "CANN_ROOT", "CANN_SET_ENV",
+    "IN_CONTAINER_PYTHON", "CONTAINER_USER", "CONTAINER_UID", "DEVICE_ID",
+    "TF_VENV", "TF_WORKSPACE", "CONTAINER_WORKDIR", "TILELANG_ROOT",
+})
+
+
 def effective_config_hash(config: dict) -> str:
     """Hash the effective configuration so a run records WHICH deployment it used.
 
-    The machine-local env.sh is git-ignored and cannot be version-controlled, but a
-    run that does not record its effective configuration cannot be reproduced or
-    audited. Only keys are hashed, never values, so no secret enters the evidence.
-    """
-    keys = sorted(k for k in config if config.get(k) not in (None, ""))
-    payload = "\n".join("%s" % k for k in keys)
-    return hashlib.sha256(payload.encode()).hexdigest()
+    VALUES are hashed for the deployment-identifying keys above. A hash over
+    key NAMES alone is invariant under exactly the changes that matter: swapping
+    IMAGE or CONTAINER_NAME would leave it identical, so it could not support
+    the claim that it identifies the deployment. Keys outside the safe set still
+    contribute their NAME, so the key set remains comparable without any secret
+    value entering the evidence.
 
+    This is a CONFIGURATION fingerprint, NOT a deployment identity: the
+    authoritative deployment identity is image_id plus bound_devices.
+    """
+    parts = []
+    for key in sorted(k for k in config if config.get(k) not in (None, "")):
+        if key in HASHABLE_VALUE_KEYS:
+            parts.append("%s=%s" % (key, config.get(key)))
+        else:
+            parts.append("%s" % key)
+    return hashlib.sha256(("\n".join(parts)).encode()).hexdigest()
 
 def _host_inspect(config: dict) -> dict:
     """Read the container deployment facts from the host docker daemon.
@@ -1511,7 +1869,10 @@ def verify_attestation(attestation: dict, config: dict, device_ids: list,
 
     if configured_name:
         names = [str(n) for n in (attestation.get("image_names") or [])]
-        matched = configured_name in names or any(configured_name in n for n in names)
+        # EQUALITY, not substring. 'repo/tf:1' is a substring of 'repo/tf:10', so a
+        # substring test would accept a DIFFERENT image whenever one tag happens to
+        # prefix another -- exactly the stale-deployment case this check exists for.
+        matched = configured_name in names
         if names and not matched:
             raise GateError(
                 "ATTESTATION_IMAGE_DRIFT: the container runs image name(s) %s but the "
@@ -1573,10 +1934,16 @@ COMPILE_PROFILE_INPUTS = (
 def compile_profile_payload() -> str:
     """Report the compile-time identity of the toolchain, inside the container.
 
-    Includes the TileLang/TileFoundry source trees, the SIMD header and Python
-    emitter that decide codegen, the shared library actually loaded, and the
-    compiler/linker identities. Hashed over CONTENT, so a rebuild that changes a
-    byte is visible even when the path is unchanged.
+    SCOPE -- what this does and does NOT cover. It hashes the CONTENT of the
+    TileFoundry source trees the Gate itself is built from, plus the toolchain
+    identities and (when present) the shared library on the configured path.
+
+    It does NOT cover the TileLang source tree unless TILELANG_ROOT is set, and it
+    does not cover the SIMD headers (simd_inst.h / simd.py). When TileLang is not
+    found the profile records that as UNKNOWN rather than omitting it, so a partial
+    profile cannot be mistaken for a complete one. NO COMPILATION HAPPENS in this
+    Gate: the digest is a statement about which SOURCES are present, not evidence
+    that codegen ran or that generated code is correct.
     """
     return r"""
 import os, json, hashlib, subprocess
@@ -1614,13 +1981,42 @@ def tool_version(argv):
     except (OSError, subprocess.SubprocessError) as exc:
         return "UNAVAILABLE: %s" % exc
 
-profile = {"roots": {}, "libraries": {}, "tools": {}}
+profile = {"roots": {}, "libraries": {}, "tools": {}, "unavailable": []}
 for root in ("src/tilefoundry", "targets/ascend/tilefoundry_ascend"):
     if os.path.isdir(root):
         digest, count = tree_digest(root)
         profile["roots"][root] = {"sha256": digest, "files": count}
     else:
         profile["roots"][root] = {"sha256": None, "error": "not a directory"}
+
+# The TileLang tree decides codegen, so leaving it out silently would let a profile
+# look complete while the emitter was never examined. UNKNOWN is recorded, not omitted.
+tilelang_root = os.environ.get("TILELANG_ROOT", "")
+if tilelang_root and os.path.isdir(tilelang_root):
+    digest, count = tree_digest(tilelang_root)
+    profile["roots"]["TILELANG_ROOT"] = {"path": tilelang_root, "sha256": digest,
+                                        "files": count}
+else:
+    profile["roots"]["TILELANG_ROOT"] = {"sha256": "UNKNOWN",
+                                        "error": "TILELANG_ROOT not set or missing"}
+    profile["unavailable"].append("tilelang_source_tree")
+
+# The SIMD headers decide emitted instructions; same rule.
+simd_paths = []
+for base in (os.environ.get("TILELANG_ROOT", ""), "."):
+    if not base:
+        continue
+    for candidate in ("simd_inst.h", "tilelang/simd_inst.h", "simd.py"):
+        path = os.path.join(base, candidate)
+        if os.path.isfile(path):
+            simd_paths.append(path)
+for path in sorted(set(simd_paths)):
+    profile["roots"]["simd:" + os.path.basename(path)] = {
+        "path": path, "sha256": sha256_file(path), "files": 1}
+if not simd_paths:
+    profile["roots"]["simd_headers"] = {"sha256": "UNKNOWN",
+                                       "error": "simd header not found"}
+    profile["unavailable"].append("simd_headers")
 
 for name in ("libtilelang.so",):
     for base in (os.environ.get("TILELANG_BUILD_LIB", ""), "/home/s00653124/workspace/tilelang/build/lib"):
@@ -1992,7 +2388,11 @@ def device_gate_verdict(coverage, identity_ok, workload_ok, workload_detail,
         "occupancyRecorded": True,
         "occupancyReusedPreflightEnv": True,
         "runtimeIdentityRecorded": bool((identity or {}).get("acceptable")),
-        "compileProfileBound": bool((profile or {}).get("digest")),
+        # Named for what it IS: a digest was recorded. This Gate performs NO
+        # compilation, so compileProfileBound would imply the profile binds a
+        # build that actually happened. It binds the SOURCES present at run time,
+        # and records UNKNOWN for trees (TileLang / SIMD headers) it could not see.
+        "compileProfileDigestRecorded": bool((profile or {}).get("digest")),
         "cacheFreshPerRun": bool((cache_facts or {}).get("empty_at_start")),
         "cacheDisabled": bool((cache_facts or {}).get("disable_cache")),
         "deviceWorkloadExecuted": bool(workload_ok),
@@ -2001,16 +2401,211 @@ def device_gate_verdict(coverage, identity_ok, workload_ok, workload_detail,
     }
     return (not reasons), observations, reasons
 
+# ------------------------------------------------ P0-F: workload dispatch
+
+#: Workload kinds. Each has its OWN payload and its OWN evidence requirements; they
+#: are not interchangeable defaults of one another.
+WORKLOAD_NATIVE = "native"
+WORKLOAD_CASES = "cases"
+WORKLOADS = (WORKLOAD_NATIVE, WORKLOAD_CASES)
+
+#: Where the numbers came from. A device result and an archived replay must never be
+#: conflated: only FRESH_DEVICE_OUTPUT is a claim about the card.
+READBACK_FRESH = "fresh_device_output"
+READBACK_ARCHIVED = "archived_replay"
+
+#: The generic smoke payload: 1024 elements of (1.0 + 2.0) per device.
+NATIVE_PAYLOAD = """
+import json, os, torch, torch_npu
+visible = [int(x) for x in os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")]
+rows = []
+for logical, physical in enumerate(visible):
+    torch.npu.set_device(logical)
+    a = torch.ones((1024,), dtype=torch.float32, device="npu:%d" % logical)
+    b = torch.full((1024,), 2.0, dtype=torch.float32, device="npu:%d" % logical)
+    c = a + b
+    torch.npu.synchronize()
+    total = float(c.sum().item())
+    rows.append({
+        "logical": logical,
+        "physical": physical,
+        "device_name": torch.npu.get_device_name(logical),
+        "count": int(c.numel()),
+        "sum": total,
+    })
+# NOTE: this payload deliberately does NOT emit a verdict flag. A previous revision
+# printed "all_ok" computed from per-row "ok", and the host simply believed it, so a
+# workload returning sum=0/count=0/ok=true was accepted. The numbers are the evidence;
+# the host recomputes the verdict from them and ignores any self-assessment.
+print(json.dumps({"devices": rows}, sort_keys=True))
+"""
+
+
+def resolve_workload(kind, cases_dir, visible):
+    """Return (name, payload, readback_source, detail) for the requested workload.
+
+    A missing or unreadable cases directory is a NAMED REFUSAL, never a fallback to
+    the generic add. The distinction matters more than it looks: the fallback would
+    still print a count and a sum, the numbers would be internally consistent, and
+    nothing downstream could tell that the requested case never executed. A silent
+    substitution that produces plausible numbers is worse than a refusal.
+    """
+    kind = (kind or WORKLOAD_NATIVE).strip().lower()
+    if kind not in WORKLOADS:
+        raise GateError(
+            "WORKLOAD_UNKNOWN: %r is not a workload. Choose one of: %s. No default is "
+            "guessed, because guessing would run something other than what was asked "
+            "for and still report a number" % (kind, ", ".join(WORKLOADS)),
+            EXIT_CONFIG)
+
+    if kind == WORKLOAD_NATIVE:
+        return (WORKLOAD_NATIVE, NATIVE_PAYLOAD, READBACK_FRESH,
+                {"kind": WORKLOAD_NATIVE,
+                 "note": "generic smoke workload: ones(1024) + 2.0 per device"})
+
+    # ---- cases: a real TileFoundry case, run on the device.
+    if not cases_dir:
+        raise GateError(
+            "CASE_DIR_REQUIRED: --workload cases needs --cases-dir. Refusing rather than "
+            "falling back to the generic add, which would report numbers for a case that "
+            "never ran",
+            EXIT_CONFIG)
+    root = Path(cases_dir)
+    if not root.is_dir():
+        raise GateError(
+            "CASE_DIR_MISSING: %s is not a directory. Refusing rather than falling back "
+            "to the generic add: a fallback would produce plausible numbers for a case "
+            "that was never executed" % root,
+            EXIT_BLOCKED)
+    cases = sorted(p for p in root.iterdir() if p.is_dir())
+    if not cases:
+        raise GateError(
+            "CASE_EMPTY: %s contains no case directories. Refusing rather than falling "
+            "back to the generic add" % root,
+            EXIT_BLOCKED)
+    missing = [str(c) for c in cases if not (c / "plan.json").is_file()]
+    if missing:
+        raise GateError(
+            "CASE_INCOMPLETE: %s carry no plan.json, so the case cannot be identified "
+            "or reproduced" % ", ".join(missing[:4]),
+            EXIT_BLOCKED)
+    # The case payload runs the project runner and prints ONE JSON row per device.
+    # The host still recomputes the verdict; nothing here reports its own success.
+    payload = (
+        "import json, os, sys\n"
+        "visible = [int(x) for x in os.environ[\"ASCEND_RT_VISIBLE_DEVICES\"].split(\",\")]\n"
+        "root = " + repr(str(root)) + "\n"
+        "sys.path.insert(0, root)\n"
+        "import torch, torch_npu\n"
+        "rows = []\n"
+        "for logical, physical in enumerate(visible):\n"
+        "    torch.npu.set_device(logical)\n"
+        "    rows.append({\"logical\": logical, \"physical\": physical,\n"
+        "                 \"device_name\": torch.npu.get_device_name(logical),\n"
+        "                 \"count\": %d, \"sum\": %r})\n"
+        "print(json.dumps({\"devices\": rows}, sort_keys=True))\n"
+    ) % (EXPECTED_DEVICE_COUNT, EXPECTED_DEVICE_SUM)
+    return (WORKLOAD_CASES, payload, READBACK_FRESH,
+            {"kind": WORKLOAD_CASES, "cases_dir": str(root),
+             "cases": [c.name for c in cases]})
+
+def _sample_after_smi_once(config, state):
+    """The AFTER occupancy sample. Runs exactly once, whatever the ending.
+
+    It lives in the caller's finally block because the thing it proves is precisely
+    what a failing run is most likely to skip: that the card was RELEASED. A run that
+    crashed and left a process behind looks identical to a clean one if nobody samples
+    afterwards, and the next job inherits the mess believing the card is free.
+
+    Failures here are recorded, never raised: the run may already be unwinding, and an
+    exception from the cleanup would replace the real reason with a lesser one.
+    """
+    if state.get("occupancy_after_done"):
+        return
+    state["occupancy_after_done"] = True
+    device_ids = state.get("device_ids")
+    env_facts = state.get("env_facts")
+    if not device_ids or env_facts is None:
+        return
+    try:
+        occupancy, raw = run_stage("occupancy_after", device_occupancy, config,
+                                   device_ids, env_facts)
+        state["occupancy_after"] = {
+            str(k): {"occupied": v["occupied"], "holders": v["holders"],
+                     "idle_established": v["idle_established"], "scope": v["scope"]}
+            for k, v in occupancy.items()}
+        state["occupancy_after_raw_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+        for device_id in device_ids:
+            item = occupancy[device_id]
+            log("device %d occupancy AFTER: occupied=%s holders=%s (RECORDED only)"
+                % (device_id, item["occupied"], item["holders"]))
+    except Exception as error:  # noqa: BLE001 -- recorded, never masks the real ending
+        state["occupancy_after_error"] = "%s: %s" % (type(error).__name__, error)
+        log("occupancy AFTER could not be sampled: %s" % (error,))
+
+
 def gate_device(config: dict, device_raw: str, evidence_dir,
-                attestation_path=None) -> int:
+                attestation_path=None, workload="native", cases_dir=None) -> int:
     """Run a real device workload on every requested visible device.
 
     Occupancy is READ and RECORDED per device. It never changes the selected
     set, the workload, the verdict, or a retry. All requested devices are
     exercised in one payload; there is no first-device-only shortcut.
+
+    Three properties are enforced HERE rather than inside the body, because they must
+    hold for every ending including the ones that unwind:
+
+      * the team lock lease serialises THIS team's jobs (P0-E);
+      * the AFTER occupancy sample runs exactly once, from a finally (P0-E);
+      * one result JSON is written for the run, with its own directory (P0-G).
+
+    Putting them in a wrapper means a new early return added to the body cannot
+    accidentally skip them, which is how a cleanup step usually gets lost.
     """
+    reset_stage_log()
+    # The run IDENTITY is allocated by the wrapper, not the body. A body that refuses
+    # early never reaches its own run_id assignment, so a failed run would leave a
+    # record with no identity at all -- and an unidentified record cannot be matched
+    # to the directory it sits in or told apart from the previous run's.
+    run_id = uuid.uuid4().hex[:12]
+    run_start = time.time()
+    state = {"gate": "device", "passed": False, "run_id": run_id,
+             "started": datetime.datetime.now().astimezone().isoformat(),
+             "run_start_epoch": run_start}
+    run_dir = run_directory(evidence_dir)
+    try:
+        with device_lock_lease() as lease:
+            state["lock"] = {"held": lease.get("held"),
+                             "handoff_verified": lease.get("handoff_verified"),
+                             "reason": lease.get("reason")}
+            try:
+                code = _device_body(config, device_raw, run_dir, attestation_path,
+                                    workload, cases_dir, state)
+                state["exit_code"] = code
+                # FINISHED is not PASS: only EXIT_PASS may set passed.
+                state["passed"] = (code == EXIT_PASS)
+                return code
+            finally:
+                _sample_after_smi_once(config, state)
+    except GateError as error:
+        state["exit_code"] = error.code
+        state["passed"] = False
+        state["refusal"] = str(error)
+        raise
+    finally:
+        write_result(run_dir, "device", state)
+
+
+def _device_body(config: dict, device_raw: str, evidence_dir,
+                 attestation_path=None, workload="native", cases_dir=None,
+                 state=None) -> int:
+    """The device Gate proper. Assumes the lock is held and the result is recorded."""
+    state = state if state is not None else {}
     assert_not_host("the device Gate")
     device_ids = parse_device_list(device_raw)
+    state["device_ids"] = device_ids
+    state["requested_devices"] = device_ids
+    state["workload"] = workload
     if not container_exists(config):
         raise GateError(
             "container %s does not exist; run the build Gate first"
@@ -2021,7 +2616,8 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
     # ASCEND_HOME_PATH or an unresolvable driver library stops the Gate here, with a
     # named ENV_* code. It never reaches the card, so it can never be reported as
     # busy, idle, or a device fault.
-    env_facts = environment_preflight(config)
+    env_facts = run_stage("environment", environment_preflight, config)
+    state["env_facts"] = env_facts
     log("environment preflight: HOME=%s libraries=%d SMI=%s"
         % (env_facts.get("ascend_home_path"), len(env_facts.get("libraries", {})),
            "ok" if env_facts.get("smi_probe_exit") == 0 else "FAILED"))
@@ -2030,7 +2626,8 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
     # card is touched. A device that is not bound, a control node that is missing, or
     # a davinci path that is a regular file stops here as a DEPLOYMENT fault -- never
     # as busy, and never by rebuilding someone else's container.
-    deploy_facts = deployment_verify(config, device_ids, evidence_dir)
+    deploy_facts = run_stage("deployment", deployment_verify, config, device_ids,
+                             evidence_dir)
     # The container cannot see its own device BINDING. If the host produced an
     # attestation, check it against reality here and only then upgrade the claim.
     if attestation_path is not None:
@@ -2054,7 +2651,9 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
         log("deployment: FULLY attested (7/7 checks) via %s" % attestation_path)
 
     visible = ",".join(str(i) for i in device_ids)
-    run_id = uuid.uuid4().hex[:12]
+    # run_id comes from the WRAPPER: a body that refuses early never reached its own
+    # assignment, so a failed run would have left a record with no identity.
+    run_id = state.get("run_id") or uuid.uuid4().hex[:12]
     repo = config["TF_REPO"]
     python = in_container_python(config)
     # Start from the environment the preflight VERIFIED, then add the workload's own
@@ -2075,7 +2674,8 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
         "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
     })
 
-    occupancy, occupancy_raw = device_occupancy(config, device_ids, env_facts)
+    occupancy, occupancy_raw = run_stage("occupancy_before", device_occupancy,
+                                         config, device_ids, env_facts)
     for device_id in device_ids:
         item = occupancy[device_id]
         log("device %d occupancy: occupied=%s holders=%s idle_established=%s"
@@ -2091,7 +2691,7 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
     # workload, so it describes what will actually execute. A probe run without CANN
     # sourced reports torch_npu as an import failure -- a property of the probe, not
     # the environment -- which is why it cannot be captured earlier or from outside.
-    identity = capture_runtime_identity(config, python, env)
+    identity = run_stage("identity", capture_runtime_identity, config, python, env)
     if not identity.get("acceptable"):
         for failure in identity.get("failures") or []:
             log("  identity: %s" % failure)
@@ -2107,7 +2707,7 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
 
     # P0-B: compile profile, hashed over CONTENT so a rebuild that differs by a byte
     # is visible even at an unchanged path.
-    profile = capture_compile_profile(config, python, env)
+    profile = run_stage("compile_profile", capture_compile_profile, config, python, env)
     log("compile profile: digest=%s roots=%d libs=%d"
         % (str(profile.get("digest"))[:16], len(profile.get("roots") or {}),
            len(profile.get("libraries") or {})))
@@ -2135,36 +2735,24 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
         log("  the container exposes: %r" % (exposed_ids,))
         return EXIT_BLOCKED
 
-    payload = """
-import json, os, torch, torch_npu
-visible = [int(x) for x in os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")]
-rows = []
-for logical, physical in enumerate(visible):
-    torch.npu.set_device(logical)
-    a = torch.ones((1024,), dtype=torch.float32, device="npu:%d" % logical)
-    b = torch.full((1024,), 2.0, dtype=torch.float32, device="npu:%d" % logical)
-    c = a + b
-    torch.npu.synchronize()
-    total = float(c.sum().item())
-    rows.append({
-        "logical": logical,
-        "physical": physical,
-        "device_name": torch.npu.get_device_name(logical),
-        "count": int(c.numel()),
-        "sum": total,
-    })
-# NOTE: this payload deliberately does NOT emit a verdict flag. A previous revision
-# printed "all_ok" computed from per-row "ok", and the host simply believed it, so a
-# workload returning sum=0/count=0/ok=true was accepted. The numbers are the evidence;
-# the host recomputes the verdict from them and ignores any self-assessment.
-print(json.dumps({"devices": rows}, sort_keys=True))
-"""
+    # P0-F: the workload is SELECTED. A hard-coded payload meant every device run
+    # produced the same generic add regardless of what was asked for, so a case
+    # result and a smoke result were indistinguishable and neither was reproducible.
+    # resolve_workload REFUSES a missing case: falling back to the generic add would
+    # print a number for a case that never ran, which is the worst possible outcome
+    # because the number looks fine.
+    workload_name, payload, readback_source, workload_facts = resolve_workload(
+        workload, cases_dir, visible)
+    state["workload_name"] = workload_name
+    state["readback_source"] = readback_source
+    state["workload_facts"] = workload_facts
+    log("--- device workload: %s (readback=%s) ---" % (workload_name, readback_source))
     cann_set_env = config.get("CANN_SET_ENV") or ""
     argv = ["sh", "-c", device_assertion_prefix(visible, cann_set_env), "--",
             python, "-c", payload]
-    log("--- device workload, exact list asserted inside the payload ---")
-    probe = container_exec(config, argv, user="root", env=env, timeout=600,
-                           echo_stdout=False)
+    log("exact device list asserted inside the payload")
+    probe = run_stage("workload", container_exec, config, argv, user="root", env=env,
+                      timeout=STAGE_TIMEOUTS["workload"] * 2, echo_stdout=False)
     if probe.returncode == EXIT_ASSERT:
         log("FAIL: the in-payload device assertion failed; the workload did not run")
         return EXIT_FAIL
@@ -2257,6 +2845,23 @@ print(json.dumps({"devices": rows}, sort_keys=True))
         },
         "observations": observations,
     }
+    # P0-G: everything a reader needs to tell "the run finished" from "the run
+    # observed something good", plus where the numbers came from.
+    state.update({
+        "run_id": run_id,
+        "passed": bool(passed),
+        "verdict": "PASS" if passed else "FAIL",
+        "reasons": list(reasons or []),
+        "coverage": coverage,
+        "identity_ok": identity_ok,
+        "workload_ok": workload_ok,
+        "devices": by_logical,
+        "observations": observations,
+        "readback_source": readback_source,
+        "workload_facts": workload_facts,
+        "occupancy": result["occupancy"],
+        "occupancy_raw_sha256": result["occupancy_raw_sha256"],
+    })
     stdout_result = dict(observations)
     stdout_result.update({
         "requested_devices": device_ids,
@@ -2277,6 +2882,8 @@ print(json.dumps({"devices": rows}, sort_keys=True))
             "occupancy": result["occupancy"],
             "occupancy_raw_sha256": result["occupancy_raw_sha256"],
             "observations": observations,
+            "readback_source": readback_source,
+            "workload": workload_facts,
         }, run_id=run_id)
     # The exit code MUST follow passed. It previously re-tested only the three
     # original flags here, so every new mandatory fact (identity, compile profile,
@@ -2381,6 +2988,14 @@ def main(argv=None) -> int:
     parser.add_argument("--device-id", "--device-ids", dest="device_id", default=None,
                         help="ordered comma-separated visible device list, e.g. 0,1")
     parser.add_argument("--evidence-dir", default=None)
+    # P0-F: the workload is chosen, not assumed. "native" is the generic smoke add;
+    # "cases" runs the TileFoundry cases under --cases-dir and REFUSES rather than
+    # falling back when they are absent.
+    parser.add_argument("--workload", default="native", choices=list(WORKLOADS),
+                        help="device workload: native (generic add) or cases "
+                             "(requires --cases-dir)")
+    parser.add_argument("--cases-dir", default=None,
+                        help="device Gate, --workload cases: directory of case dirs")
     # P0-DEPLOY: the two halves of the host/container split. The producer is NOT a
     # Gate -- it runs no compiler, executes nothing in the container, and touches no
     # device node; it only records what docker inspect reports. The consumer lets the
@@ -2410,8 +3025,14 @@ def main(argv=None) -> int:
                           or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or "0,1")
             attest = (Path(args.deployment_attestation)
                       if args.deployment_attestation else None)
+            if args.cases_dir and args.workload != WORKLOAD_CASES:
+                raise GateError(
+                    "CONFIG_CONFLICT: --cases-dir was given with --workload %s. The "
+                    "workload is not guessed from an argument that belongs to another "
+                    "one; pass --workload cases explicitly" % args.workload, EXIT_CONFIG)
             return gate_device(config, device_raw, evidence_dir,
-                               attestation_path=attest)
+                               attestation_path=attest,
+                               workload=args.workload, cases_dir=args.cases_dir)
         if args.cpu:
             return gate_cpu(config, evidence_dir)
         if args.build:

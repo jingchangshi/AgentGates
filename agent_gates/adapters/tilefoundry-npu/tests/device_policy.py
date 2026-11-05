@@ -250,8 +250,31 @@ def main():
     # signature silently stopped matching when device_occupancy gained the preflight
     # argument, so the two controls below "detected nothing" while reporting a pass,
     # and the injected source was byte-identical to the clean one.
-    anchor = next((line for line in source.splitlines()
-                   if "device_occupancy(config, device_ids" in line), None)
+    # Match by SHAPE, not by exact spelling: the call is now wrapped in
+    # run_stage("occupancy_before", ...) for the P0-E watchdog, so an exact-substring
+    # anchor stopped matching and both injections below became no-ops that
+    # nonetheless reported a pass. A control that silently stops controlling is
+    # worse than a missing one, because it reads as evidence.
+    import re as _re
+    # The call is now `run_stage("occupancy_before", device_occupancy, ...)`, where
+    # the function name appears WITHOUT a following parenthesis, so matching
+    # "device_occupancy(" misses it entirely. Match the bare name on a non-def line.
+    # The call is `run_stage("occupancy_before", device_occupancy,` CONTINUED on
+    # the next line. Injecting after the first physical line splits the call and
+    # produces a SyntaxError, so the anchor must be the whole STATEMENT: find the
+    # opening line, then consume continuation lines until the call closes.
+    lines = source.splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if "device_occupancy" in line
+                  and not line.lstrip().startswith("def ")
+                  and not line.lstrip().startswith("#")), None)
+    if start is not None:
+        end = start
+        while not lines[end].rstrip().endswith(")") and end + 1 < len(lines):
+            end += 1
+        anchor = chr(10).join(lines[start:end + 1])
+    else:
+        anchor = None
     if anchor is None:
         # The call site was renamed or moved. Say so plainly instead of crashing:
         # this tool must never die with a TypeError from its own instrumentation,
