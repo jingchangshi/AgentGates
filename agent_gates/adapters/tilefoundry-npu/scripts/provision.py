@@ -8,6 +8,13 @@ Two modes, one contract:
   --apply   create the container ONLY if it does not exist. If it exists, --apply
             behaves like --check: it verifies and refuses on drift.
 
+  --inspect-json FILE
+            inspect a RECORDED docker inspect document instead of the live daemon.
+            A recording is data, not a peer's container: the drift and structural
+            negatives run against it, so no case names or touches a real resource
+            that belongs to somebody else. It is read-only by construction, and
+            --apply refuses to act on it (a stale recording is not a deployment).
+
 Why it never removes or recreates: the container is shared (other agents, other runs,
 possibly a LIVE device job). A "converge" that rebuilds on any difference turns a typo
 in the profile into an outage, and a rebuild is exactly how a verified image silently
@@ -90,6 +97,32 @@ def load_env_file(path: Path) -> dict:
     return values
 
 
+def load_inspect_json(path: Path) -> dict:
+    """A RECORDED docker inspect document, used by the drift negatives.
+
+    Reading a recording instead of a live container is what lets the drift cases
+    run without naming anyone else's container. It is also the only way these
+    cases can be made deterministic: a peer's container may be removed or may
+    change while the test runs, and then the test would be measuring the peer
+    instead of the checker.
+    """
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise ProvisionError("INSPECT_UNREADABLE", str(exc)) from exc
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        raise ProvisionError("INSPECT_MALFORMED", str(exc)) from exc
+    if isinstance(document, list):
+        document = document[0] if document else None
+    if not isinstance(document, dict):
+        raise ProvisionError(
+            "INSPECT_MALFORMED",
+            "expected one docker inspect object, got %r" % type(document).__name__)
+    return document
+
+
 def docker_inspect(name: str):
     rc, out, err = run(["docker", "inspect", name])
     if rc != 0:
@@ -168,7 +201,10 @@ def compare(inspect: dict, profile: dict) -> list:
 def create_command(profile: dict, env: dict) -> list:
     """The exact argv --apply uses. By DIGEST, never by tag: a moved tag is how a
     rebuilt image silently replaces the one a Gate was verified against."""
-    argv = ["docker", "run", "-d", "--name", env["CONTAINER_NAME"]]
+    # "create", not "run": provisioning RECORDS a container, it does not start one.
+    # Starting is a separate, explicit act (--start), so a creation can never become
+    # a device job by side effect.
+    argv = ["docker", "create", "--name", env["CONTAINER_NAME"]]
     for device in profile["required_devices"]:
         argv += ["--device", device]
     for want in profile["required_binds"]:
@@ -184,6 +220,11 @@ def create_command(profile: dict, env: dict) -> list:
     return argv
 
 
+def start_command(name: str) -> list:
+    """Starting is a separate act, and never part of a plain --apply."""
+    return ["docker", "start", name]
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -193,10 +234,16 @@ def main(argv=None) -> int:
     parser.add_argument("--container", default=None,
                         help="inspect THIS container instead of the profile's (read-only; "
                              "used by the drift negatives)")
+    parser.add_argument("--inspect-json", default=None, metavar="FILE",
+                        help="inspect a RECORDED docker inspect document instead of the live "
+                             "daemon (the drift negatives). Read-only: --apply refuses it.")
     parser.add_argument("--profile", default=str(PROFILE_PATH))
     parser.add_argument("--env-file", default=str(ENV_FILE))
     parser.add_argument("--dry-run", action="store_true",
                         help="with --apply, print the docker argv and create nothing")
+    parser.add_argument("--start", action="store_true",
+                        help="with --apply, also START the just-created container; without "
+                             "it a created container stays stopped (provisioning is not a device job)")
     args = parser.parse_args(argv)
 
     report = {"tool": "provision.py", "mode": "apply" if args.apply else "check"}
@@ -206,22 +253,35 @@ def main(argv=None) -> int:
         report["profile"] = str(Path(args.profile).resolve())
         report["profile_image_name"] = profile["required_image_name"]
         report["profile_image_digest"] = profile["required_image_digest"]
-        local_digest = image_digest(profile)
-        report["image_present_locally"] = True
-        report["image_local_digest"] = local_digest
-        if local_digest != profile["required_image_digest"]:
-            report["verdict"] = "IMAGE_TAG_MOVED"
-            report["detail"] = ("the tag %r now resolves to %s, but the profile pins %s; "
-                                "the pinned image was rebuilt or replaced"
-                                % (profile["required_image_name"], local_digest,
-                                   profile["required_image_digest"]))
-            report["mutated"] = False
-            print(json.dumps(report, indent=1, sort_keys=True))
-            return EXIT_DRIFT
 
         name = args.container or env["CONTAINER_NAME"]
         report["container"] = name
-        inspect = docker_inspect(name)
+        if args.inspect_json:
+            # A recording is EVIDENCE, not a deployment: never mutate on it.
+            if args.apply:
+                raise ProvisionError(
+                    "INSPECT_JSON_READ_ONLY",
+                    "--apply cannot act on a recorded inspect document; pass a live "
+                    "container name or drop --apply",
+                    EXIT_CONFIG)
+            inspect = load_inspect_json(Path(args.inspect_json))
+            report["inspect_source"] = str(Path(args.inspect_json).resolve())
+            report["image_check"] = "recorded inspect (no live docker query)"
+            report["image_present_locally"] = None
+        else:
+            local_digest = image_digest(profile)
+            report["image_present_locally"] = True
+            report["image_local_digest"] = local_digest
+            if local_digest != profile["required_image_digest"]:
+                report["verdict"] = "IMAGE_TAG_MOVED"
+                report["detail"] = ("the tag %r now resolves to %s, but the profile pins %s; "
+                                    "the pinned image was rebuilt or replaced"
+                                    % (profile["required_image_name"], local_digest,
+                                       profile["required_image_digest"]))
+                report["mutated"] = False
+                print(json.dumps(report, indent=1, sort_keys=True))
+                return EXIT_DRIFT
+            inspect = docker_inspect(name)
         if inspect is None:
             report["verdict"] = "CONTAINER_ABSENT"
             report["mutated"] = False
@@ -239,6 +299,12 @@ def main(argv=None) -> int:
                 report["create_stderr"] = err.strip()[:400]
                 report["mutated"] = rc == 0
                 report["verdict"] = "CREATED" if rc == 0 else "CREATE_FAILED"
+                report["started"] = False
+                if rc == 0 and args.start:
+                    start_rc, _start_out, start_err = run(start_command(name), timeout=300)
+                    report["start_rc"] = start_rc
+                    report["start_stderr"] = start_err.strip()[:300]
+                    report["started"] = start_rc == 0
                 print(json.dumps(report, indent=1, sort_keys=True))
                 return EXIT_OK if rc == 0 else EXIT_CONFIG
             print(json.dumps(report, indent=1, sort_keys=True))

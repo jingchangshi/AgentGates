@@ -1,0 +1,25 @@
+[
+  {
+    "Id": "1000000000000000000000000000000000000000000000000000000000000000",
+    "Image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "Created": "1970-01-01T00:00:00.000000000Z",
+    "Config": {
+      "User": "root",
+      "Image": "recorded/foreign:latest"
+    },
+    "HostConfig": {
+      "Binds": [
+        "/var/lib/recorded-elsewhere:/home",
+        "/var/lib/recorded-data:/data:ro"
+      ],
+      "Devices": [
+        { "PathOnHost": "/dev/davinci0" },
+        { "PathOnHost": "/dev/davinci1" }
+      ]
+    },
+    "State": {
+      "Running": false,
+      "StartedAt": "1970-01-01T00:00:00Z"
+    }
+  }
+]
