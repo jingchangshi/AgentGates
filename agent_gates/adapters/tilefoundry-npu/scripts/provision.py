@@ -234,6 +234,9 @@ def main(argv=None) -> int:
     parser.add_argument("--container", default=None,
                         help="inspect THIS container instead of the profile's (read-only; "
                              "used by the drift negatives)")
+    parser.add_argument("--check-config", action="store_true",
+                        help="validate the profile and env file ONLY; runs no docker "
+                             "command and changes nothing (the recipe preflight)")
     parser.add_argument("--inspect-json", default=None, metavar="FILE",
                         help="inspect a RECORDED docker inspect document instead of the live "
                              "daemon (the drift negatives). Read-only: --apply refuses it.")
@@ -253,6 +256,21 @@ def main(argv=None) -> int:
         report["profile"] = str(Path(args.profile).resolve())
         report["profile_image_name"] = profile["required_image_name"]
         report["profile_image_digest"] = profile["required_image_digest"]
+
+        if args.check_config:
+            # PARSE ONLY. No docker call, no image lookup, no create: a preflight
+            # that touches the daemon is not a preflight, it is a step.
+            report.update({
+                "mode": "check-config",
+                "configuration": "valid",
+                "container": env["CONTAINER_NAME"],
+                "image": profile["required_image_name"],
+                "required_devices": profile["required_devices"],
+                "required_binds": [want.get("destination")
+                                   for want in profile["required_binds"]],
+            })
+            print(json.dumps(report, indent=1, sort_keys=True))
+            return EXIT_OK
 
         name = args.container or env["CONTAINER_NAME"]
         report["container"] = name

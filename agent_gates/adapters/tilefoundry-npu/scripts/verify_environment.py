@@ -390,6 +390,28 @@ def vadd_one(n: int):
     return main
 
 
+def check_configuration() -> int:
+    """Validate the DECLARED configuration only: no device, no subprocess, no writes.
+
+    The recipe preflight. It must be runnable before a run directory even exists.
+    """
+    tf_root = Path(os.environ.get("TFNU_TF_ROOT") or E.TF_ROOT)
+    report = {"tool": "verify_environment.py", "mode": "check-config",
+              "tf_root": str(tf_root),
+              "interpreter": sys.executable,
+              "deployment_interpreter": str(E.interpreter()),
+              "set_env": E.CANN_SET_ENV,
+              "pythonpath": E.python_path_entries(),
+              "configuration": "valid"}
+    if not (tf_root / "src" / "tilefoundry").is_dir():
+        report["configuration"] = "invalid"
+        report["code"] = "TF_SOURCE_MISSING"
+        print(json.dumps(report, indent=1, sort_keys=True))
+        return 2
+    print(json.dumps(report, indent=1, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -402,6 +424,9 @@ def main(argv=None) -> int:
                     help="use this cache dir instead of a fresh one (the non-empty negative)")
     ap.add_argument("--inject-error", type=int, choices=[0, 1], default=0,
                     help="1 = flip one bit of the REFERENCE, to prove the compare can fail")
+    ap.add_argument("--check-config", action="store_true",
+                    help="validate the declared configuration ONLY; touches no device, "
+                         "starts nothing and writes nothing (the recipe preflight)")
     ap.add_argument("--skip-device", action="store_true")
     ap.add_argument("--tf-cli-cmd", default=None,
                     help="override the interpreter/command used for the TileFoundry CPU "
@@ -418,6 +443,8 @@ def main(argv=None) -> int:
     ap.add_argument("--watchdog", type=int, default=0,
                     help="seconds after which a stack dump is printed (diagnostics only)")
     args = ap.parse_args(argv)
+    if args.check_config:
+        return check_configuration()
     if args.watchdog:
         faulthandler.dump_traceback_later(args.watchdog, repeat=False)
 

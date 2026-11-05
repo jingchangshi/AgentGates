@@ -542,6 +542,39 @@ def _findings(facts: dict) -> int:
     return 0
 
 
+def _check_config() -> int:
+    """Validate the DECLARED configuration without writing or executing anything.
+
+    This is the recipe preflight: it must be safe to run before any step, on any
+    machine, including one where the prefix does not exist yet. It therefore checks
+    the preconditions of convergence (a writable parent, a writable wheel cache)
+    and never calls the interpreter, pip, or docker.
+    """
+    problems = []
+    prefix_parent = E.SHARED_PREFIX.parent
+    if not prefix_parent.is_dir():
+        problems.append("CONFIGURE_PREFIX_PARENT_MISSING")
+    elif not os.access(str(prefix_parent), os.W_OK):
+        problems.append("CONFIGURE_PREFIX_PARENT_NOT_WRITABLE")
+    cache_parent = E.WHEEL_CACHE.parent
+    if not cache_parent.is_dir():
+        problems.append("CONFIGURE_WHEEL_CACHE_PARENT_MISSING")
+    elif not os.access(str(cache_parent), os.W_OK):
+        problems.append("CONFIGURE_WHEEL_CACHE_NOT_WRITABLE")
+    report = {"tool": "configure.py", "mode": "check-config",
+              "prefix": str(E.SHARED_PREFIX),
+              "interpreter": str(E.interpreter()),
+              "wheel_cache": str(E.WHEEL_CACHE),
+              "configuration": "invalid" if problems else "valid"}
+    if problems:
+        report["code"] = problems[0]
+        report["problems"] = problems
+        print(json.dumps(report, indent=1, sort_keys=True))
+        return 2
+    print(json.dumps(report, indent=1, sort_keys=True))
+    return 0
+
+
 def _fail(actions: list, code: str, detail: str, exit_code: int = 1) -> int:
     """Print a NAMED failure and return a NON-ZERO code.
 
@@ -560,7 +593,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--facts", action="store_true", help="inspect only, write nothing")
     parser.add_argument("--findings", action="store_true", help="exit non-zero if unusable")
+    parser.add_argument("--check-config", action="store_true",
+                        help="validate the declared configuration ONLY; writes nothing "
+                             "and runs no subprocess (the recipe preflight)")
     args = parser.parse_args(argv)
+
+    if args.check_config:
+        return _check_config()
 
     if args.facts:
         facts = gather_facts()
