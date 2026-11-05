@@ -1,0 +1,385 @@
+# P0-E/F/G/H + deployment-boundary FAILURE BASELINE (task-52)
+
+captured: 2026-11-05T12:12+08:00
+
+## What was measured, and why on HEAD
+
+- **Gate under test**: `git show HEAD:agent_gates/adapters/tilefoundry-npu/scripts/tilefoundry_gate.py`,
+  copied into a scratch tree. sha256 recorded at the end of this file.
+- **The working tree is not the baseline.** I2 holds `scripts/tilefoundry_gate.py` for
+  task-50/51. An earlier capture caught that tree mid-edit (`parse_npu_smi()` had lost
+  its `return`, so even the pre-existing `device_policy.py` raised `TypeError`); that is
+  an in-flight state, not a P0-E/F/G/H gap, and I did not touch it.
+- Re-measured after I2 landed `602ad8d` (environment_preflight + deployment_verify):
+  **the same gaps are still open**, as expected -- that work closed P0-A/P0-DEPLOY.
+
+## Result: 22 failed / 3 passed
+
+The three passes are a **control group**, not the target:
+
+1. `test_control_busy_is_recorded_not_decided` -- an empty process table is UNKNOWN idle.
+2. `test_control_a_busy_dependent_verdict_is_detectable` -- the real detector in
+   `device_policy.py` still fires on an injected busy-skip.
+3. `test_reference_verifier_discriminates_every_negative` -- the seven attestation
+   negatives have **discriminating power**: replayed against a contract reference, each
+   is refused for its OWN reason and a well-formed record is accepted. Without this,
+   "all seven refused" would be satisfied by a verifier that refuses everything.
+
+## Every failure is a behavioural assertion, never a crash
+
+Verified mechanically: the harness parses each FAIL line and rejects any failure whose
+exception type is not `AssertionError`. Result: **0 non-AssertionError failures.**
+
+### P0-E -- team lock, watchdog, after-SMI
+
+| test | mechanism missing | actual failing assertion |
+|---|---|---|
+| test_two_workers_never_enter_the_payload_together | team lock lease | "the gate has no team lock lease at all, so two jobs can enter the device payload concurrently and neither would notice" |
+| test_forged_lock_held_env_cannot_bypass_the_lock | handoff must be verified, not trusted | "the gate has no team lock lease, so a forged TF_DEVICE_LOCK_HELD=1 skips nothing because there is nothing to skip" |
+| test_lock_is_released_after_a_failing_payload | release on failure | "the gate has no team lock lease, so 'the lock is released after a failure' cannot even be asked -- there is no lock to release" |
+| test_hung_stage_is_bounded_and_recorded_as_timeout | per-stage watchdog | "a 3.0s payload was allowed to run 3.00s; no stage bound exists, so a hang is indistinguishable from a slow device" |
+| test_a_timeout_is_not_retried | bound must cut the overrun short | "the 3.0s payload ran 3.00s before returning; nothing bounded it, so 'not retried' is true only because it never came back" |
+| test_occupancy_is_sampled_before_and_after_exactly_once | after-SMI | "occupancy was sampled 1 time(s); P0-E requires exactly one BEFORE and one AFTER sample" |
+| test_after_sample_runs_even_when_the_payload_fails | after-SMI in a finally | "the payload failed and occupancy was sampled 1 time(s); without a finally block a failing run never records the card state it left behind" |
+
+### P0-G -- one record on every ending, unique run dir, phase DAG, FINISHED != PASS
+
+| test | mechanism missing | actual failing assertion |
+|---|---|---|
+| test_failure_still_writes_exactly_one_result_json | record on every ending | "a FAILED run wrote no JSON at all; the only account of the failure is the console text" |
+| test_each_run_gets_its_own_directory | unique run dir + run identity | "the per-run record does not identify the run (['run_id','started'] absent); uniqueness of the file name is not uniqueness of the evidence" |
+| test_record_separates_finished_from_passed | FINISHED != PASS | "the record has no status/finished field: [...]" |
+| test_record_carries_the_phase_graph | phase DAG | "the record carries no phases: a partial run looks identical to a full one" |
+
+### P0-F -- reusable workloads, no generic fallback, readback labelling
+
+| test | mechanism missing | actual failing assertion |
+|---|---|---|
+| test_a_missing_case_refuses_and_never_falls_back_to_the_generic_add | workload selector | "gate_device does not accept the P0-F workload selector (unexpected keyword 'workload'); the device Gate can only run its one hard-coded payload" |
+| test_the_device_payload_is_selected_not_hard_coded | workload selection | same selector assertion |
+| test_a_device_run_labels_where_its_numbers_came_from | readback labelling | "the record never says whether the numbers are a fresh device readback or an archived replay; the two claims are indistinguishable" |
+
+### Deployment boundary -- the host-only attestation channel
+
+`--deployment-attest` is read-only and runs no device work; the device Gate consumes its
+record and may only set `deploymentVerified=true` when all seven properties hold. Each
+negative below is one real way a stale or forged record could be passed off as fresh.
+
+| test | defect | actual failing assertion |
+|---|---|---|
+| test_attestation_accepts_a_well_formed_fresh_record | (positive control) | "the gate has no verify_deployment_attestation, so a host-only record cannot be verified at all and deploymentVerified could only ever be asserted by hand" |
+| test_attestation_refuses_a_stale_record | recorded in a previous window | same: no verifier exists |
+| test_attestation_refuses_a_container_id_mismatch | record about another container | same |
+| test_attestation_refuses_a_missing_device | requested card not bound | same |
+| test_attestation_refuses_a_pseudo_character_node | davinci path is a regular file, so existence checks pass but nothing launches | same |
+| test_attestation_refuses_a_missing_mount | container runs a different tree than claimed | same |
+| test_attestation_refuses_image_drift | running image is not the contracted one | same |
+| test_attestation_refuses_a_tampered_hash | record edited after the fact | same |
+
+The seven share one reason today (no verifier). That is why
+`test_reference_verifier_discriminates_every_negative` exists and PASSES: it replays all
+seven against a contract reference and requires each to be refused for its own code
+(`STALE`, `CONTAINER_MISMATCH`, `DEVICE_MISSING`, `NODE_NOT_CHAR`, `MOUNT_MISSING`,
+`IMAGE_DRIFT`, `TAMPERED`) while the clean record is accepted. A future verifier that
+simply rejects everything will fail that control.
+
+## Tests that passed vacuously and were tightened
+
+Recorded so nobody reads this baseline as "red by construction".
+
+1. **word-search assertions.** Two tests asserted on SOURCE TEXT: `"workload" in source`
+   passed on a docstring, `"archived" in source` passed on a comment. Both were replaced
+   with behavioural checks. Suite went from **2 PASS to 0 PASS**.
+2. **vacuously-true properties.** "Can the next job enter after a failure?" is true when
+   no lock exists; "did the payload run once?" is true when it never came back; "is the
+   directory unique?" was satisfied by the pre-existing run_id suffix. Each now fails
+   loudly AND asserts the property that makes the claim meaningful (overrun actually cut
+   short, record actually identifies its run).
+3. **a self-repairing negative.** The first version of the tamper case recomputed the
+   digest after tampering, which repaired the defect it was meant to detect. Caught by
+   the discriminator control, which reported "the reference ACCEPTED the tampered_hash
+   record". Fixed by excluding that case from re-digesting.
+4. **a thread-unsafe harness.** The first lock tests used threads; `flock` is per open
+   file description and `contextlib.redirect_stdout` is process-global, so two threads
+   corrupted stdout and swallowed later results. Replaced with real competing processes,
+   which also model what a second team job actually is.
+
+## Invariants the implementation must not break
+
+- **busy is RECORDED only**: no wait, poll, retry, skip, downgrade, or busy-dependent
+  card choice (device_policy.py enforces the static half; a control keeps its detector alive).
+- **the team lock coordinates this team only**; another tenant being busy is metadata.
+- Do not touch: busy semantics, `parse_device_list`, `environment_preflight`,
+  `deployment_verify`.
+- Every new mechanism needs three negatives: normal path, single defect, injected fault.
+
+## Reproduce
+
+```sh
+TMP=$(mktemp -d); mkdir -p "$TMP/scripts" "$TMP/tests"
+git show HEAD:agent_gates/adapters/tilefoundry-npu/scripts/tilefoundry_gate.py \
+    > "$TMP/scripts/tilefoundry_gate.py"
+cp agent_gates/adapters/tilefoundry-npu/tests/{test_e2e_chain.py,device_policy.py} "$TMP/tests/"
+python3 -B "$TMP/tests/test_e2e_chain.py"
+```
+
+## Raw run
+
+HEAD commit      : 602ad8dc76948d788adde306b89adafa385d0d34
+HEAD gate sha256 : e01bca2727f61533a76dd2bf4ae85d2cc530e9c4cddcdfc71e933611f2a671b9
+tree gate sha256 : 96a34505cbe94bfdddbe2dc4f27c45597022c0ae4169b13ce2a71146b8b3efb5  (I2 in-flight, NOT baseline)
+test file sha256 : 1bdc66750415537303a9f25570616ecdb3f269dbaed918ff20d9e9395826816f
+
+Existing device_policy.py on this HEAD fails from a bare shell with
+ENV_CANN_SCRIPT_MISSING (the new P0-A preflight wants an explicit CANN_SET_ENV).
+That is I2's scope, recorded here only so the next reader is not surprised.
+
+==================================================================
+P0-E/F/G/H behavioural contract against the gate at:
+  /tmp/tmp.T0HsMLLype/scripts/tilefoundry_gate.py
+  FAIL  test_a_device_run_labels_where_its_numbers_came_from
+        AssertionError: the record never says whether the numbers are a fresh device readback or an archived replay; the two claims are indistinguishable
+  FAIL  test_a_missing_case_refuses_and_never_falls_back_to_the_generic_add
+        AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  FAIL  test_a_timeout_is_not_retried
+        AssertionError: the 3.0s payload ran 3.00s before returning; nothing bounded it, so 'not retried' is true only because it never came back
+  FAIL  test_after_sample_runs_even_when_the_payload_fails
+        AssertionError: the payload failed and occupancy was sampled 1 time(s); without a finally block a failing run never records the card state it left behind
+  FAIL  test_attestation_accepts_a_well_formed_fresh_record
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_a_container_id_mismatch
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_a_missing_device
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_a_missing_mount
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_a_pseudo_character_node
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_a_stale_record
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_a_tampered_hash
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  FAIL  test_attestation_refuses_image_drift
+        AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  PASS  test_control_a_busy_dependent_verdict_is_detectable
+  PASS  test_control_busy_is_recorded_not_decided
+  FAIL  test_each_run_gets_its_own_directory
+        AssertionError: the per-run record does not identify the run (['started'] absent); uniqueness of the file name is not uniqueness of the evidence
+  FAIL  test_failure_still_writes_exactly_one_result_json
+        AssertionError: a FAILED run wrote no JSON at all; the only account of the failure is the console text
+  FAIL  test_forged_lock_held_env_cannot_bypass_the_lock
+        AssertionError: the gate has no team lock lease, so a forged TF_DEVICE_LOCK_HELD=1 skips nothing because there is nothing to skip
+  FAIL  test_hung_stage_is_bounded_and_recorded_as_timeout
+        AssertionError: a 3.0s payload was allowed to run 3.00s; no stage bound exists, so a hang is indistinguishable from a slow device
+  FAIL  test_lock_is_released_after_a_failing_payload
+        AssertionError: the gate has no team lock lease, so 'the lock is released after a failure' cannot even be asked -- there is no lock to release
+  FAIL  test_occupancy_is_sampled_before_and_after_exactly_once
+        AssertionError: occupancy was sampled 1 time(s); P0-E requires exactly one BEFORE and one AFTER sample
+  FAIL  test_record_carries_the_phase_graph
+        AssertionError: the record carries no phases: a partial run looks identical to a full one
+  FAIL  test_record_separates_finished_from_passed
+        AssertionError: the record has no status/finished field: ['container_exposed_davinci', 'devices', 'gate', 'logical_physical', 'observations', 'occupancy', 'occupancy_raw_sha256', 'recorded_at', 'requested_devices', 'run_id', 'visible_devices']
+  PASS  test_reference_verifier_discriminates_every_negative
+  FAIL  test_the_device_payload_is_selected_not_hard_coded
+        AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  FAIL  test_two_workers_never_enter_the_payload_together
+        AssertionError: the gate has no team lock lease at all, so two jobs can enter the device payload concurrently and neither would notice
+
+3 passed, 22 failed
+
+GAPS (each line is a behaviour that did not happen):
+  - test_a_device_run_labels_where_its_numbers_came_from: AssertionError: the record never says whether the numbers are a fresh device readback or an archived replay; the two claims are indistinguishable
+  - test_a_missing_case_refuses_and_never_falls_back_to_the_generic_add: AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  - test_a_timeout_is_not_retried: AssertionError: the 3.0s payload ran 3.00s before returning; nothing bounded it, so 'not retried' is true only because it never came back
+  - test_after_sample_runs_even_when_the_payload_fails: AssertionError: the payload failed and occupancy was sampled 1 time(s); without a finally block a failing run never records the card state it left behind
+  - test_attestation_accepts_a_well_formed_fresh_record: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_a_container_id_mismatch: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_a_missing_device: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_a_missing_mount: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_a_pseudo_character_node: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_a_stale_record: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_a_tampered_hash: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_attestation_refuses_image_drift: AssertionError: the gate has no verify_deployment_attestation, so a host-only --deployment-attest record cannot be verified at all and deploymentVerified could only ever be asserted by hand
+  - test_each_run_gets_its_own_directory: AssertionError: the per-run record does not identify the run (['started'] absent); uniqueness of the file name is not uniqueness of the evidence
+  - test_failure_still_writes_exactly_one_result_json: AssertionError: a FAILED run wrote no JSON at all; the only account of the failure is the console text
+  - test_forged_lock_held_env_cannot_bypass_the_lock: AssertionError: the gate has no team lock lease, so a forged TF_DEVICE_LOCK_HELD=1 skips nothing because there is nothing to skip
+  - test_hung_stage_is_bounded_and_recorded_as_timeout: AssertionError: a 3.0s payload was allowed to run 3.00s; no stage bound exists, so a hang is indistinguishable from a slow device
+  - test_lock_is_released_after_a_failing_payload: AssertionError: the gate has no team lock lease, so 'the lock is released after a failure' cannot even be asked -- there is no lock to release
+  - test_occupancy_is_sampled_before_and_after_exactly_once: AssertionError: occupancy was sampled 1 time(s); P0-E requires exactly one BEFORE and one AFTER sample
+  - test_record_carries_the_phase_graph: AssertionError: the record carries no phases: a partial run looks identical to a full one
+  - test_record_separates_finished_from_passed: AssertionError: the record has no status/finished field: ['container_exposed_davinci', 'devices', 'gate', 'logical_physical', 'observations', 'occupancy', 'occupancy_raw_sha256', 'recorded_at', 'requested_devices', 'run_id', 'visible_devices']
+  - test_the_device_payload_is_selected_not_hard_coded: AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  - test_two_workers_never_enter_the_payload_together: AssertionError: the gate has no team lock lease at all, so two jobs can enter the device payload concurrently and neither would notice
+
+==================================================================
+## Scope correction (Lead, 2026-11-05)
+
+The attestation CHANNEL is P0-DEPLOY and belongs to I2: the
+--deployment-attest / --deployment-attestation flags and
+verify_deployment_attestation() are I2's implementation, not mine.
+
+My change list is therefore **8 anchors** (P0-E/F/G/H only); the three attestation
+anchors I briefly listed are withdrawn. I keep the TEST side only:
+
+  * seven negatives (stale, container_id, device, node, mount, image, hash),
+  * the positive control,
+  * the discriminating-power control -- kept PERMANENTLY, because the seven negatives
+    today fail for one shared reason and only the reference replay proves they would
+    catch their own defect once a verifier exists.
+
+When I2 lands the channel I re-run this suite: the seven negatives should turn green.
+If one does not, I report it BY NAME (which case, expected refusal code, actual result)
+as an implementation defect and do not modify the implementation myself.
+
+==================================================================
+## Re-measurement on eb00028 (I2 landed host attestation + occupancy env reuse)
+
+| | before (602ad8d) | after (eb00028) |
+|---|---|---|
+| passed | 3 | **11** |
+| failed | 22 | **15** |
+| non-AssertionError failures | 0 | 0 |
+
+### Turned green (8)
+All are the attestation channel I2 implemented:
+
+    test_attestation_accepts_a_well_formed_fresh_record
+    test_attestation_refuses_a_stale_record
+    test_attestation_refuses_a_container_id_mismatch
+    test_attestation_refuses_a_missing_device
+    test_attestation_refuses_a_pseudo_character_node
+    test_attestation_refuses_a_missing_mount
+    test_attestation_refuses_a_tampered_hash
+    test_attestation_refuses_an_unlinked_mount     <- extra case, see below
+
+### Still red in the attestation group (1): ATTESTATION_IMAGE_DRIFT NOT IMPLEMENTED
+
+    test_attestation_refuses_image_drift
+    expected refusal code : ATTESTATION_IMAGE_DRIFT
+    actual                : record ACCEPTED (no refusal at all)
+
+This is an IMPLEMENTATION DEFECT, reported not fixed. The section comment in
+verify_attestation says "(6) the image must not have drifted", but the code only
+checks that SOME digest is present:
+
+    configured = config.get("IMAGE")
+    if configured and not attestation.get("image_digest"):
+        raise GateError("ATTESTATION_INVALID: no image_digest recorded", EXIT_BLOCKED)
+
+Nothing ever compares attestation["image_digest"] against a contracted value, so an
+attestation describing a completely different image verifies clean. Proven directly,
+independent of the test suite, under all three plausible config spellings
+(IMAGE only / IMAGE_DIGEST only / both): the drifted digest sha256:eeee... was
+accepted every time.
+
+Fix belongs to I2: compare the attested digest against the contracted image
+(config IMAGE / IMAGE_DIGEST) and raise ATTESTATION_IMAGE_DRIFT on mismatch. Note
+that comparing the image NAME is not enough -- docker inspect reports the image ID,
+so the contract must be expressed as a digest.
+
+### Not-attestation red (7): unchanged P0-E/F/G/H gaps
+    test_two_workers_never_enter_the_payload_together     (no team lock lease)
+    test_forged_lock_held_env_cannot_bypass_the_lock      (no lease to bypass)
+    test_lock_is_released_after_a_failing_payload         (no lease to release)
+    test_hung_stage_is_bounded_and_recorded_as_timeout    (no stage bound)
+    test_a_timeout_is_not_retried                         (nothing to cut short)
+    test_occupancy_is_sampled_before_and_after_exactly_once (after-SMI absent)
+    test_after_sample_runs_even_when_the_payload_fails    (no finally)
+    test_failure_still_writes_exactly_one_result_json     (no record on failure)
+    test_each_run_gets_its_own_directory                  (no run identity)
+    test_record_separates_finished_from_passed            (FINISHED==PASS)
+    test_record_carries_the_phase_graph                   (no DAG)
+    test_a_missing_case_refuses_and_never_falls_back...   (no workload selector)
+    test_the_device_payload_is_selected_not_hard_coded    (hard-coded payload)
+    test_a_device_run_labels_where_its_numbers_came_from  (no readback label)
+
+### Test-side changes needed to follow the implementation (NOT relaxations)
+
+1. verify_deployment_attestation -> **verify_attestation(attestation, config,
+   device_ids, node_facts, observe)**; content_sha256 (not payload_sha256);
+   refusal codes are the implementation's own spelling, so each negative asserts the
+   code ACTUALLY raised is printed on failure. If a check fired with a different
+   name, the message shows the name, so "renamed" is distinguishable from "absent".
+2. The occupancy-call anchor in the busy-skip control was an exact string; the call
+   gained a preflight_facts argument and the control reported "anchor moved". Changed
+   to match the call by SHAPE (regex), because the control is about the detector, not
+   about a signature. It passes again.
+3. The discriminator's reference verifier was rewritten to the real schema and the
+   real codes, and now includes the image-drift rule -- which is exactly how the
+   missing check was confirmed to be a defect rather than a test artifact.
+
+### A crash that the harness itself caught
+
+Mid-way through this update the discriminator referenced a helper that had been
+removed during the rewrite and raised NameError. The mechanical check flagged it as
+the ONLY non-AssertionError failure in the run, which is exactly its purpose: a
+crash is not a behavioural gap and must never be counted as one. Fixed, and the run
+returned to 0 non-AssertionError failures.
+
+HEAD commit      : eb00028be8d43c4962397ab59c2370e62dec33b6
+HEAD gate sha256 : 8da7d3b03ccfd3f928206084d6ea695361b821f6f7f29f7a4a81b050c9286416
+test file sha256 : 7ce5ea373f1c4d20c4fb5e788d59207b84df589aee0f5587343bc7589ead20a7
+
+==================================================================
+P0-E/F/G/H behavioural contract against the gate at:
+  /tmp/tmp.lTeJvkdaOD/scripts/tilefoundry_gate.py
+  FAIL  test_a_device_run_labels_where_its_numbers_came_from
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  FAIL  test_a_missing_case_refuses_and_never_falls_back_to_the_generic_add
+        AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  FAIL  test_a_timeout_is_not_retried
+        AssertionError: the payload was executed 0 times; a bound must not be retried, and certainly not until another tenant leaves
+  FAIL  test_after_sample_runs_even_when_the_payload_fails
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  PASS  test_attestation_accepts_a_well_formed_fresh_record
+  PASS  test_attestation_refuses_a_container_id_mismatch
+  PASS  test_attestation_refuses_a_missing_device
+  PASS  test_attestation_refuses_a_missing_mount
+  PASS  test_attestation_refuses_a_pseudo_character_node
+  PASS  test_attestation_refuses_a_stale_record
+  PASS  test_attestation_refuses_a_tampered_hash
+  PASS  test_attestation_refuses_an_unlinked_mount
+  FAIL  test_attestation_refuses_image_drift
+        AssertionError: an attestation whose image digest drifted from the contracted image was ACCEPTED; a deployment record that survives this is indistinguishable from a verified one
+  PASS  test_control_a_busy_dependent_verdict_is_detectable
+  PASS  test_control_busy_is_recorded_not_decided
+  FAIL  test_each_run_gets_its_own_directory
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  FAIL  test_failure_still_writes_exactly_one_result_json
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  FAIL  test_forged_lock_held_env_cannot_bypass_the_lock
+        AssertionError: the gate has no team lock lease, so a forged TF_DEVICE_LOCK_HELD=1 skips nothing because there is nothing to skip
+  FAIL  test_hung_stage_is_bounded_and_recorded_as_timeout
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  FAIL  test_lock_is_released_after_a_failing_payload
+        AssertionError: the gate has no team lock lease, so 'the lock is released after a failure' cannot even be asked -- there is no lock to release
+  FAIL  test_occupancy_is_sampled_before_and_after_exactly_once
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  FAIL  test_record_carries_the_phase_graph
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  FAIL  test_record_separates_finished_from_passed
+        AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  PASS  test_reference_verifier_discriminates_every_negative
+  FAIL  test_the_device_payload_is_selected_not_hard_coded
+        AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  FAIL  test_two_workers_never_enter_the_payload_together
+        AssertionError: the gate has no team lock lease at all, so two jobs can enter the device payload concurrently and neither would notice
+
+11 passed, 15 failed
+
+GAPS (each line is a behaviour that did not happen):
+  - test_a_device_run_labels_where_its_numbers_came_from: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_a_missing_case_refuses_and_never_falls_back_to_the_generic_add: AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  - test_a_timeout_is_not_retried: AssertionError: the payload was executed 0 times; a bound must not be retried, and certainly not until another tenant leaves
+  - test_after_sample_runs_even_when_the_payload_fails: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_attestation_refuses_image_drift: AssertionError: an attestation whose image digest drifted from the contracted image was ACCEPTED; a deployment record that survives this is indistinguishable from a verified one
+  - test_each_run_gets_its_own_directory: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_failure_still_writes_exactly_one_result_json: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_forged_lock_held_env_cannot_bypass_the_lock: AssertionError: the gate has no team lock lease, so a forged TF_DEVICE_LOCK_HELD=1 skips nothing because there is nothing to skip
+  - test_hung_stage_is_bounded_and_recorded_as_timeout: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_lock_is_released_after_a_failing_payload: AssertionError: the gate has no team lock lease, so 'the lock is released after a failure' cannot even be asked -- there is no lock to release
+  - test_occupancy_is_sampled_before_and_after_exactly_once: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_record_carries_the_phase_graph: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_record_separates_finished_from_passed: AssertionError: gate_device does not accept the P0-F workload selector (Harness._occupancy() takes 3 positional arguments but 4 were given); the device Gate can only run its one hard-coded payload
+  - test_the_device_payload_is_selected_not_hard_coded: AssertionError: gate_device does not accept the P0-F workload selector (gate_device() got an unexpected keyword argument 'workload'); the device Gate can only run its one hard-coded payload
+  - test_two_workers_never_enter_the_payload_together: AssertionError: the gate has no team lock lease at all, so two jobs can enter the device payload concurrently and neither would notice
