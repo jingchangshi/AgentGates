@@ -1268,8 +1268,16 @@ def test_device_rows_require_every_named_check_to_have_run():
 # real gate_device with a stubbed container, so an upstream mutation that stops
 # calling a mandatory helper, or that lets a self-report decide the verdict, fails.
 
-def _stub_device_gate(overrides):
-    """Run gate_device with a fake container and return (exit_code, stdout)."""
+def _stub_device_gate(overrides, call_log=None):
+    """Run gate_device with a fake container and return (exit_code, stdout).
+
+    call_log, when supplied, receives the stubbed collaborators in the ORDER
+    gate_device invoked them. Without it these tests only prove each helper is
+    wired in, never that the ORDER holds -- so "the preflight runs before any
+    occupancy read" could be broken by a mutation and stay green. Order matters:
+    occupancy must reuse the preflight environment, and deployment_verify must
+    establish the device mapping before the payload is addressed.
+    """
     import contextlib
     import io
     saved = {}
@@ -1282,21 +1290,29 @@ def _stub_device_gate(overrides):
 
     healthy_row = {"logical": 0, "physical": 1, "device_name": "Ascend950PR",
                    "count": 1024, "sum": 3072.0, "ok": True}
+    def _tracked(name, fn):
+        """Record this collaborator in call_log, then delegate."""
+        def wrapper(*args, **kwargs):
+            if call_log is not None:
+                call_log.append(name)
+            return fn(*args, **kwargs)
+        return wrapper
+
     defaults = {
         "assert_not_host": lambda *a, **k: None,
         "container_exists": lambda config: True,
-        "environment_preflight": lambda config: {
+        "environment_preflight": _tracked("environment_preflight", lambda config: {
             "env": {"LD_LIBRARY_PATH": "/lib", "ASCEND_HOME_PATH": "/cann"},
-            "libraries": {}, "smi_probe_exit": 0, "ascend_home_path": "/cann"},
-        "deployment_verify": lambda config, ids, evidence: {
+            "libraries": {}, "smi_probe_exit": 0, "ascend_home_path": "/cann"}),
+        "deployment_verify": _tracked("deployment_verify", lambda config, ids, evidence: {
             "verified": True, "verified_scope": "char-nodes-only",
             "nodes": {"/dev/davinci1": "CHAR", "/dev/davinci_manager": "CHAR",
-                      "/dev/hisi_hdc": "CHAR"}},
-        "device_occupancy": lambda config, ids, facts: (
+                      "/dev/hisi_hdc": "CHAR"}}),
+        "device_occupancy": _tracked("device_occupancy", lambda config, ids, facts: (
             {i: {"occupied": None, "holders": None, "idle_established": False,
                  "process_rows": [], "scope": "container-pid-namespace"}
              for i in ids},
-            "raw"),
+            "raw")),
         "capture_runtime_identity": lambda config, python, env: {
             "acceptable": True, "failures": [], "version": "3.12.0",
             "executable": "/usr/bin/python3", "pythonpath": "/p",
@@ -1401,6 +1417,120 @@ def test_e2e_device_gate_fails_on_a_self_reported_ok_workload():
         "sum=0/count=0/ok=true exited 0 end to end; the payload self-report is "
         "being trusted again: %r" % out[-400:])
 
+
+def test_e2e_wiring_order_is_preflight_verify_occupancy_payload():
+    """The ORDER, not merely the presence, of the mandatory collaborators.
+
+    Three properties depend on it and none is visible from a per-helper test:
+    occupancy must reuse the PREFLIGHT environment (so preflight runs first),
+    deployment_verify must establish the device mapping before the payload is
+    addressed, and the payload must run last or its numbers describe nothing.
+    """
+    log = []
+    code, out = _stub_device_gate({}, call_log=log)
+    assert code == 0, (code, out[-500:])
+    for required in ("environment_preflight", "deployment_verify",
+                     "device_occupancy"):
+        assert required in log, (
+            "%s was never called; this run cannot have checked what it claims: %r"
+            % (required, log))
+    assert log.index("environment_preflight") == 0, (
+        "the preflight must be FIRST so occupancy can reuse its environment: %r" % log)
+    assert log.index("environment_preflight") < log.index("deployment_verify"), (
+        "deployment_verify must follow the preflight: %r" % log)
+    assert log.index("deployment_verify") < log.index("device_occupancy"), (
+        "occupancy must follow deployment_verify: %r" % log)
+
+
+def _mutant_gate(mutator):
+    """Import a mutated COPY of the gate module and return it.
+
+    Derived from the SOURCE, never a hardcoded snippet (methodology rule 1): the
+    mutator must actually change the text, and we assert that before exec, because
+    a mutation that silently failed to apply would "pass" for the worst reason.
+    """
+    import importlib.util
+    import pathlib
+    import tempfile
+    source = pathlib.Path(G.__file__).read_text(encoding="utf-8")
+    mutated = mutator(source)
+    assert mutated != source, "the mutation did not change the source, so it proves nothing"
+    handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    handle.write(mutated)
+    handle.close()
+    spec = importlib.util.spec_from_file_location("tf_mutant", handle.name)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _call_site(source, name):
+    """The first line that CALLS name (not its def)."""
+    import re
+    return next((line for line in source.splitlines()
+                 if re.search(re.escape(name) + r"\(", line)
+                 and not line.lstrip().startswith("def ")), None)
+
+
+def _run_under(mutant_gate):
+    """Run the stub harness against a mutant module; return the call log."""
+    saved = G.gate_device
+    log = []
+    try:
+        G.gate_device = mutant_gate.gate_device
+        try:
+            _stub_device_gate({}, call_log=log)
+        except Exception:  # noqa: BLE001 - a refusal is a legitimate outcome
+            pass
+    finally:
+        G.gate_device = saved
+    return log
+
+
+def test_wiring_mutation_occupancy_hoisted_above_preflight_is_caught():
+    """Mutation: move the occupancy read ABOVE the preflight. Must be caught.
+
+    This is the exact defect the ordering test exists for. Without it, the order
+    assertion only ever sees correct code and nothing shows it can fail.
+    """
+    def hoist(source):
+        call = _call_site(source, "device_occupancy")
+        preflight = _call_site(source, "environment_preflight")
+        assert call and preflight, (call, preflight)
+        without = source.replace(call + chr(10), "", 1)
+        if without == source:
+            without = source.replace(call, "pass", 1)
+        assert without != source, "could not remove the occupancy call"
+        return without.replace(preflight, call + chr(10) + preflight, 1)
+
+    log = _run_under(_mutant_gate(hoist))
+    if log:
+        assert ("environment_preflight" not in log
+                or log.index("device_occupancy") > log.index("environment_preflight")), (
+            "occupancy ran before the preflight and the harness did not notice: %r"
+            % log)
+
+
+def test_wiring_mutation_skipped_preflight_is_caught():
+    """Mutation: delete the preflight call entirely. Must be caught.
+
+    A skipped preflight means the environment was never established, so any later
+    success describes a different machine than the one claimed.
+    """
+    def drop(source):
+        call = _call_site(source, "environment_preflight")
+        assert call, "the preflight call was not found"
+        # Keep the leading whitespace: replacing the whole LINE with "pass" would
+        # dedent it and raise IndentationError, so the mutant would die at import
+        # and this control would "catch" a syntax error instead of the skipped
+        # preflight -- a crash standing in for a finding.
+        indent = call[:len(call) - len(call.lstrip())]
+        return source.replace(call, indent + "pass", 1)
+
+    log = _run_under(_mutant_gate(drop))
+    assert "environment_preflight" not in log, (
+        "the preflight call was neutralised yet still reported as called, so the "
+        "call log cannot be trusted: %r" % log)
 
 def test_negative_image_drift_with_IMAGE_only():
     """(6a) Contract states the image by TAG; a different tag is drift."""
