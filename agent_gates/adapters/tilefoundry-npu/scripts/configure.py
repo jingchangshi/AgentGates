@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -120,26 +121,110 @@ def _wheel_for(name: str, version: str | None = None) -> Path | None:
     return None
 
 
+#: Bounds on the installer. A pip that waits on a network nobody can reach is
+#: indistinguishable from a hung program; these turn it into a NAMED result.
+PIP_TIMEOUT = os.environ.get("TFNU_PIP_TIMEOUT", "60")
+PIP_RETRIES = os.environ.get("TFNU_PIP_RETRIES", "2")
+INSTALL_TIMEOUT = int(os.environ.get("TFNU_INSTALL_TIMEOUT", "900"))
+PROXY_SCRIPT = os.environ.get("TFNU_PROXY_SH", os.path.expanduser("~/set_proxy.sh"))
+MIRROR_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+
+
+def _pip_argv() -> list:
+    return [str(E.interpreter()), "-m", "pip", "install", "--no-input",
+            "--no-warn-script-location", "--timeout", str(PIP_TIMEOUT),
+            "--retries", str(PIP_RETRIES)]
+
+
+def _missing_wheels(stderr: str, steps: list[dict]) -> list[str]:
+    """Which pinned packages the offline attempt could not satisfy.
+
+    Named, not "offline install failed": the point is to say WHICH wheel is not in
+    the local cache, because that is the only fact that makes networking necessary.
+    """
+    text = stderr or ""
+    missing = []
+    for step in steps:
+        name = step["name"].lower().replace("_", "-")
+        if ("no matching distribution found for %s==" % step["name"]).lower() in text.lower():
+            missing.append(step["name"])
+        elif name in text.lower() and "could not find a version" in text.lower():
+            if step["name"] not in missing:
+                missing.append(step["name"])
+    return missing
+
+
 def _install(steps: list[dict]) -> list[dict]:
-    """Converge on the plan, offline where the wheel cache suffices."""
+    """Converge on the plan: OFFLINE FIRST, network only when a wheel is missing.
+
+    Offline is not a preference, it is the reproducibility claim: 35 wheels in the
+    local cache cover every pin, so a converge must finish in milliseconds. If it
+    cannot, the answer is "WHEEL_MISSING: <name>" -- not a silent wait on a mirror.
+    """
     if not steps:
         return []
-    recipes = [
-        "%s==%s" % (step["name"], step["want"]) for step in steps
-    ]
+    recipes = ["%s==%s" % (step["name"], step["want"]) for step in steps]
     env = dict(os.environ)
     env.setdefault("PYTHONNOUSERSITE", "1")
-    argv = [
-        str(E.interpreter()), "-m", "pip", "install",
-        "--no-input", "--no-warn-script-location",
-    ]
-    if E.WHEEL_CACHE.is_dir() and all(
-        _wheel_for(step["name"], step["want"]) for step in steps
-    ):
-        argv += ["--no-index", "--find-links", str(E.WHEEL_CACHE)]
-    argv += recipes
-    rc, out, err = _run(argv, env=env, timeout=7200)
-    return [{"action": "pip", "argv": argv, "rc": rc, "tail": (out + err)[-800:]}]
+    actions = []
+
+    # ---- 1. offline, bounded
+    offline = _pip_argv()
+    if E.WHEEL_CACHE.is_dir():
+        offline += ["--no-index", "--find-links", str(E.WHEEL_CACHE)]
+    offline += recipes
+    started = time.time()
+    try:
+        rc, out, err = _run(offline, env=env, timeout=INSTALL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return [{"action": "pip", "mode": "offline", "code": "CONFIGURE_NETWORK_TIMEOUT",
+                 "rc": None, "timeout_s": INSTALL_TIMEOUT, "argv": offline}]
+    actions.append({"action": "pip", "mode": "offline", "rc": rc,
+                    "seconds": round(time.time() - started, 2), "argv": offline,
+                    "tail": (out + err)[-600:]})
+    if rc == 0:
+        return actions
+
+    missing = _missing_wheels(err, steps)
+    actions.append({"action": "diagnose", "code": "WHEEL_MISSING", "missing": missing,
+                    "cache": str(E.WHEEL_CACHE)})
+    if not missing or os.environ.get("TFNU_OFFLINE_ONLY", "").strip() == "1":
+        return actions
+
+    # ---- 2. network, ONLY for the named missing wheels, and bounded
+    online = _pip_argv() + ["-i", MIRROR_INDEX, "--trusted-host", "mirrors.aliyun.com"]
+    online += ["%s==%s" % (step["name"], step["want"])
+               for step in steps if step["name"] in missing]
+    proxy = Path(PROXY_SCRIPT)
+    command = online
+    if proxy.is_file():
+        command = ["bash", "-lc", ". %s >/dev/null 2>&1; exec %s"
+                   % (proxy, " ".join(online))]
+    started = time.time()
+    try:
+        rc, out, err = _run(command, env=env, timeout=INSTALL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        actions.append({"action": "pip", "mode": "online",
+                        "code": "CONFIGURE_NETWORK_TIMEOUT", "rc": None,
+                        "timeout_s": INSTALL_TIMEOUT, "argv": online})
+        return actions
+    actions.append({"action": "pip", "mode": "online", "rc": rc,
+                    "seconds": round(time.time() - started, 2), "argv": online,
+                    "proxy": str(proxy) if proxy.is_file() else None,
+                    "tail": (out + err)[-600:]})
+    if rc == 0:
+        # Persist what was fetched, so the NEXT run is offline again. Without this the
+        # network becomes a permanent dependency and this whole path is unrepeatable.
+        for name in missing:
+            want = next(step["want"] for step in steps if step["name"] == name)
+            _run([str(E.interpreter()), "-m", "pip", "download", "--no-deps",
+                  "-i", MIRROR_INDEX, "--trusted-host", "mirrors.aliyun.com",
+                  "--timeout", str(PIP_TIMEOUT), "--retries", str(PIP_RETRIES),
+                  "-d", str(E.WHEEL_CACHE), "%s==%s" % (name, want)],
+                 env=env, timeout=INSTALL_TIMEOUT)
+        actions.append({"action": "cache_warmed", "wheels": missing,
+                        "cache": str(E.WHEEL_CACHE)})
+    return actions
 
 
 def _tilelang_state() -> dict:
