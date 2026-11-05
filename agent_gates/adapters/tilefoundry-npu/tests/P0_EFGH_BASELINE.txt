@@ -143,6 +143,43 @@ the failure mode is always a report that cannot distinguish itself from success.
    and of every test actually executed. A working tree can be mid-edit -- this baseline
    was itself once captured against a tree whose `parse_npu_smi()` had lost its return.
 
+## `negatives.sh`: the "14 pass / 4 fail" figure and its per-case attribution
+
+Recorded so a later re-run can be compared line by line, and specifically so nobody
+reads the expected "4 fail -> 0 fail" transition as four Gate defects being fixed.
+
+**Only ONE of the four is a Gate finding. Three were harness artefacts of MY re-run**
+(an extraction set that omitted the files `negatives.sh` shells out to). Proven, not
+assumed: each of the three prints `python3: can't open file ... [Errno 2]` -- a
+missing-file error, not an assertion about the adapter.
+
+| failing case | exit | cause | owner |
+|---|---|---|---|
+| `busy and idle run the same workload with the same verdict` | 2 | `device_policy.py` absent from the extraction set | ME (fixed: extract it) |
+| `interpreter identity refuses /bin/true` | 2 | `identity_check.py` absent from the extraction set | ME (fixed) |
+| `tool reports must be structured PASS, not bare exit 0` | 2 | `tool_report_check.py` absent from the extraction set | ME (fixed) |
+| `manifest observationChecks match the script` | 1 | **real drift**: 8 observed keys undeclared for `tilefoundry-npu-device` | **g2** (P0-G, observationChecks must align with the final record schema) |
+
+So the CORRECT expected transition for g2's delivery is **17 pass / 1 fail -> 18 pass /
+0 fail**, not "4 fail -> 0 fail". The 17/1 figure is what `negatives.sh` actually
+reports once its dependencies are extracted; the 14/4 figure came from an incomplete
+extraction and must not be used as the acceptance baseline.
+
+Dependency set `negatives.sh` requires (it resolves the gate relatively, but shells out
+to these by name, so they MUST be in the same tree):
+
+```
+scripts/tilefoundry_gate.py
+manifest.json
+tests/device_policy.py
+tests/identity_check.py
+tests/tool_report_check.py
+tests/manifest_parity.py
+```
+
+A re-run harness must extract ALL of them or it manufactures failures that look like
+adapter defects. That is rule 6 in action: the harness is part of the measurement.
+
 ## Invariants the implementation must not break
 
 - **busy is RECORDED only**: no wait, poll, retry, skip, downgrade, or busy-dependent
