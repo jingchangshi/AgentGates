@@ -401,6 +401,51 @@ def test_profile_libraries_match_the_gate_constant():
     assert tuple(G.required_libraries()) == G.REQUIRED_LIBRARIES, (
         G.required_libraries(), G.REQUIRED_LIBRARIES)
 
+def test_effective_config_hash_changes_when_a_deployment_value_changes():
+    """The POSITIVE half: a hash over key NAMES alone would be invariant here.
+
+    The negative half above proves no secret leaks. On its own it would also pass
+    for a hash of key names only -- which is exactly the defect: swapping IMAGE or
+    CONTAINER_NAME would leave it identical, so it could not identify a deployment.
+    Each of the four keys below must move the digest when its VALUE moves, and must
+    keep it stable when nothing moves.
+    """
+    baseline = G.effective_config_hash(cfg())
+    assert G.effective_config_hash(cfg()) == baseline, "the hash is not deterministic"
+
+    changes = {
+        "IMAGE": "other-image:2.0",
+        "CONTAINER_NAME": "other-container",
+        "TF_REPO": "/somewhere/else/TileFoundry",
+        "CANN_SET_ENV": "/other/cann/set_env.sh",
+    }
+    for key, value in changes.items():
+        moved = G.effective_config_hash(cfg(**{key: value}))
+        assert moved != baseline, (
+            "changing %s left the config hash identical (%s), so the hash covers "
+            "key NAMES rather than deployment VALUES and cannot identify the "
+            "deployment the run used" % (key, baseline[:16]))
+        assert len(moved) == 64, moved
+
+
+def test_effective_config_hash_covers_every_declared_value_key():
+    """Every key declared as value-bearing must actually move the digest.
+
+    Guards the gap between the declaration (HASHABLE_VALUE_KEYS) and the behaviour:
+    a key added to the set but skipped by the loop would otherwise be invisible.
+    """
+    keyed = sorted(G.HASHABLE_VALUE_KEYS)
+    assert keyed, "HASHABLE_VALUE_KEYS is empty"
+    insensitive = []
+    for key in keyed:
+        if G.effective_config_hash(cfg(**{key: "sensitivity-probe-a"})) == \
+                G.effective_config_hash(cfg(**{key: "sensitivity-probe-b"})):
+            insensitive.append(key)
+    assert not insensitive, (
+        "these keys are declared value-bearing but their VALUE does not change the "
+        "hash, so the declaration overstates what the fingerprint covers: %r"
+        % (insensitive,))
+
 def test_effective_config_hash_never_leaks_values():
     """The evidence may record WHICH keys were set, never their values."""
     h = G.effective_config_hash(cfg(PROXY_SH="/secret/path/proxy.sh"))
@@ -1282,6 +1327,33 @@ def _stub_device_gate(overrides, call_log=None):
     import io
     saved = {}
 
+    defaults = _stub_defaults(call_log)
+    defaults.update(overrides)
+    for name, value in defaults.items():
+        if hasattr(G, name):
+            saved[name] = getattr(G, name)
+            setattr(G, name, value)
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = G.gate_device(cfg(), "1", None)
+    except G.GateError as error:
+        # A refusal is a legitimate non-zero outcome. main() converts it to
+        # error.code; the harness must do the same or it would look like a crash.
+        code = error.code or 1
+        buffer.write(str(error))
+    finally:
+        for name, value in saved.items():
+            setattr(G, name, value)
+    return code, buffer.getvalue()
+
+
+def _stub_defaults(call_log=None):
+    """The full stub set, shared by the in-place harness and the mutant runner.
+
+    Shared deliberately: the mutant runner must install EXACTLY the same stubs into
+    the mutant's namespace, and a second hand-written copy would drift.
+    """
     class Result:
         def __init__(self, rc=0, out="", err=""):
             self.returncode = rc
@@ -1290,6 +1362,7 @@ def _stub_device_gate(overrides, call_log=None):
 
     healthy_row = {"logical": 0, "physical": 1, "device_name": "Ascend950PR",
                    "count": 1024, "sum": 3072.0, "ok": True}
+
     def _tracked(name, fn):
         """Record this collaborator in call_log, then delegate."""
         def wrapper(*args, **kwargs):
@@ -1298,7 +1371,7 @@ def _stub_device_gate(overrides, call_log=None):
             return fn(*args, **kwargs)
         return wrapper
 
-    defaults = {
+    return {
         "assert_not_host": lambda *a, **k: None,
         "container_exists": lambda config: True,
         "environment_preflight": _tracked("environment_preflight", lambda config: {
@@ -1332,24 +1405,6 @@ def _stub_device_gate(overrides, call_log=None):
             if "davinci" not in " ".join(argv)
             else Result(0, "/dev/davinci1")),
     }
-    defaults.update(overrides)
-    for name, value in defaults.items():
-        if hasattr(G, name):
-            saved[name] = getattr(G, name)
-            setattr(G, name, value)
-    buffer = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buffer):
-            code = G.gate_device(cfg(), "1", None)
-    except G.GateError as error:
-        # A refusal is a legitimate non-zero outcome. main() converts it to
-        # error.code; the harness must do the same or it would look like a crash.
-        code = error.code or 1
-        buffer.write(str(error))
-    finally:
-        for name, value in saved.items():
-            setattr(G, name, value)
-    return code, buffer.getvalue()
 
 
 def test_e2e_device_gate_passes_with_an_honest_container():
@@ -1429,17 +1484,8 @@ def test_e2e_wiring_order_is_preflight_verify_occupancy_payload():
     log = []
     code, out = _stub_device_gate({}, call_log=log)
     assert code == 0, (code, out[-500:])
-    for required in ("environment_preflight", "deployment_verify",
-                     "device_occupancy"):
-        assert required in log, (
-            "%s was never called; this run cannot have checked what it claims: %r"
-            % (required, log))
-    assert log.index("environment_preflight") == 0, (
-        "the preflight must be FIRST so occupancy can reuse its environment: %r" % log)
-    assert log.index("environment_preflight") < log.index("deployment_verify"), (
-        "deployment_verify must follow the preflight: %r" % log)
-    assert log.index("deployment_verify") < log.index("device_occupancy"), (
-        "occupancy must follow deployment_verify: %r" % log)
+    print("      actual call order:", log)
+    _assert_wiring_order(log)
 
 
 def _mutant_gate(mutator):
@@ -1560,26 +1606,128 @@ def _call_site(source, name, index=0, same_scope_as=None):
     return chr(10).join(source.splitlines()[start - 1:end])
 
 
+#: A path the test owns. The mutant must never be able to touch the canonical
+#: team lock, which lives at TEAM_LOCK_PATH and coordinates the whole team.
+_TEST_LOCK_PATH = "/tmp/.tf-test-lock-not-the-team-lock"
+
+
 def _run_under(mutant_gate):
-    """Run the stub harness against a mutant module; return the call log."""
-    saved = G.gate_device
+    """Run the stubbed harness against a mutant module; return (log, acquisitions).
+
+    THE STUBS MUST GO INTO THE MUTANT'S OWN NAMESPACE. A mutant is exec'd as a
+    SEPARATE module object, so its `gate_device` resolves `environment_preflight`,
+    `deployment_verify` and `device_occupancy` from ITS OWN globals. Patching `G`
+    alone reached nothing: the captured log came back EMPTY, both mutation
+    controls skipped their assertions on `if log`, and they were therefore
+    INCAPABLE of failing -- a vacuous green, exactly the defect class these
+    controls exist to prevent.
+
+    The lease is stubbed for a second, independent reason: without it the mutant
+    creates and releases the CANONICAL team lock (/home/.tf_device0.lock) on every
+    suite run, so a test could block a teammate. That is asserted, not assumed.
+    """
     log = []
+    # Counts REAL lock acquisitions. The lease stub below records separately, so
+    # "the stub ran" can never be mistaken for "the team lock was taken" -- the two
+    # are opposite outcomes and conflating them inverts the assertion.
+    acquisitions = []
+    stub_leases = []
+
+    class _Lease:
+        """Yields the lease RECORD the Gate expects (a dict), not None.
+
+        Returning None made gate_device raise AttributeError on `lease.get(...)`,
+        which the per-mutant `except Exception` then swallowed -- so the log stayed
+        empty and the control looked merely "unobservable" rather than broken.
+        """
+
+        def __enter__(self):
+            stub_leases.append(1)
+            return {"held": True, "stubbed": True, "canonical": False}
+
+        def __exit__(self, *exc):
+            return False
+
+    stubs = _stub_defaults(call_log=log)
+    for name, value in stubs.items():
+        if name in mutant_gate.__dict__:
+            setattr(mutant_gate, name, value)
+    # Belt and braces: if the mutant reads the path directly, point it at a path
+    # this test owns, so a stub regression still cannot grab the team lock.
+    if "DEVICE_LOCK_PATH" in mutant_gate.__dict__:
+        mutant_gate.DEVICE_LOCK_PATH = _TEST_LOCK_PATH
+    if "device_lock_lease" in mutant_gate.__dict__:
+        mutant_gate.device_lock_lease = _Lease
+
+    # Evidence that the CANONICAL lock was never touched: its mtime must not move.
+    # The stub counters alone cannot prove this -- they prove the stub was reached,
+    # which is desirable but not the same claim.
+    canonical = getattr(G, "TEAM_LOCK_PATH", None)
+    before = _mtime(canonical)
+    import contextlib
+    import io
+    # Call the MUTANT's gate_device directly. Routing through _stub_device_gate
+    # was the original defect: it re-stubs `G` and then runs `G.gate_device`, whose
+    # globals are G's, so the mutant's own code (and its call log) was never
+    # exercised at all -- which is why the log came back empty.
+    buffer = io.StringIO()
     try:
-        G.gate_device = mutant_gate.gate_device
-        try:
-            _stub_device_gate({}, call_log=log)
-        except Exception:  # noqa: BLE001 - a refusal is a legitimate outcome
-            pass
+        with contextlib.redirect_stdout(buffer):
+            mutant_gate.gate_device(cfg(), "1", None)
+    except Exception:  # noqa: BLE001 - a refusal is a legitimate outcome
+        pass
     finally:
-        G.gate_device = saved
-    return log
+        buffer.getvalue()
+    after = _mtime(canonical)
+    assert before == after, (
+        "the mutant run TOUCHED the canonical team lock (%r: %r -> %r). A test run "
+        "must never take it." % (canonical, before, after))
+    # Announce the lease reachability, so a future regression that stops installing
+    # the stub is visible in the output rather than silently reintroducing the hazard.
+    if not stub_leases:
+        print("      NOTE: the lease stub was never entered (the mutant may not lease)")
+    return log, acquisitions
+
+
+def _mtime(path):
+    """mtime of path, or None when it does not exist."""
+    import os
+    if path is None:
+        return None
+    try:
+        return os.stat(str(path)).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _assert_wiring_order(log):
+    """The ordered-wiring contract, factored out so mutations can run the SAME rule.
+
+    Raises AssertionError when the order is wrong or a mandatory call is missing.
+    Sharing one implementation is the point: a mutation test that re-implemented the
+    rule could pass while the real assertion was broken.
+    """
+    assert log, ("the call log is EMPTY, so nothing was observed and every "
+                 "ordering claim below would be vacuous")
+    for required in ("environment_preflight", "deployment_verify",
+                     "device_occupancy"):
+        assert required in log, (
+            "%s was never called; this run cannot have checked what it claims: %r"
+            % (required, log))
+    assert log.index("environment_preflight") == 0, (
+        "the preflight must be FIRST so occupancy can reuse its environment: %r" % log)
+    assert log.index("environment_preflight") < log.index("deployment_verify"), (
+        "deployment_verify must follow the preflight: %r" % log)
+    assert log.index("deployment_verify") < log.index("device_occupancy"), (
+        "occupancy must follow deployment_verify: %r" % log)
 
 
 def test_wiring_mutation_occupancy_hoisted_above_preflight_is_caught():
-    """Mutation: move the occupancy read ABOVE the preflight. Must be caught.
+    """Mutation: move the occupancy read ABOVE the preflight. MUST be caught.
 
-    This is the exact defect the ordering test exists for. Without it, the order
-    assertion only ever sees correct code and nothing shows it can fail.
+    The mutant runs with its own stubs installed in ITS namespace, so the log is
+    real. Without that the log came back empty and this control could never fail --
+    a vacuous green.
     """
     def hoist(source):
         # The BEFORE sample, which lives in the same scope as the preflight; the
@@ -1591,23 +1739,46 @@ def test_wiring_mutation_occupancy_hoisted_above_preflight_is_caught():
         assert call and preflight, (call, preflight)
         # Both are whole STATEMENTS and may span lines, so they must be replaced as
         # text blocks; a line-oriented replace would leave a dangling continuation.
+        #
+        # The hoisted call must NOT reference env_facts: that name is produced by
+        # the preflight, so a literal hoist raises NameError, the per-mutant handler
+        # swallows it, and the log comes back EMPTY -- the control would then look
+        # merely unobservable instead of catching the reordering. Substituting {}
+        # models the real defect exactly: occupancy read WITHOUT the preflight
+        # environment, which is the property this mechanism exists to protect.
+        detached = call.replace("env_facts", "{}")
+        assert detached != call, "the occupancy call did not reference env_facts"
         indent = call[:len(call) - len(call.lstrip())]
         without = source.replace(call, indent + "pass  # occupancy hoisted", 1)
         assert without != source, "could not remove the occupancy call"
-        hoisted = without.replace(preflight, call + chr(10) + preflight, 1)
+        hoisted = without.replace(preflight, detached + chr(10) + preflight, 1)
         assert hoisted != without, "could not re-insert the occupancy call"
         return hoisted
 
-    log = _run_under(_mutant_gate(hoist))
-    if log:
-        assert ("environment_preflight" not in log
-                or log.index("device_occupancy") > log.index("environment_preflight")), (
-            "occupancy ran before the preflight and the harness did not notice: %r"
-            % log)
+    log, acquisitions = _run_under(_mutant_gate(hoist))
+    assert not acquisitions, (
+        "the mutant run took a real device lock; the lease stub did not reach the "
+        "mutant namespace: %r" % (acquisitions,))
+    print("      hoist call_log:", log)
+    assert log, "the hoisted mutant produced an EMPTY log, so nothing was observed"
+    # The defect is genuinely present: occupancy is now recorded BEFORE the preflight.
+    assert log.index("device_occupancy") < log.index("environment_preflight"), (
+        "the hoist did not actually reorder the calls, so this control proves "
+        "nothing: %r" % log)
+    # And the shared contract rejects it, naming the reason.
+    try:
+        _assert_wiring_order(log)
+    except AssertionError as error:
+        assert "must be FIRST" in str(error), (
+            "the mutant was rejected for the wrong reason: %s" % error)
+    else:
+        raise AssertionError(
+            "CAUGHT NOTHING: occupancy ran before the preflight and the ordering "
+            "contract ACCEPTED it: %r" % log)
 
 
 def test_wiring_mutation_skipped_preflight_is_caught():
-    """Mutation: delete the preflight call entirely. Must be caught.
+    """Mutation: delete the preflight call entirely. MUST be caught.
 
     A skipped preflight means the environment was never established, so any later
     success describes a different machine than the one claimed.
@@ -1615,17 +1786,87 @@ def test_wiring_mutation_skipped_preflight_is_caught():
     def drop(source):
         call = _call_site(source, "environment_preflight")
         assert call, "the preflight call was not found"
-        # Keep the leading whitespace: replacing the whole LINE with "pass" would
-        # dedent it and raise IndentationError, so the mutant would die at import
-        # and this control would "catch" a syntax error instead of the skipped
-        # preflight -- a crash standing in for a finding.
+        # Replace the call with FORGED facts rather than `pass`. Two traps avoided:
+        # (a) replacing the line with bare `pass` drops its indentation and the
+        # mutant dies at import with IndentationError; (b) leaving env_facts
+        # unassigned raises NameError further down. Either way the control would
+        # "catch" a crash instead of the missing preflight. Forging the facts is
+        # also the more dangerous real defect: the run proceeds AS IF the
+        # environment had been verified.
         indent = call[:len(call) - len(call.lstrip())]
-        return source.replace(call, indent + "pass", 1)
+        assert "=" in call, "the preflight call is not an assignment: %r" % call
+        target = call.split("=", 1)[0].strip()
+        # ONE line on purpose: a multi-line literal has to reproduce the original
+        # indentation exactly, and getting that wrong yields a SyntaxError that the
+        # control then reports as a "find" -- a crash impersonating a detection.
+        forged = (indent + target
+                  + " = {'env': {}, 'libraries': {}, 'smi_probe_exit': 0,"
+                  + " 'ascend_home_path': '/cann'}  # FORGED: preflight never ran")
+        return source.replace(call, forged, 1)
 
-    log = _run_under(_mutant_gate(drop))
+    log, acquisitions = _run_under(_mutant_gate(drop))
+    assert not acquisitions, (
+        "the mutant run took a real device lock: %r" % (acquisitions,))
+    print("      drop call_log:", log)
+    assert log, ("the preflight-less mutant produced an EMPTY log, so nothing was "
+                 "observed and this control could never fail")
     assert "environment_preflight" not in log, (
         "the preflight call was neutralised yet still reported as called, so the "
         "call log cannot be trusted: %r" % log)
+    try:
+        _assert_wiring_order(log)
+    except AssertionError as error:
+        assert "environment_preflight was never called" in str(error), (
+            "the mutant was rejected for the wrong reason: %s" % error)
+    else:
+        raise AssertionError(
+            "CAUGHT NOTHING: the preflight was deleted and the ordering contract "
+            "ACCEPTED the run: %r" % log)
+
+
+def test_wiring_no_op_mutation_is_NOT_caught():
+    """THE VACUITY CONTROL: a behaviour-preserving mutation must NOT be caught.
+
+    Without this, "the mutation was caught" is satisfied by a contract that rejects
+    everything. This mutant changes the source (so it passes the mutator guard) but
+    not the behaviour, and the ordering contract must ACCEPT it.
+    """
+    def no_op(source):
+        # A real textual change, no behavioural change.
+        return source + chr(10) + "# behaviour-preserving no-op mutation"
+
+    log, acquisitions = _run_under(_mutant_gate(no_op))
+    assert not acquisitions, (
+        "the no-op mutant run took a real device lock: %r" % (acquisitions,))
+    print("      no-op call_log:", log)
+    assert log, "the no-op mutant produced an EMPTY log, so this control is vacuous"
+    _assert_wiring_order(log)  # must NOT raise
+
+
+def test_wiring_mutant_run_never_takes_the_team_lock():
+    """A test must never acquire the canonical team lock that coordinates the team.
+
+    The mutants execute real gate_device code, so without a lease stub they would
+    create and release /home/.tf_device0.lock on every suite run and could block a
+    teammate. Asserted explicitly rather than assumed to be stubbed.
+    """
+    def identity(source):
+        return source + chr(10) + "# touched only"
+
+    # Evidence, in the output rather than only in an assertion.
+    canonical = G.TEAM_LOCK_PATH
+    before = _mtime(canonical)
+    _log, acquisitions = _run_under(_mutant_gate(identity))
+    after = _mtime(canonical)
+    print("      canonical lock: %r mtime %r -> %r (unchanged=%s)"
+          % (str(canonical), before, after, before == after))
+    print("      real lock acquisitions during mutant run: %d" % len(acquisitions))
+    assert before == after, (
+        "the mutant run modified the canonical team lock %r; a test run must never "
+        "take it" % (str(canonical),))
+    assert not acquisitions, (
+        "mutant runs acquired the device lock %d time(s); a test run must never take "
+        "the team lock" % len(acquisitions))
 
 def test_negative_image_drift_with_IMAGE_only():
     """(6a) Contract states the image by TAG; a different tag is drift."""
