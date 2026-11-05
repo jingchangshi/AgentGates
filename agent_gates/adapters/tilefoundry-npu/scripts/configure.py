@@ -187,6 +187,11 @@ def gather_facts() -> dict:
             "rollback_prefix_path": str(E.ROLLBACK_PREFIX),
             "expected_tilelang_wheel_version": E.TILELANG_WHEEL_VERSION,
             "tilelang_source_commit": E.TILELANG_COMMIT,
+            # RECORDED, never used to decide pass: a pass obtained with the source
+            # tree prepended is not a pass about the deployed wheel.
+            "source_tree_prepended": (os.environ.get(E.SOURCE_TREE_PREPENDED_ENV) == "1"
+                                     or E.source_tree_allowed()),
+            "allow_source_tree_env": E.ALLOW_SOURCE_TREE_ENV,
         },
         "interpreter": str(E.interpreter()),
         "interpreter_exists": _interpreter_ready(),
@@ -237,6 +242,10 @@ def _findings(facts: dict) -> int:
             % facts.get("interpreter"),
             file=sys.stderr,
         )
+        return 1
+    env_facts = facts.get("env") or {}
+    if env_facts.get("source_tree_prepended"):
+        print("SOURCE TREE ENABLED: " + str(env_facts.get("allow_source_tree_env")) + "=1 -- the import path prepends the tilelang checkout, so this environment must not be reported as verified. Unset it and re-run.", file=sys.stderr)
         return 1
     cann = facts.get("cann") or {}
     if not cann.get("sourced"):

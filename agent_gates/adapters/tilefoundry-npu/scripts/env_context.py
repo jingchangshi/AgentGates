@@ -138,20 +138,51 @@ def interpreter() -> Path:
 
 
 def python_path_entries() -> list[str]:
-    """Entries the shared prefix must see. tilelang FIRST so its own tree wins."""
+    """The PYTHONPATH entries a deployment run needs, WITHOUT any tilelang tree.
+
+    This used to put TILELANG_ROOT first "so the tree wins". That was the defect:
+    the checks resolved the installed wheel while every real run resolved the
+    checkout, so a green check said nothing about what ran. tilelang must come from
+    the prefix site-packages; the tree is available only through the explicit
+    TFNU_ALLOW_SOURCE_TREE escape hatch below.
+    """
     return [
-        str(TILELANG_ROOT),
         str(TF_ROOT / "src"),
         str(TF_ROOT / "targets" / "ascend"),
     ]
 
 
-def runtime_env(base: dict | None = None, *, with_cann: bool = True) -> dict:
+ALLOW_SOURCE_TREE_ENV = "TFNU_ALLOW_SOURCE_TREE"
+SOURCE_TREE_PREPENDED_ENV = "TFNU_SOURCE_TREE_PREPENDED"
+
+
+def source_tree_allowed(explicit: "bool | None" = None) -> bool:
+    """Whether the tilelang TREE may be prepended. Off unless explicitly enabled."""
+    if explicit is not None:
+        return bool(explicit)
+    return (os.environ.get(ALLOW_SOURCE_TREE_ENV) or "").strip() == "1"
+
+
+def import_path(allow_source_tree: bool = False) -> list[str]:
+    """The one definition of the deployment import path.
+
+    runtime_env() and probe_env() both call THIS, so they cannot disagree about
+    which tilelang an import resolves -- the disagreement was the bug.
+    """
+    entries = python_path_entries()
+    if allow_source_tree:
+        entries = [str(TILELANG_ROOT)] + entries
+    return entries
+
+
+def runtime_env(base: dict | None = None, *, with_cann: bool = True,
+               allow_source_tree: "bool | None" = None) -> dict:
     """The environment the deployment interpreter must be given.
 
     Four pins, each with a reason:
-      - PYTHONPATH carries the tilelang TREE: the wheel installs the package, but
-        the tree entry is what makes the pinned revision win over a stale copy.
+      - PYTHONPATH does NOT carry the tilelang tree: tilelang resolves from the
+        prefix site-packages. TFNU_ALLOW_SOURCE_TREE=1 opts into the tree for
+        development, and records TFNU_SOURCE_TREE_PREPENDED=1 so it is visible.
       - TORCH_DEVICE_BACKEND_AUTOLOAD=0 is REQUIRED here: with it on, torch's own
         autoload raises on torch_npu before this process can say anything useful.
       - CANN sourced, because torch_npu imports libhccl.so at import time.
@@ -160,8 +191,19 @@ def runtime_env(base: dict | None = None, *, with_cann: bool = True) -> dict:
         would look like work while changing nothing.
     """
     env = dict(os.environ if base is None else base)
-    env["PYTHONPATH"] = os.pathsep.join(python_path_entries())
+    # The switch is read from the environment this call is BUILDING, not from the
+    # process-wide one: a caller that passes an explicit base must get the base's
+    # answer, or the flag would silently disagree with the path it describes.
+    if allow_source_tree is None:
+        allow_tree = (env.get(ALLOW_SOURCE_TREE_ENV) or "").strip() == "1"
+    else:
+        allow_tree = bool(allow_source_tree)
+    env["PYTHONPATH"] = os.pathsep.join(import_path(allow_tree))
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    # Recorded so a run can say WHICH mode it was in. This flag must never be used
+    # to decide pass/fail: a pass obtained with the source tree is not a pass about
+    # the deployed wheel.
+    env[SOURCE_TREE_PREPENDED_ENV] = "1" if allow_tree else "0"
     env.pop("LD_LIBRARY_PATH_FOR_TILELANG", None)
     if with_cann:
         env["TFNU_SOURCE_CANN"] = CANN_SET_ENV
@@ -266,10 +308,11 @@ def probe_env(base: dict | None = None) -> dict:
     nothing about the wheel that a real run imports. An environment check that
     inspects a different artefact than the one deployed is a vacuous pass.
     """
-    env = runtime_env(base, with_cann=False)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [entry for entry in python_path_entries() if entry != str(TILELANG_ROOT)]
-    )
+    env = runtime_env(base, with_cann=False, allow_source_tree=False)
+    env["PYTHONPATH"] = os.pathsep.join(import_path(False))
+    # Stated, not inherited: the probe never resolves a checkout, so this flag is
+    # always 0 here even when TFNU_ALLOW_SOURCE_TREE=1 is set for a development run.
+    env[SOURCE_TREE_PREPENDED_ENV] = "0"
     env["TFNU_EXPECTED_PREFIX"] = str(SHARED_PREFIX)
     # The expected version follows the SELECTED prefix: a rebuilt wheel (main 0e687c17
     # vs feat 8e2d3c82) reports a different git suffix, and hard-coding one would fail
@@ -278,6 +321,52 @@ def probe_env(base: dict | None = None) -> dict:
         os.environ.get("TFNU_EXPECTED_TILELANG_VERSION") or TILELANG_WHEEL_VERSION
     )
     return env
+
+
+class ResolutionError(RuntimeError):
+    """A named refusal: the interpreter resolved tilelang somewhere it must not."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__("%s: %s" % (code, message))
+        self.code = code
+
+
+def assert_tilelang_from_prefix(env: dict | None = None, timeout: int = 300,
+                              prefix: "str | None" = None) -> dict:
+    """Run an import under *env* and require tilelang to resolve inside the prefix.
+
+    This is the executable form of the rule the checks and the runs must share. A
+    source-tree resolution is refused by NAME (TILELANG_RESOLVES_TO_SOURCE_TREE)
+    rather than accepted because it happened to import.
+    """
+    env = runtime_env() if env is None else env
+    code = "import json,os,tilelang;print(json.dumps(dict(file=tilelang.__file__,resolved=os.path.realpath(tilelang.__file__),version=getattr(tilelang,'__version__',None))))"
+    done = subprocess.run([str(interpreter()), "-c", code], capture_output=True,
+                          text=True, timeout=timeout, env=env, cwd="/tmp")
+    payload = None
+    for line in reversed((done.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                payload = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if payload is None:
+        tail = (done.stderr or done.stdout or "").strip()[-400:] or "no output"
+        raise ResolutionError("TILELANG_IMPORT_FAILED", tail)
+    prefix = os.path.realpath(str(prefix or SHARED_PREFIX))
+    payload["expected_prefix"] = prefix
+    payload["in_prefix"] = payload["resolved"].startswith(prefix + os.sep)
+    payload["source_tree_prepended"] = env.get(SOURCE_TREE_PREPENDED_ENV)
+    if not payload["in_prefix"]:
+        looks_like_tree = os.path.isfile(
+            os.path.join(os.path.dirname(os.path.dirname(payload["resolved"])), "VERSION"))
+        raise ResolutionError(
+            "TILELANG_RESOLVES_TO_SOURCE_TREE" if looks_like_tree else "TILELANG_NOT_FROM_PREFIX",
+            "%r is not under %r (source_tree_prepended=%s)"
+            % (payload["resolved"], prefix, env.get(SOURCE_TREE_PREPENDED_ENV)))
+    return payload
 
 
 def probe_source_file() -> Path:
@@ -672,6 +761,12 @@ __all__ = [
     "TOOLCHAIN",
     "probe_toolchain",
     "ROLLBACK_PREFIX",
+    "ALLOW_SOURCE_TREE_ENV",
+    "SOURCE_TREE_PREPENDED_ENV",
+    "ResolutionError",
+    "assert_tilelang_from_prefix",
+    "import_path",
+    "source_tree_allowed",
     "prefix_is_rollback",
     "REQUIRED_TOOLS",
     "TILELANG_Z3_REQUIREMENT",
