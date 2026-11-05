@@ -122,6 +122,51 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def record_kernel_artifacts(kernel, out_dir, facts: dict) -> None:
+    """Export the compiled kernel and hash the REAL bytes on disk.
+
+    "The compile exited 0" is not an artefact. This writes the Ascend C source and
+    the linked library and records their sha256, along with the device/host sources
+    the adapter produced. ENV-05 asks for the produced artifact hash; that has to be
+    a hash of a file, not a flag.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+    for label, filename, kind in (
+            ("ascend_c_source", "kernel_source.c", "sources"),
+            ("linked_library", "kernel.lib", "library")):
+        path = out_dir / filename
+        try:
+            if kind == "sources":
+                kernel.export_sources(str(path))
+            else:
+                kernel.export_library(str(path))
+        except Exception as exc:  # noqa: BLE001
+            artifacts[label] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+            continue
+        if path.is_file():
+            data = path.read_bytes()
+            artifacts[label] = {"path": str(path), "bytes": len(data),
+                                "sha256": sha256_bytes(data)}
+        else:
+            artifacts[label] = {"error": "export produced no file at %s" % path}
+    facts["compiled_artifacts"] = artifacts
+
+    def _source(label, getter):
+        try:
+            text = getter() or ""
+        except Exception as exc:  # noqa: BLE001
+            facts["%s_error" % label] = "%s: %s" % (type(exc).__name__, exc)
+            return
+        facts["%s_chars" % label] = len(text)
+        facts["%s_sha256" % label] = sha256_bytes(text.encode())
+
+    _source("devicesource", lambda: kernel.adapter.get_device_source())
+    _source("hostsource", lambda: kernel.adapter.get_host_source())
+    _source("kernelsource", lambda: getattr(kernel, "kernel_source", "") or "")
+
+
 def bounded_run(argv, timeout, kill_grace=5, env=None):
     """Run *argv* with a bound that survives an UNKILLABLE child.
 
@@ -660,7 +705,13 @@ def main(argv=None) -> int:
             return "FAIL", "CACHE_NOT_EMPTY", \
                 "a cache hit could fake a compile: %r" % (before[:5],), facts, EXIT_FAIL
         os.environ["TILELANG_CACHE_DIR"] = str(cache)
+        facts["cache_enabled_before_disable"] = bool(tilelang.is_cache_enabled())
         tilelang.disable_cache()
+        # EVIDENCE, not a flag we set ourselves: ask the library whether the cache
+        # is still enabled after the call. A field saying "disabled" would prove
+        # only that we assigned it.
+        facts["cache_enabled_after_disable"] = bool(tilelang.is_cache_enabled())
+        facts["disable_cache_invoked"] = True
         started_compile = time.time()
         kernel = tilelang.compile(vadd_one(N_LANES), target="ascend", out_idx=-1)
         facts["compile_seconds"] = round(time.time() - started_compile, 2)
@@ -668,9 +719,24 @@ def main(argv=None) -> int:
         facts["kernel_source_chars"] = len(source)
         facts["kernel_source_sha256"] = sha256_bytes(source.encode())
         facts["adapter"] = type(getattr(kernel, "adapter", None)).__name__
+        record_kernel_artifacts(kernel, run_dir / "compile_artifacts", facts)
+        # FILES only: tilelang creates empty staging DIRECTORIES even when the cache
+        # is disabled, and counting those as "a cache write" would fail a correct
+        # run. A cached kernel is a FILE, and that is what must not exist.
+        cache_after = sorted(str(p.relative_to(cache)) for p in cache.rglob("*")
+                             if p.is_file())
+        facts["cache_entries_after"] = cache_after
+        facts["cache_remained_empty"] = not cache_after
         if not source:
             # FINISHED is not PASS: a compile that produced no source proves nothing.
             return "FAIL", "COMPILE_PRODUCED_NO_SOURCE", "empty kernel source", facts, EXIT_FAIL
+        if facts["cache_enabled_after_disable"]:
+            return "FAIL", "CACHE_NOT_DISABLED",                 "tilelang.is_cache_enabled() is still True after disable_cache()", facts, EXIT_FAIL
+        if cache_after:
+            return "FAIL", "COMPILE_WROTE_CACHE",                 "a disabled cache still received %d entries: %r" % (len(cache_after), sorted(cache_after)[:5]), facts, EXIT_FAIL
+        for label in ("ascend_c_source", "linked_library"):
+            if not (facts["compiled_artifacts"].get(label) or {}).get("sha256"):
+                return "FAIL", "ARTIFACT_EXPORT_FAILED",                     "no %s artefact was produced: %r" % (label, facts["compiled_artifacts"].get(label)), facts, EXIT_FAIL
         report["kernel_source_sha256"] = facts["kernel_source_sha256"]
         return "PASS", None, None, facts, EXIT_PASS
 
@@ -714,7 +780,10 @@ def main(argv=None) -> int:
 
         torch.npu.set_device(selection["logical_index"])
         facts["device_name"] = torch.npu.get_device_name(selection["logical_index"])
+        started_compile = time.time()
         kernel = tilelang.compile(vadd_one(N_LANES), target="ascend", out_idx=-1)
+        facts["device_compile_seconds"] = round(time.time() - started_compile, 2)
+        record_kernel_artifacts(kernel, run_dir / "device_artifacts", facts)
         host_in = np.arange(N_LANES, dtype=np.float32) + 0.5
         expected = (host_in + np.float32(1.0)).astype(np.float32)
         if args.inject_error:
@@ -724,9 +793,22 @@ def main(argv=None) -> int:
             expected[7] = np.nextafter(expected[7], np.float32(1e9))
             facts["injected_error"] = "one ulp on reference lane 7"
         tensor = torch.from_numpy(host_in.copy()).to("npu:%d" % selection["logical_index"])
+        facts["launch"] = "kernel(tensor) on npu:%d" % selection["logical_index"]
         produced = kernel(tensor)
         torch.npu.synchronize()
+        facts["synchronize_called"] = True
         got = produced.cpu().numpy()
+        facts["elements_expected"] = int(N_LANES)
+        facts["input_elements"] = int(host_in.size)
+        facts["elements_read"] = int(got.size)
+        facts["input_nonempty"] = bool(host_in.size)
+        facts["all_elements_compared"] = bool(
+            host_in.size == got.size == expected.size == N_LANES)
+        facts["readback_source"] = "host numpy copy after torch.npu.synchronize()"
+        if not facts["all_elements_compared"] or host_in.size == 0:
+            return "FAIL", "READBACK_INCOMPLETE", \
+                ("readback is not a full comparison: expected=%d input=%d read=%d"
+                 % (getattr(expected, "size", -1), host_in.size, got.size)), facts, EXIT_FAIL
         facts["input_sha256"] = sha256_bytes(host_in.tobytes())
         facts["output_sha256"] = sha256_bytes(got.tobytes())
         facts["expected_sha256"] = sha256_bytes(expected.tobytes())
@@ -736,6 +818,10 @@ def main(argv=None) -> int:
         if bad.size:
             return "FAIL", "VADD_MISMATCH", \
                 "%d lanes differ from the host reference" % int(bad.size), facts, EXIT_FAIL
+        for label in ("ascend_c_source", "linked_library"):
+            if not (facts["compiled_artifacts"].get(label) or {}).get("sha256"):
+                return "FAIL", "DEVICE_ARTIFACT_EXPORT_FAILED", \
+                    "no device %s artefact was produced: %r" % (label, facts["compiled_artifacts"].get(label)), facts, EXIT_FAIL
         return "PASS", None, None, facts, EXIT_PASS
 
     for pid, deps, fn in (("cann", [], phase_cann),
