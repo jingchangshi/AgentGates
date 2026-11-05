@@ -42,18 +42,82 @@ def fake_result(stdout="", returncode=0):
     return types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
 
 
+#: The complete minimal configuration the device Gate needs. Deliberately
+#: explicit rather than relying on env.sh: this tool must run from a BARE SHELL.
+#:
+#: It used to pass {"TF_REPO", "CONTAINER_NAME"} only, so once the P0-A preflight
+#: landed the very first thing gate_device did was refuse with
+#: ENV_CANN_SCRIPT_MISSING -- a crash from a bare shell, not a policy finding.
+#: A test tool that needs an ambient environment is a test tool nobody can run.
+MINIMAL_CONFIG = {
+    "TF_REPO": "/tmp",
+    "CONTAINER_NAME": "fake",
+    "IMAGE": "img",
+    "CANN_ROOT": "/data/cann",
+    "CANN_SET_ENV": "/data/cann/set_env.sh",
+    "IN_CONTAINER_PYTHON": "python",
+    "CONTAINER_USER": "u",
+    "DEVICE_ID": "",
+    # RETIRED and IGNORED by the Gate; present so the "legacy keys still parse"
+    # contract is exercised with a real key rather than an invented one.
+    "TF_ALLOW_BUSY_DEVICE": "",
+}
+
+
+def _stub_container(gate, calls, occupancy, payload, exposed):
+    """Replace every container-facing dependency of gate_device.
+
+    gate_device grew mandatory preflight/identity/profile/cache steps. Each has to
+    be stubbed here for the two-state comparison to reach the verdict at all; the
+    assertions in main() then still prove busy and idle produce the SAME result.
+    """
+    gate.assert_not_host = lambda *args: None
+    gate.container_exists = lambda config: True
+    gate.in_container_python = lambda config: "python"
+    gate.environment_preflight = lambda config: {
+        "env": {"LD_LIBRARY_PATH": "/cann/lib64", "ASCEND_HOME_PATH": "/cann",
+                "PATH": "/usr/bin"},
+        "libraries": {}, "smi_probe_exit": 0, "ascend_home_path": "/cann"}
+    gate.deployment_verify = lambda config, ids, evidence: {
+        "verified": True, "verified_scope": "char-nodes-only",
+        "nodes": {"/dev/davinci0": "CHAR", "/dev/davinci1": "CHAR",
+                  "/dev/davinci_manager": "CHAR", "/dev/hisi_hdc": "CHAR"}}
+    gate.capture_runtime_identity = lambda config, python, env: {
+        "acceptable": True, "failures": [], "version": "3.12.0",
+        "executable": "/usr/bin/python3", "pythonpath": "/p",
+        "torch_backend_autoload": None,
+        "modules": {"torch": {"imported": True, "version": "2.12.0",
+                              "file": "/t.py", "file_sha256": "aa"},
+                    "torch_npu": {"imported": True, "version": "2.12.0",
+                                  "file": "/n.py", "file_sha256": "bb"}}}
+    gate.capture_compile_profile = lambda config, python, env: {
+        "digest": "deadbeef", "roots": {}, "libraries": {}, "tools": {}}
+    gate.prepare_empty_cache = lambda config, path: {
+        "cache_dir": path, "empty_at_start": True, "disable_cache": True}
+    gate.device_occupancy = lambda config, ids, facts: (occupancy, "npu-smi raw")
+
+    def exec_(config, argv, **kwargs):
+        calls.append(list(argv))
+        if argv[:3] == ["sh", "-c", "ls /dev/davinci* 2>/dev/null"]:
+            return fake_result(exposed)
+        return fake_result(payload)
+
+    gate.container_exec = exec_
+
+
 def exercise(busy):
     gate = load_gate()
     calls = []
     exposed = "/dev/davinci0\n/dev/davinci1\n/dev/davinci_manager\n"
+    # The payload reports NUMBERS, not a verdict: the host recomputes it. An "ok"
+    # flag here would model the very self-report the Gate no longer trusts.
     payload = json.dumps({
         "devices": [
             {"logical": 0, "physical": 0, "device_name": "dev0", "count": 1024,
-             "sum": 3072.0, "ok": True},
+             "sum": 3072.0},
             {"logical": 1, "physical": 1, "device_name": "dev1", "count": 1024,
-             "sum": 3072.0, "ok": True},
+             "sum": 3072.0},
         ],
-        "all_ok": True,
     })
     def record(is_busy):
         rows = ["| 0 | 123 | other | 100 |"] if is_busy else []
@@ -64,20 +128,45 @@ def exercise(busy):
                 "scope": "container-pid-namespace",
                 "process_rows": rows}
     occupancy = {0: record(busy), 1: record(False)}
-    gate.assert_not_host = lambda *args: None
-    gate.container_exists = lambda config: True
-    gate.in_container_python = lambda config: "python"
-    gate.device_occupancy = lambda config, ids: (occupancy, "npu-smi raw")
-    def exec_(config, argv, **kwargs):
-        calls.append(list(argv))
-        if argv[:3] == ["sh", "-c", "ls /dev/davinci* 2>/dev/null"]:
-            return fake_result(exposed)
-        return fake_result(payload)
-    gate.container_exec = exec_
+    _stub_container(gate, calls, occupancy, payload, exposed)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        rc = gate.gate_device({"TF_REPO": "/tmp", "CONTAINER_NAME": "fake"}, "0,1", None)
+        rc = gate.gate_device(dict(MINIMAL_CONFIG), "0,1", None)
     return rc, calls, out.getvalue(), occupancy
+
+
+def _write_partial_env(omit):
+    """Write a complete env file with one key omitted; return its path."""
+    import tempfile
+    lines = []
+    for key, value in MINIMAL_CONFIG.items():
+        if key == omit:
+            continue
+        lines.append("%s=%s" % (key, value))
+    handle = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+    handle.write("\n".join(lines) + "\n")
+    handle.close()
+    return Path(handle.name)
+
+
+def refuse_reason(config, argv=None):
+    """Return (exit_code, message) for a configuration that must be REFUSED.
+
+    GateError is what the Gate raises for a bad configuration, but this tool must
+    not die with a raw traceback from a bare shell: it reports the refusal and
+    keeps going. A missing key must surface as a USAGE error naming the key, not
+    as an internal exception with a container stack trace.
+    """
+    gate = load_gate()
+    try:
+        gate.load_config  # noqa: B018 - existence check only
+    except AttributeError:
+        pass
+    try:
+        code = gate.gate_device(dict(config), "0,1", None)
+    except gate.GateError as error:
+        return error.code, str(error)
+    return code, ""
 
 
 def audit_source(source: str):
@@ -157,17 +246,38 @@ def main():
              and isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "pop"}]
     check(not reads and not calls,
           "the retired exclusive/busy keys are never read (%r, %r)" % (reads, calls))
-    injected_wait = source.replace(
-        "    occupancy, occupancy_raw = device_occupancy(config, device_ids)",
-        "    time.sleep(5)  # injected idle wait\n"
-        "    occupancy, occupancy_raw = device_occupancy(config, device_ids)", 1)
-    check(bool(audit_source(injected_wait)), "an injected sleep is detected")
-    injected_skip = source.replace(
-        "    occupancy, occupancy_raw = device_occupancy(config, device_ids)",
-        "    occupancy, occupancy_raw = device_occupancy(config, device_ids)\n"
-        "    if occupancy[device_ids[0]][\"occupied\"]:\n"
-        "        return EXIT_PASS  # injected busy skip", 1)
-    check(bool(audit_source(injected_skip)), "an injected busy skip is detected")
+    # The injection anchor is DERIVED from the source, not hardcoded: a hardcoded
+    # signature silently stopped matching when device_occupancy gained the preflight
+    # argument, so the two controls below "detected nothing" while reporting a pass,
+    # and the injected source was byte-identical to the clean one.
+    anchor = next((line for line in source.splitlines()
+                   if "device_occupancy(config, device_ids" in line), None)
+    if anchor is None:
+        # The call site was renamed or moved. Say so plainly instead of crashing:
+        # this tool must never die with a TypeError from its own instrumentation,
+        # because that looks like a defect in the Gate rather than in the harness.
+        check(False, "the occupancy call site is findable for injection "
+                    "(device_occupancy(config, device_ids...) not found; the two "
+                    "controls below cannot run, so they prove nothing)")
+        indent = "    "
+    else:
+        check(True, "the occupancy call site is findable for injection")
+        indent = anchor[:len(anchor) - len(anchor.lstrip())]
+
+    if anchor is not None:
+        injected_wait = source.replace(
+            anchor,
+            indent + "time.sleep(5)  # injected idle wait" + chr(10) + anchor, 1)
+        check(injected_wait != source,
+              "the sleep injection actually changed the source")
+        check(bool(audit_source(injected_wait)), "an injected sleep is detected")
+        injected_skip = source.replace(
+            anchor,
+            anchor + chr(10) + indent + "if occupancy[device_ids[0]][\"occupied\"]:"
+            + chr(10) + indent + "    return EXIT_PASS  # injected busy skip", 1)
+        check(injected_skip != source,
+              "the skip injection actually changed the source")
+        check(bool(audit_source(injected_skip)), "an injected busy skip is detected")
 
     # Occupancy parsing must separate the health table from the process table. A
     # dump with "No running processes" is idle; a dump with a process row is
@@ -214,16 +324,30 @@ def main():
                     bad.append((node.lineno, test.strip()))
         check(not bad, "no occupied/busy branch controls refusal, skip, or return: %r" % bad)
 
-    busy_rc, busy_calls, busy_out, _ = exercise(True)
-    idle_rc, idle_calls, idle_out, _ = exercise(False)
+    # A stub that stops matching must produce a FAIL, not an uncaught crash. Without
+    # this, removing any single stub killed the tool with GateError and the run showed
+    # "0 failures" with rc=1 -- indistinguishable from a clean pass at a glance.
+    try:
+        busy_rc, busy_calls, busy_out, _ = exercise(True)
+        idle_rc, idle_calls, idle_out, _ = exercise(False)
+    except Exception as error:  # noqa: BLE001
+        check(False, "the two-state harness could not run (%s: %s). A stub no longer "
+                     "matches the Gate, so the busy/idle comparison below proves "
+                     "nothing" % (type(error).__name__, str(error)[:120]))
+        busy_rc = idle_rc = None
+        busy_calls = idle_calls = None
+        busy_out = idle_out = ""
     check(busy_rc == idle_rc, "busy and idle return the same exit code (%s/%s)"
           % (busy_rc, idle_rc))
     check(len(busy_calls) == len(idle_calls),
           "busy and idle execute the same number of work commands (%d/%d)"
           % (len(busy_calls), len(idle_calls)))
     check(busy_calls == idle_calls, "busy and idle execute the same commands")
-    busy_obj = json.loads(busy_out)
-    idle_obj = json.loads(idle_out)
+    if busy_out and idle_out:
+        busy_obj = json.loads(busy_out)
+        idle_obj = json.loads(idle_out)
+    else:
+        busy_obj = idle_obj = {"unavailable": True}
     busy_obj.pop("occupancy", None)
     idle_obj.pop("occupancy", None)
     check(busy_obj == idle_obj,
@@ -255,6 +379,65 @@ def main():
     check("RECORD" in policy.get("default", "") and "same workload" in policy.get("default", ""),
           "manifest policy is record-and-proceed")
 
+    # A BARE SHELL must be enough to run this tool, and a missing configuration key
+    # must surface as a NAMED usage error rather than an internal crash. This tool
+    # used to die with a raw GateError traceback (ENV_CANN_SCRIPT_MISSING) because
+    # exercise() supplied only TF_REPO/CONTAINER_NAME.
+    for missing in ("CANN_SET_ENV", "TF_REPO", "CONTAINER_NAME"):
+        broken = dict(MINIMAL_CONFIG)
+        broken.pop(missing, None)
+        code, message = refuse_reason(broken)
+        check(code != 0,
+              "a configuration missing %s is refused (exit %s)" % (missing, code))
+        check(message is not None and "Traceback" not in str(message),
+              "a missing %s reports a message, not a traceback" % missing)
+
+    # The refusal must NAME the missing key. Two DIFFERENT layers own two different
+    # keys, and the test must respect that instead of demanding one layer do both:
+    #   - TF_REPO / CONTAINER_NAME are structural, so load_config owns them;
+    #   - CANN_SET_ENV is an ENVIRONMENT fact, so the preflight owns it. It is
+    #     deliberately not a load_config requirement: a machine may legitimately
+    #     carry the path elsewhere for non-device work.
+    # Asking gate_device directly would test the HOST guard, not the usage error,
+    # because it refuses on the host before it ever reads the configuration.
+    for missing in ("TF_REPO", "CONTAINER_NAME"):
+        try:
+            gate.load_config(_write_partial_env(missing))
+        except gate.GateError as error:
+            check(missing in str(error),
+                  "a missing %s is named in the refusal: %r"
+                  % (missing, str(error)[:80]))
+        except Exception as error:  # noqa: BLE001
+            check(False, "a missing %s must raise GateError, got %s: %s"
+                  % (missing, type(error).__name__, str(error)[:60]))
+        else:
+            check(False, "a configuration missing %s must be refused" % missing)
+
+    try:
+        gate.environment_preflight({"CANN_SET_ENV": "", "CONTAINER_NAME": "c",
+                                    "TF_REPO": "/tmp"})
+    except gate.GateError as error:
+        check("CANN_SET_ENV" in str(error) and error.code == gate.EXIT_BLOCKED,
+              "an unset CANN_SET_ENV is named and BLOCKED_ENV: %r" % (str(error)[:70],))
+    except Exception as error:  # noqa: BLE001
+        check(False, "unset CANN_SET_ENV must raise GateError, got %s"
+              % type(error).__name__)
+    else:
+        check(False, "an unset CANN_SET_ENV must be refused")
+
+    # A bare shell really is enough: the config this tool supplies must be
+    # complete on its own. Assert every key the Gate declares as required.
+    try:
+        required = gate.REQUIRED_CONFIG_KEYS
+    except AttributeError:
+        required = None
+    if required:
+        absent = sorted(k for k in required if k not in MINIMAL_CONFIG)
+        check(not absent,
+              "MINIMAL_CONFIG supplies every required key (absent: %r)" % (absent,))
+    else:
+        for key in ("TF_REPO", "CONTAINER_NAME", "CANN_SET_ENV"):
+            check(key in MINIMAL_CONFIG, "MINIMAL_CONFIG supplies %s" % key)
     print("RESULT:", "PASS" if not FAILS else "FAILURES=%d" % len(FAILS))
     return 0 if not FAILS else 1
 
