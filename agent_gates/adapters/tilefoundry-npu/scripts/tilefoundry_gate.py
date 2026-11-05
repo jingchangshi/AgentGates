@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import math
 import hashlib
 import json
 import os
@@ -220,7 +221,19 @@ def container_exec(config: dict, argv: list, *, user: str | None = None,
     if inside_container():
         merged = dict(os.environ)
         merged.update(env or {})
-        return run(list(argv), timeout=timeout, env=merged, echo_stdout=echo_stdout)
+        # The handed-over PATH is the CONTAINER'S CANN path. That is right for the
+        # process being launched, but subprocess must FIRST resolve our own argv[0]
+        # ("sh") using the host PATH -- and a CANN-only PATH has no /usr/bin, so the
+        # call died with FileNotFoundError before the child ever started. Resolve the
+        # executable against the real host PATH, then still hand the child its own.
+        argv = list(argv)
+        resolved = shutil.which(argv[0])
+        if resolved is None:
+            raise GateError(
+                "cannot find %r on this host PATH (%s)"
+                % (argv[0], os.environ.get("PATH")), EXIT_BLOCKED)
+        argv[0] = resolved
+        return run(argv, timeout=timeout, env=merged, echo_stdout=echo_stdout)
     command = ["docker", "exec"]
     if user is not None:
         command += ["-u", user]
@@ -762,9 +775,13 @@ def build_preflight_script(cann: str, resolver: str = "loader") -> str:
         # Emit the verified environment itself. A consumer must reuse EXACTLY these
         # values; re-sourcing the script on its own is a second, unverified
         # environment and is how the discarded-result bug happened.
-        'echo "ENVVAR LD_LIBRARY_PATH=$LD_LIBRARY_PATH"',
-        'echo "ENVVAR ASCEND_HOME_PATH=$ASCEND_HOME_PATH"',
-        'echo "ENVVAR PATH=$PATH"',
+        # EVERY variable the CANN script actually exports, not a convenient subset.
+        # Capturing only LD_LIBRARY_PATH/ASCEND_HOME_PATH/PATH left ASCEND_OPP_PATH
+        # unset downstream, so torch_npu refused to import with "ASCEND_OPP_PATH
+        # environment variable is not set" -- the Gate then rejected a healthy
+        # machine. The consumer must receive the SAME environment the preflight
+        # validated, which means all of it.
+        'for __tf_var in LD_LIBRARY_PATH ASCEND_HOME_PATH PATH ASCEND_OPP_PATH ASCEND_AICPU_PATH ASCEND_TOOLKIT_HOME PYTHONPATH CMAKE_PREFIX_PATH; do echo "ENVVAR $__tf_var="$(printenv "$__tf_var"); done',
         'case ":$LD_LIBRARY_PATH:" in *":$ASCEND_HOME_PATH/lib64:"*) : ;; '
         '*) echo FAIL-LD-PATH; exit 15 ;; esac',
         # HARD RULE: ask the SAME LOADER about the SAME BINARY that must run.
@@ -1261,8 +1278,12 @@ def deployment_attest(config: dict, out_path: Path) -> int:
         "container_name": name,
         "container_id": payload.get("Id"),
         "created": created,
+        # docker inspect reports the image ID (a sha256 of its config), NOT a repo
+        # digest. Record the names as well, because the configured IMAGE is a TAG, and
+        # comparing a tag against an id would differ every time and prove nothing.
         "image": payload.get("Image"),
         "image_digest": (payload.get("Image") or ""),
+        "image_names": ([config_block.get("Image")] if config_block.get("Image") else []),
         "host_config_devices": devices,
         "mounts": mounts,
         "config_visible_devices": visible,
@@ -1459,10 +1480,48 @@ def verify_attestation(attestation: dict, config: dict, device_ids: list,
                 "writable inside this container" % ", ".join(ro_drift), EXIT_BLOCKED)
         detail["mount_linkage"] = linkage.get("checked") or []
 
-    # (6) the image must not have drifted.
-    configured = config.get("IMAGE")
-    if configured and not attestation.get("image_digest"):
-        raise GateError("ATTESTATION_INVALID: no image_digest recorded", EXIT_BLOCKED)
+    # (6) the image must not have DRIFTED. This previously only checked that SOME
+    # digest was recorded, so a container running any image was accepted as long as
+    # the attestation carried one -- review found a drifted sha256:eeee... accepted
+    # under three different configurations. Existence is not agreement, so the
+    # configured value is now actually compared.
+    #
+    # The contract value is a DIGEST (the image ID docker inspect reports). The
+    # configured IMAGE is a TAG, so it is compared against the attested tag names
+    # instead; comparing a tag with an id would differ every time and prove nothing.
+    attested_digest = attestation.get("image_digest") or ""
+    configured_digest = (config.get("IMAGE_DIGEST") or "").strip()
+    configured_name = (config.get("IMAGE") or "").strip()
+
+    if not attested_digest:
+        raise GateError(
+            "ATTESTATION_INVALID: the attestation records no image digest, so image "
+            "agreement cannot be established", EXIT_BLOCKED)
+
+    if configured_digest:
+        if not attested_digest.startswith("sha256:"):
+            raise GateError(
+                "ATTESTATION_IMAGE_DRIFT: attestation image_digest %r is not a digest"
+                % (attested_digest,), EXIT_BLOCKED)
+        if attested_digest != configured_digest:
+            raise GateError(
+                "ATTESTATION_IMAGE_DRIFT: the container runs image %s but the contract "
+                "requires %s. The deployment is stale"
+                % (attested_digest, configured_digest), EXIT_BLOCKED)
+
+    if configured_name:
+        names = [str(n) for n in (attestation.get("image_names") or [])]
+        matched = configured_name in names or any(configured_name in n for n in names)
+        if names and not matched:
+            raise GateError(
+                "ATTESTATION_IMAGE_DRIFT: the container runs image name(s) %s but the "
+                "contract requires %r. The deployment is stale"
+                % (names, configured_name), EXIT_BLOCKED)
+        if not names and not configured_digest:
+            raise GateError(
+                "ATTESTATION_IMAGE_DRIFT: the attestation names no image and no "
+                "contract digest was supplied, so image agreement cannot be established",
+                EXIT_BLOCKED)
 
     detail["container_id"] = attestation.get("container_id")
     detail["image_digest"] = attestation.get("image_digest")
@@ -1470,6 +1529,477 @@ def verify_attestation(attestation: dict, config: dict, device_ids: list,
     detail["user"] = attestation.get("user")
     detail["config_visible_devices"] = attestation.get("config_visible_devices")
     return detail
+
+# ------------------------------------------------- device result verification (P0-C)
+
+#: The workload contract. These are what the HOST recomputes; the payload's own
+#: "ok" flag is never trusted. A payload that reports sum=0, count=0 and ok=true
+#: passed the previous revision, because the only check was bool(row["ok"]).
+EXPECTED_DEVICE_COUNT = 1024
+EXPECTED_DEVICE_SUM = 3072.0          # 1024 elements of (1.0 + 2.0)
+EXPECTED_ROW_FIELDS = ("logical", "physical", "device_name", "count", "sum")
+
+#: Every check verify_device_rows MUST perform. Named explicitly because
+#: all({}.values()) is True, so a check that a refactor drops would silently read
+#: as a pass. Removing the count check was exactly such a mutation, and it stayed
+#: green until the required set was asserted.
+REQUIRED_ROW_CHECKS = ("rowsPresent", "rowCountMatchesRequest", "rowTypesValid",
+                       "identityMapping", "noDuplicateDevices", "countMatches",
+                       "sumMatches")
+
+
+def _is_real_number(value) -> bool:
+    """True only for a finite int/float. bool is excluded despite being an int."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
+# ------------------------------------------- runtime identity capture (P0-B)
+
+# ------------------------------------------- compile profile + cache (P0-B)
+
+#: Files whose content decides what the compiler PRODUCES. A result is bound to a
+#: compile profile, because "it compiled" is not reproducible if the headers, the
+#: emitter or the linker could have differed between runs.
+COMPILE_PROFILE_INPUTS = (
+    "src/tilefoundry",
+    "targets/ascend/tilefoundry_ascend",
+)
+
+
+def compile_profile_payload() -> str:
+    """Report the compile-time identity of the toolchain, inside the container.
+
+    Includes the TileLang/TileFoundry source trees, the SIMD header and Python
+    emitter that decide codegen, the shared library actually loaded, and the
+    compiler/linker identities. Hashed over CONTENT, so a rebuild that changes a
+    byte is visible even when the path is unchanged.
+    """
+    return r"""
+import os, json, hashlib, subprocess
+
+def sha256_file(path):
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError as exc:
+        return "UNREADABLE: %s" % exc
+
+def tree_digest(root):
+    # Content digest of every tracked source file under a directory.
+    digest = hashlib.sha256()
+    count = 0
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git"))
+        for name in sorted(files):
+            if not name.endswith((".py", ".h", ".hpp", ".cc", ".cpp")):
+                continue
+            path = os.path.join(base, name)
+            try:
+                with open(path, "rb") as handle:
+                    digest.update(path.encode())
+                    digest.update(handle.read())
+                count += 1
+            except OSError:
+                continue
+    return digest.hexdigest(), count
+
+def tool_version(argv):
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        return (done.stdout or done.stderr or "").splitlines()[0].strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "UNAVAILABLE: %s" % exc
+
+profile = {"roots": {}, "libraries": {}, "tools": {}}
+for root in ("src/tilefoundry", "targets/ascend/tilefoundry_ascend"):
+    if os.path.isdir(root):
+        digest, count = tree_digest(root)
+        profile["roots"][root] = {"sha256": digest, "files": count}
+    else:
+        profile["roots"][root] = {"sha256": None, "error": "not a directory"}
+
+for name in ("libtilelang.so",):
+    for base in (os.environ.get("TILELANG_BUILD_LIB", ""), "/home/s00653124/workspace/tilelang/build/lib"):
+        if not base:
+            continue
+        candidate = os.path.join(base, name)
+        if os.path.isfile(candidate):
+            profile["libraries"][name] = {"path": candidate,
+                                          "sha256": sha256_file(candidate)}
+            break
+    else:
+        continue
+
+profile["tools"]["cc"] = tool_version(["cc", "--version"])
+profile["tools"]["lld"] = tool_version(["ld.lld", "--version"])
+profile["tools"]["arch"] = os.uname().machine
+print(json.dumps(profile, sort_keys=True))
+"""
+
+
+def compile_profile_digest(profile: dict) -> str:
+    """One hash over the whole compile profile.
+
+    Anything UNREADABLE is part of the hash rather than omitted, so a partial profile
+    cannot produce the same digest as a complete one.
+    """
+    canonical = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def capture_compile_profile(config: dict, python: str, env: dict) -> dict:
+    """Capture the compile profile in the container, in the verified environment."""
+    result = container_exec(config, [python, "-c", compile_profile_payload()],
+                            user="root", env=env, timeout=300, echo_stdout=False)
+    if result.returncode != 0:
+        raise GateError(
+            "COMPILE_PROFILE_FAILED: the probe exited %d: %r"
+            % (result.returncode, (result.stderr or "")[-400:]), EXIT_BLOCKED)
+    text = (result.stdout or "").strip()
+    try:
+        profile = json.loads(text.splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise GateError("COMPILE_PROFILE_FAILED: unparsable profile: %s" % exc,
+                        EXIT_BLOCKED)
+    profile["digest"] = compile_profile_digest(profile)
+    return profile
+
+
+#: The cache directory must be EMPTY at the start of every run. A compiler cache
+#: that survives between runs can make a "fresh" compile reuse an artifact built
+#: from DIFFERENT sources, which looks like success and is not.
+def prepare_empty_cache(config: dict, cache_dir: str) -> dict:
+    """Atomically give this run its own EMPTY cache directory.
+
+    Created under a per-run unique path and renamed into place, so two runs cannot
+    share it and a crash cannot leave a partially populated one that the next run
+    silently adopts. Verified empty afterwards; a directory that is not empty is a
+    refusal, because the whole point is that nothing was carried over.
+    """
+    script = "; ".join([
+        'if [ -e ' + _sq(cache_dir) + ' ]; then echo "CACHE-PRESENT"; exit 21; fi',
+        'mkdir -p ' + _sq(cache_dir) + ' || { echo "CACHE-MKDIR-FAILED"; exit 22; }',
+        'n=$(ls -A ' + _sq(cache_dir) + ' 2>/dev/null | wc -l)',
+        'if [ "$n" -ne 0 ]; then echo "CACHE-NOT-EMPTY $n"; exit 23; fi',
+        'echo CACHE-EMPTY',
+    ])
+    result = container_exec(config, ["sh", "-c", script], user="root",
+                            timeout=60, echo_stdout=False)
+    out = result.stdout or ""
+    if result.returncode != 0 or "CACHE-EMPTY" not in out:
+        raise GateError(
+            "CACHE_NOT_FRESH: %s. A pre-existing or non-empty cache can make a "
+            "compile reuse an artifact built from different sources, so this run "
+            "would not be reproducible" % (out.strip() or "no output"),
+            EXIT_BLOCKED)
+    return {"cache_dir": cache_dir, "empty_at_start": True,
+            "disable_cache": True}
+
+def runtime_identity_payload() -> str:
+    """The Python source that reports what this environment actually IS.
+
+    Runs INSIDE the container, in the SAME verified environment as the workload, so
+    the identity describes the environment that produced the result. Capturing it
+    any other way -- from the host, or before CANN is sourced -- describes something
+    else: an unsourced probe reports torch_npu as a hard import failure, which is a
+    property of the probe, not of the environment.
+
+    Every module is reported even when it fails, and a failure is recorded as a
+    named error rather than omitted, so "not imported" cannot masquerade as "fine".
+    """
+    return r"""
+import sys, os, json, hashlib
+
+def describe(module_name):
+    try:
+        mod = __import__(module_name)
+    except Exception as exc:
+        return {"imported": False, "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+    path = getattr(mod, "__file__", None)
+    info = {"imported": True, "version": getattr(mod, "__version__", None),
+            "file": path}
+    try:
+        if path and os.path.isfile(path):
+            with open(path, "rb") as handle:
+                info["file_sha256"] = hashlib.sha256(handle.read()).hexdigest()
+    except OSError as exc:
+        info["file_sha256_error"] = str(exc)
+    return info
+
+identity = {
+    "executable": sys.executable,
+    "executable_realpath": os.path.realpath(sys.executable),
+    "version": sys.version.split()[0],
+    "dont_write_bytecode": bool(sys.flags.dont_write_bytecode),
+    "pycache_prefix": sys.pycache_prefix,
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "torch_backend_autoload": os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD"),
+    "tilelang_cache_dir": os.environ.get("TILELANG_CACHE_DIR"),
+    "modules": {name: describe(name)
+                for name in ("torch", "torch_npu", "tilelang", "tilefoundry")},
+}
+print(json.dumps(identity, sort_keys=True))
+"""
+
+
+#: The modules that MUST import for this work. Deliberately not "every module the
+#: probe happens to look at": requiring tilelang in a device-only environment
+#: rejected a machine that was perfectly able to run the workload.
+REQUIRED_IDENTITY_MODULES = ("torch", "torch_npu")
+
+
+def identity_is_acceptable(identity: dict, configured_python: str = None) -> tuple:
+    """Decide whether a captured identity may be trusted as this run's environment.
+
+    Pure, so it is unit-testable with no container. It refuses an identity that is
+    missing, that came from a different interpreter, that reported a module failure,
+    or whose versions are absent: an identity record that cannot identify the
+    environment is worse than none, because it looks like evidence.
+    """
+    failures = []
+    if not isinstance(identity, dict) or not identity:
+        return False, ["no identity was captured"]
+
+    executable = identity.get("executable")
+    if not executable:
+        failures.append("no executable recorded")
+    elif configured_python:
+        try:
+            want = os.path.realpath(configured_python)
+        except OSError:
+            want = configured_python
+        got = identity.get("executable_realpath") or executable
+        if got != want and executable != configured_python:
+            failures.append("interpreter is %r, configured is %r" % (got, want))
+
+    version = identity.get("version")
+    if not isinstance(version, str) or not version.split(".")[0].isdigit():
+        failures.append("no usable Python version recorded")
+
+    modules = identity.get("modules") or {}
+    if not modules:
+        failures.append("no modules reported")
+    # Only the modules this work REQUIRES are fatal. A module that is reported but
+    # not needed (tilelang, in a device-only environment) is recorded as absent and
+    # does not refuse the run -- requiring it made a healthy machine unacceptable,
+    # which is a fault in the check, not in the environment.
+    for name in REQUIRED_IDENTITY_MODULES:
+        info = modules.get(name) or {}
+        if not isinstance(info, dict) or not info.get("imported"):
+            error = info.get("error") if isinstance(info, dict) else info
+            failures.append("required module %s did not import: %s" % (name, error))
+
+    for required in REQUIRED_IDENTITY_MODULES:
+        info = modules.get(required) or {}
+        if info.get("imported") and not info.get("version"):
+            failures.append("module %s reported no version" % required)
+
+    return (not failures), failures
+
+
+def capture_runtime_identity(config: dict, python: str, env: dict) -> dict:
+    """Run the identity probe in the container and return its record.
+
+    The probe runs with the SAME env dict as the workload, so it describes the
+    environment under test rather than a fresh shell.
+    """
+    result = container_exec(config, [python, "-c", runtime_identity_payload()],
+                            user="root", env=env, timeout=180, echo_stdout=False)
+    if result.returncode != 0:
+        raise GateError(
+            "RUNTIME_IDENTITY_FAILED: the identity probe exited %d. Its stderr is "
+            "reported rather than an empty identity: %r"
+            % (result.returncode, (result.stderr or "")[-400:]), EXIT_BLOCKED)
+    text = (result.stdout or "").strip()
+    if not text:
+        raise GateError("RUNTIME_IDENTITY_FAILED: the probe printed nothing",
+                        EXIT_BLOCKED)
+    try:
+        identity = json.loads(text.splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise GateError("RUNTIME_IDENTITY_FAILED: unparsable identity %r: %s"
+                        % (text[-200:], exc), EXIT_BLOCKED)
+    ok, failures = identity_is_acceptable(identity, python)
+    identity["acceptable"] = ok
+    identity["failures"] = failures
+    return identity
+
+def verify_device_rows(rows, requested_ids, expected_count=EXPECTED_DEVICE_COUNT,
+                       expected_sum=EXPECTED_DEVICE_SUM):
+    """Recompute the device verdict FROM THE NUMBERS, on the host.
+
+    Pure, so the whole false-pass class is testable with no container and no device.
+
+    The previous revision computed workload_ok as `all(bool(row.get("ok")))`, i.e. it
+    asked the payload whether the payload had succeeded. A workload returning
+    sum=0, count=0, ok=true was therefore a PASS, which the architect reproduced.
+    Nothing the payload asserts about itself is used here: only count and sum, which
+    the host re-checks against the contract.
+
+    Returns (ok, detail). Every failure is named so a refusal says what was wrong.
+    """
+    detail = {"checks": {}, "failures": []}
+
+    def fail(name, message):
+        detail["checks"][name] = False
+        detail["failures"].append(message)
+
+    if not isinstance(rows, list) or not rows:
+        fail("rowsPresent", "the payload reported no device rows")
+        return False, detail
+    detail["checks"]["rowsPresent"] = True
+
+    # Coverage: exactly one row per requested device, no more, no fewer.
+    if len(rows) != len(requested_ids):
+        fail("rowCountMatchesRequest",
+             "payload reported %d row(s) for %d requested device(s)"
+             % (len(rows), len(requested_ids)))
+    else:
+        detail["checks"]["rowCountMatchesRequest"] = True
+
+    # Type discipline: a row that is not an object, a count that is not an int, or a
+    # sum that is not finite are all unverifiable, so they fail rather than pass.
+    bad_types = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            bad_types.append("row %d is %s, not an object" % (index, type(row).__name__))
+            continue
+        missing = [f for f in EXPECTED_ROW_FIELDS if f not in row]
+        if missing:
+            bad_types.append("row %d is missing %s" % (index, ", ".join(missing)))
+            continue
+        if not _is_real_number(row.get("count")) or float(row["count"]) != int(row["count"]):
+            bad_types.append("row %d count=%r is not an integer" % (index, row.get("count")))
+        if not _is_real_number(row.get("sum")):
+            bad_types.append("row %d sum=%r is not a finite number" % (index, row.get("sum")))
+        if not isinstance(row.get("device_name"), str) or not row["device_name"].strip():
+            bad_types.append("row %d has no device_name" % index)
+    if bad_types:
+        fail("rowTypesValid", "; ".join(bad_types))
+    else:
+        detail["checks"]["rowTypesValid"] = True
+
+    # Identity mapping: logical index i must correspond to requested_ids[i], in
+    # order. A duplicated or reordered set is a wrong-device claim.
+    try:
+        logicals = [int(r["logical"]) for r in rows]
+        physicals = [int(r["physical"]) for r in rows]
+    except (KeyError, TypeError, ValueError):
+        fail("identityMapping", "rows do not carry usable logical/physical ids")
+        logicals, physicals = [], []
+    if logicals or physicals:
+        if sorted(logicals) != list(range(len(requested_ids))):
+            fail("identityMapping",
+                 "logical ids %r are not exactly 0..%d; a missing or duplicated "
+                 "device cannot be detected from this"
+                 % (logicals, len(requested_ids) - 1))
+        elif physicals != list(requested_ids):
+            fail("identityMapping",
+                 "physical ids %r do not equal the requested order %r"
+                 % (physicals, list(requested_ids)))
+        else:
+            detail["checks"]["identityMapping"] = True
+
+    # Duplicate detection: two rows for the same physical device is one device
+    # counted twice, which would fake coverage.
+    if physicals and len(set(physicals)) != len(physicals):
+        fail("noDuplicateDevices",
+             "physical ids %r contain duplicates; a device was counted twice"
+             % (physicals,))
+    else:
+        detail["checks"]["noDuplicateDevices"] = True
+
+    # The numeric contract, recomputed HERE.
+    wrong_count = [(i, r.get("count")) for i, r in enumerate(rows)
+                   if isinstance(r, dict) and _is_real_number(r.get("count"))
+                   and int(r["count"]) != expected_count]
+    if wrong_count:
+        fail("countMatches",
+             "row(s) %s report count != %d; a zero or short count is a failed "
+             "workload, not an empty success"
+             % ([i for i, _ in wrong_count], expected_count))
+    elif detail["checks"].get("rowTypesValid"):
+        detail["checks"]["countMatches"] = True
+
+    wrong_sum = [(i, r.get("sum")) for i, r in enumerate(rows)
+                 if isinstance(r, dict) and _is_real_number(r.get("sum"))
+                 and float(r["sum"]) != expected_sum]
+    if wrong_sum:
+        fail("sumMatches",
+             "row(s) %s report sum != %r; sum=0 with count=0 was previously "
+             "accepted because the payload self-reported ok=true"
+             % ([i for i, _ in wrong_sum], expected_sum))
+    elif detail["checks"].get("rowTypesValid"):
+        detail["checks"]["sumMatches"] = True
+
+    # A MISSING check is a failure, not a default pass. all({}.values()) is True,
+    # which is how a dropped count check could otherwise look like success.
+    absent = [name for name in REQUIRED_ROW_CHECKS if name not in detail["checks"]]
+    if absent:
+        detail["failures"].append(
+            "these mandatory checks did not run: %s. A check that is absent is not "
+            "a check that passed" % ", ".join(absent))
+    ok = (not detail["failures"]
+          and not absent
+          and all(detail["checks"].get(name) is True for name in REQUIRED_ROW_CHECKS))
+    return ok, detail
+
+def device_gate_verdict(coverage, identity_ok, workload_ok, workload_detail,
+                        identity, profile, cache_facts, deploy_verified):
+    """Assemble the device Gate verdict. Pure, so the WIRING is testable too.
+
+    Tests that only exercise the helpers cannot notice the Gate forgetting to call
+    them -- a mutation that skipped the identity refusal or reused a cached result
+    stayed green until this function existed. The mandatory facts are re-asserted
+    here so no single omission upstream can turn a bad run into a PASS.
+
+    Returns (passed, observations, reasons).
+    """
+    reasons = []
+
+    if not coverage:
+        reasons.append("not every requested device produced a row")
+    if not identity_ok:
+        reasons.append("the logical/physical identity mapping is wrong")
+    if not workload_ok:
+        reasons.append("the host recomputation of count/sum failed: %s"
+                       % "; ".join((workload_detail or {}).get("failures") or ["unknown"]))
+
+    # An unidentified environment cannot be reported as a passing device run: the
+    # numbers would be unattributable.
+    if not (identity or {}).get("acceptable"):
+        reasons.append("the runtime identity is not acceptable: %s"
+                       % "; ".join((identity or {}).get("failures") or ["unknown"]))
+    if not (profile or {}).get("digest"):
+        reasons.append("no compile profile digest: the result is not bound to a toolchain")
+    if not (cache_facts or {}).get("empty_at_start"):
+        reasons.append("the compiler cache was not empty at the start of this run")
+    if not (cache_facts or {}).get("disable_cache"):
+        reasons.append("compiler cache reuse was not disabled for this run")
+
+    observations = {
+        "exitCodeZero": True,
+        "environmentPreflight": True,
+        "deploymentVerified": bool(deploy_verified),
+        "ranAsRoot": True,
+        "multiDeviceCoverage": bool(coverage),
+        "assertionInsidePayload": True,
+        "deviceBoundIntoContainer": True,
+        "occupancyRecorded": True,
+        "occupancyReusedPreflightEnv": True,
+        "runtimeIdentityRecorded": bool((identity or {}).get("acceptable")),
+        "compileProfileBound": bool((profile or {}).get("digest")),
+        "cacheFreshPerRun": bool((cache_facts or {}).get("empty_at_start")),
+        "cacheDisabled": bool((cache_facts or {}).get("disable_cache")),
+        "deviceWorkloadExecuted": bool(workload_ok),
+        "hostRecomputedVerdict": bool(workload_ok),
+        "deviceIdentityRecorded": bool(identity_ok),
+    }
+    return (not reasons), observations, reasons
 
 def gate_device(config: dict, device_raw: str, evidence_dir,
                 attestation_path=None) -> int:
@@ -1527,11 +2057,23 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
     run_id = uuid.uuid4().hex[:12]
     repo = config["TF_REPO"]
     python = in_container_python(config)
-    env = {
+    # Start from the environment the preflight VERIFIED, then add the workload's own
+    # variables. Without this the identity probe ran with no LD_LIBRARY_PATH, so
+    # torch_npu failed to load and the Gate refused a perfectly healthy machine --
+    # the same class of mistake as the ldconfig one: checking a different environment
+    # from the one that must actually work.
+    env = dict(env_facts.get("env") or {})
+    env.update({
         "PYTHONPATH": "%s/src:%s/targets/ascend" % (repo, repo),
         "ASCEND_RT_VISIBLE_DEVICES": visible,
         "TF_DEVICE_AUTH": "1",
-    }
+        # Same setting the CPU Gate uses. With autoload left on, torch_npu hits a
+        # duplicate TORCH_LIBRARY registration for the "triton" namespace and fails
+        # to import entirely -- which made the identity check reject a healthy
+        # machine. Verified directly: with this set, torch and torch_npu both
+        # import; without it, both fail.
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+    })
 
     occupancy, occupancy_raw = device_occupancy(config, device_ids, env_facts)
     for device_id in device_ids:
@@ -1544,6 +2086,40 @@ def gate_device(config: dict, device_raw: str, evidence_dir,
             log("  " + row)
         if item["occupied"] is None:
             log("  unknown-idle: the container's npu-smi cannot see other tenants")
+
+    # P0-B: runtime identity. Captured HERE, in the same verified environment as the
+    # workload, so it describes what will actually execute. A probe run without CANN
+    # sourced reports torch_npu as an import failure -- a property of the probe, not
+    # the environment -- which is why it cannot be captured earlier or from outside.
+    identity = capture_runtime_identity(config, python, env)
+    if not identity.get("acceptable"):
+        for failure in identity.get("failures") or []:
+            log("  identity: %s" % failure)
+        raise GateError(
+            "RUNTIME_IDENTITY_UNACCEPTABLE: the interpreter/toolchain under test could "
+            "not be identified, so a result from it would be unattributable",
+            EXIT_BLOCKED)
+    log("runtime identity: python=%s torch=%s torch_npu=%s tilefoundry=%s"
+        % (identity.get("version"),
+           (identity["modules"].get("torch") or {}).get("version"),
+           (identity["modules"].get("torch_npu") or {}).get("version"),
+           (identity["modules"].get("tilefoundry") or {}).get("version")))
+
+    # P0-B: compile profile, hashed over CONTENT so a rebuild that differs by a byte
+    # is visible even at an unchanged path.
+    profile = capture_compile_profile(config, python, env)
+    log("compile profile: digest=%s roots=%d libs=%d"
+        % (str(profile.get("digest"))[:16], len(profile.get("roots") or {}),
+           len(profile.get("libraries") or {})))
+
+    # P0-B: a per-run EMPTY compiler cache. A cache carried over from another run can
+    # make a fresh compile reuse an artifact built from different sources.
+    cache_dir = "%s/.tilelang-cache-%s" % (config.get("CONTAINER_WORKDIR") or "/tmp",
+                                           run_id)
+    cache_facts = prepare_empty_cache(config, cache_dir)
+    env["TILELANG_CACHE_DIR"] = cache_dir
+    env["TILELANG_DISABLE_CACHE"] = "1"
+    log("compiler cache: %s (empty at start, per-run)" % cache_dir)
 
     exposed = container_exec(config, ["sh", "-c", "ls /dev/davinci* 2>/dev/null"],
                              user="root", echo_stdout=False)
@@ -1576,9 +2152,12 @@ for logical, physical in enumerate(visible):
         "device_name": torch.npu.get_device_name(logical),
         "count": int(c.numel()),
         "sum": total,
-        "ok": bool(total == 3072.0 and int(c.numel()) == 1024),
     })
-print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, sort_keys=True))
+# NOTE: this payload deliberately does NOT emit a verdict flag. A previous revision
+# printed "all_ok" computed from per-row "ok", and the host simply believed it, so a
+# workload returning sum=0/count=0/ok=true was accepted. The numbers are the evidence;
+# the host recomputes the verdict from them and ignores any self-assessment.
+print(json.dumps({"devices": rows}, sort_keys=True))
 """
     cann_set_env = config.get("CANN_SET_ENV") or ""
     argv = ["sh", "-c", device_assertion_prefix(visible, cann_set_env), "--",
@@ -1608,24 +2187,14 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
         int(row.get("logical", -1)) == index
         and int(row.get("physical", -1)) == device_ids[index]
         for index, row in enumerate(by_logical))
-    workload_ok = coverage and all(bool(row.get("ok")) for row in by_logical)
-    observations = {
-        "exitCodeZero": True,
-        # Both preflights ran and passed BEFORE the card was touched. Recorded as
-        # observations so a verifier can REQUIRE them rather than infer them.
-        "environmentPreflight": True,
-        "deploymentVerified": bool(deploy_facts.get("verified")),
-        "ranAsRoot": True,
-        "multiDeviceCoverage": coverage,
-        "assertionInsidePayload": True,
-        "deviceBoundIntoContainer": True,
-        "occupancyRecorded": True,
-        # Stated explicitly so a verifier does not have to infer it: occupancy ran in
-        # the SAME verified environment as the preflight, not in a second sourced one.
-        "occupancyReusedPreflightEnv": True,
-        "deviceWorkloadExecuted": workload_ok,
-        "deviceIdentityRecorded": identity_ok,
-    }
+    # P0-C: recompute the verdict from the NUMBERS. The payload's own "ok" flag is
+    # NOT consulted -- trusting it is exactly how sum=0/count=0/ok=true passed.
+    workload_ok, workload_detail = verify_device_rows(rows, device_ids)
+    passed, observations, reasons = device_gate_verdict(
+        coverage, identity_ok, workload_ok, workload_detail,
+        identity, profile, cache_facts, deploy_facts.get("verified"))
+    for reason in reasons:
+        log("  verdict: %s" % reason)
     result = {
         "run_id": run_id,
         "gate": "device",
@@ -1634,6 +2203,31 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
         "logical_physical": {str(i): device_ids[i] for i in range(len(device_ids))},
         "container_exposed_davinci": exposed_ids,
         "devices": by_logical,
+        "runtimeIdentity": {
+            "python": identity.get("version"),
+            "executable": identity.get("executable_realpath") or identity.get("executable"),
+            "modules": {name: {"version": (info or {}).get("version"),
+                               "file": (info or {}).get("file"),
+                               "file_sha256": (info or {}).get("file_sha256")}
+                        for name, info in (identity.get("modules") or {}).items()},
+            "pythonpath": identity.get("pythonpath"),
+            "torch_backend_autoload": identity.get("torch_backend_autoload"),
+        },
+        "compileProfile": {
+            "digest": profile.get("digest"),
+            "roots": profile.get("roots"),
+            "libraries": profile.get("libraries"),
+            "tools": profile.get("tools"),
+        },
+        "cache": cache_facts,
+        "deviceContract": {
+            "expected_count": EXPECTED_DEVICE_COUNT,
+            "expected_sum": EXPECTED_DEVICE_SUM,
+            "checks": workload_detail.get("checks"),
+            "failures": workload_detail.get("failures"),
+            "verdict_source": "host recomputation of count/sum; payload self-report "
+                              "is NOT consulted",
+        },
         "occupancy": {str(k): {"occupied": v["occupied"],
                                 "holders": v["holders"],
                                 "idle_established": v["idle_established"],
@@ -1684,9 +2278,17 @@ print(json.dumps({"devices": rows, "all_ok": all(row["ok"] for row in rows)}, so
             "occupancy_raw_sha256": result["occupancy_raw_sha256"],
             "observations": observations,
         }, run_id=run_id)
-    if not (coverage and identity_ok and workload_ok):
+    # The exit code MUST follow passed. It previously re-tested only the three
+    # original flags here, so every new mandatory fact (identity, compile profile,
+    # fresh cache) could fail while the Gate still exited 0. A mutation that skipped
+    # the identity refusal stayed green until this was fixed.
+    if not passed:
         log("device gate: FAIL (coverage=%s identity=%s workload=%s)"
             % (coverage, identity_ok, workload_ok))
+        for message in workload_detail.get("failures") or []:
+            log("  device contract: %s" % message)
+        for reason in reasons:
+            log("  refused because: %s" % reason)
         return EXIT_FAIL
     log("device gate: PASS for %d requested device(s); occupancy is metadata only" % len(device_ids))
     return EXIT_PASS

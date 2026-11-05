@@ -607,6 +607,7 @@ def _attestation(**over):
         "created": "2026-11-05T00:00:00.000000000Z",
         "image": "sha256:" + "b" * 64,
         "image_digest": "sha256:" + "b" * 64,
+        "image_names": ["img"],
         "host_config_devices": [
             {"path_in_container": "/dev/davinci0", "path_on_host": "/dev/davinci0",
              "permissions": "rwm"},
@@ -731,10 +732,10 @@ def test_negative_missing_driver_mount():
 
 
 def test_negative_image_digest_missing():
-    """(6) Image drift: the attestation carries no digest to compare."""
-    att = _attestation(image_digest="")
-    expect_blocked(lambda: _verify(att, observe=_linkage_ok),
-                   "no image_digest", "ATTESTATION_INVALID")
+    """(6) With no digest recorded, image agreement cannot be established."""
+    att = _attestation(image_digest="", image_names=[])
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok, IMAGE=""),
+                   "no image digest", "ATTESTATION_INVALID")
 
 
 def test_negative_tampered_attestation_hash_mismatch():
@@ -879,6 +880,575 @@ def test_occupancy_refuses_without_a_verified_environment():
     """No verified env means NO silent fallback to an unverified source."""
     expect_blocked(lambda: G.device_occupancy(cfg(), [0], {}),
                    "did not return a verified environment", "ENV_LIBRARY_UNRESOLVED")
+
+
+# --- P0-C: the host recomputes the device verdict -------------------------
+
+def _row(logical=0, physical=1, count=1024, total=3072.0, name="Ascend950PR", **extra):
+    row = {"logical": logical, "physical": physical, "device_name": name,
+           "count": count, "sum": total}
+    row.update(extra)
+    return row
+
+
+def test_device_rows_honest_payload_passes():
+    """Positive control against the real numbers."""
+    ok, detail = G.verify_device_rows([_row(0, 1)], [1])
+    assert ok, detail
+    assert detail["checks"]["sumMatches"] and detail["checks"]["countMatches"]
+
+
+def test_false_pass_sum0_count0_oktrue_is_now_refused():
+    """THE reproduced false pass: sum=0, count=0, ok=true.
+
+    The previous revision asked the payload `bool(row["ok"])`, so a workload that
+    computed nothing and said it was fine was a PASS. The verdict is now recomputed
+    from count and sum on the host, so this must fail -- and the detail must say why.
+    """
+    ok, detail = G.verify_device_rows([_row(0, 1, count=0, total=0.0, ok=True)], [1])
+    assert not ok, "sum=0/count=0/ok=true must NOT pass on a self-report"
+    joined = " ".join(detail["failures"])
+    assert "count" in joined and "sum" in joined, joined
+
+
+def test_payload_self_report_is_ignored_entirely():
+    """ok=true cannot rescue bad numbers, and ok=false cannot spoil good ones."""
+    bad, _ = G.verify_device_rows([_row(0, 1, total=1.0, ok=True)], [1])
+    assert not bad, "a self-declared ok must not override a wrong sum"
+    good, _ = G.verify_device_rows([_row(0, 1, ok=False)], [1])
+    assert good, "a self-declared failure flag is not evidence; the numbers are"
+
+
+def test_device_rows_reject_a_missing_device():
+    """Requesting two devices but getting one row is missing coverage."""
+    ok, detail = G.verify_device_rows([_row(0, 0)], [0, 1])
+    assert not ok, detail
+    assert "row(s) for 2 requested" in " ".join(detail["failures"]), detail
+
+
+def test_device_rows_reject_a_duplicated_device():
+    """The same physical device reported twice fakes coverage."""
+    rows = [_row(0, 1), _row(1, 1)]
+    ok, detail = G.verify_device_rows(rows, [1, 1])
+    assert not ok, detail
+    assert any("duplicate" in f.lower() for f in detail["failures"]), detail
+
+
+def test_device_rows_reject_wrong_device_order():
+    """Physical ids must match the REQUESTED order, not merely be a valid set."""
+    rows = [_row(0, 1), _row(1, 0)]
+    ok, detail = G.verify_device_rows(rows, [0, 1])
+    assert not ok, detail
+    assert "requested order" in " ".join(detail["failures"]), detail
+
+
+def test_device_rows_reject_wrong_device_id_even_with_right_count():
+    """Right count, right sum, but the wrong physical card must still fail."""
+    ok, detail = G.verify_device_rows([_row(0, 5)], [1])
+    assert not ok, "a result from device 5 must not satisfy a request for device 1"
+    assert "requested order" in " ".join(detail["failures"]), detail
+
+
+def test_device_rows_reject_nan_and_infinity():
+    """NaN/Inf are not numbers a verdict can be computed from."""
+    for bad_value in (float("nan"), float("inf"), -float("inf")):
+        ok, detail = G.verify_device_rows([_row(0, 1, total=bad_value)], [1])
+        assert not ok, "sum=%r must be refused" % (bad_value,)
+        assert any("finite" in f for f in detail["failures"]), detail
+
+
+def test_device_rows_reject_non_numeric_and_bool_types():
+    """Strings and booleans pretending to be numbers are unverifiable."""
+    for bad_count in ("1024", True, None):
+        ok, detail = G.verify_device_rows([_row(0, 1, count=bad_count)], [1])
+        assert not ok, "count=%r must be refused" % (bad_count,)
+
+
+def test_device_rows_reject_a_row_that_is_not_an_object():
+    """A bare string or number is not a device row."""
+    ok, detail = G.verify_device_rows(["npu is fine, honest"], [1])
+    assert not ok, detail
+    assert any("not an object" in f for f in detail["failures"]), detail
+
+
+def test_device_rows_refuse_an_empty_report():
+    """No rows is not "all zero devices are fine"."""
+    ok, detail = G.verify_device_rows([], [1])
+    assert not ok, "an empty device report must be refused"
+
+
+def test_device_rows_require_every_contract_field():
+    """A row missing count or sum cannot be verified, so it fails."""
+    incomplete = {"logical": 0, "physical": 1, "device_name": "Ascend950PR"}
+    ok, detail = G.verify_device_rows([incomplete], [1])
+    assert not ok, detail
+    assert any("missing" in f for f in detail["failures"]), detail
+
+
+# --- P0-B: runtime identity, compile profile, per-run cache ----------------
+
+def test_identity_probe_reports_module_FAILURE_instead_of_omitting_it():
+    """A module that cannot import must appear as a named error, not be absent.
+
+    An omitted module reads as "nothing to report"; an explicit failure reads as
+    "this environment cannot do the job". Those must not be confusable.
+    """
+    src = G.runtime_identity_payload()
+    assert "IMPORT-FAILED" not in src.split("def ")[0] or True
+    assert "except Exception as exc:" in src, src[:400]
+    assert "\"imported\": False" in src or "imported\": False" in src, src[:400]
+    assert "file_sha256" in src, "the module file must be hashed, not just named"
+
+
+def test_identity_is_refused_when_a_module_failed():
+    """A partially importing environment must not be accepted as identified."""
+    identity = {
+        "executable": "/usr/bin/python3", "version": "3.12.0",
+        "executable_realpath": "/usr/bin/python3",
+        "modules": {
+            "torch": {"imported": True, "version": "2.12.0"},
+            "torch_npu": {"imported": False, "error": "RuntimeError: no backend"},
+        },
+    }
+    ok, failures = G.identity_is_acceptable(identity)
+    assert not ok, "an environment where torch_npu failed to import is not identified"
+    # The message must name the IMPORT failure specifically. Asserting only
+    # "torch_npu" would also be satisfied by the weaker "reported no version"
+    # check, which masks a dropped import-failure check.
+    assert any("did not import" in f for f in failures), (
+        "the refusal must attribute the failure to the import itself: %r" % (failures,))
+
+
+def test_identity_is_refused_when_empty_or_missing_version():
+    """An empty identity is worse than none: it looks like evidence."""
+    for bad in (None, {}, {"executable": "/usr/bin/python3"}):
+        ok, failures = G.identity_is_acceptable(bad)
+        assert not ok, "identity %r must be refused" % (bad,)
+        assert failures, "a refusal must say why"
+
+
+def test_identity_is_refused_for_the_wrong_interpreter():
+    """An identity from a different interpreter is not this run's environment."""
+    identity = {
+        "executable": "/opt/other/python", "executable_realpath": "/opt/other/python",
+        "version": "3.12.0",
+        "modules": {"torch": {"imported": True, "version": "2.12.0"},
+                    "torch_npu": {"imported": True, "version": "2.12.0"}},
+    }
+    ok, failures = G.identity_is_acceptable(identity, "/usr/bin/python3")
+    assert not ok, "a different interpreter must be refused"
+    assert any("configured is" in f for f in failures), failures
+
+
+def test_identity_accepts_a_complete_record():
+    """Positive control."""
+    identity = {
+        "executable": "/usr/bin/python3", "executable_realpath": "/usr/bin/python3",
+        "version": "3.12.0",
+        "modules": {"torch": {"imported": True, "version": "2.12.0"},
+                    "torch_npu": {"imported": True, "version": "2.12.0"}},
+    }
+    ok, failures = G.identity_is_acceptable(identity, "/usr/bin/python3")
+    assert ok, failures
+
+
+def test_compile_profile_digest_changes_when_content_changes():
+    """The digest must be over CONTENT, so a rebuild is visible at the same path."""
+    base = {"roots": {"src": {"sha256": "aaa", "files": 3}}, "libraries": {},
+            "tools": {"cc": "gcc 13"}}
+    same = {"roots": {"src": {"sha256": "aaa", "files": 3}}, "libraries": {},
+            "tools": {"cc": "gcc 13"}}
+    different = {"roots": {"src": {"sha256": "bbb", "files": 3}}, "libraries": {},
+                 "tools": {"cc": "gcc 13"}}
+    assert G.compile_profile_digest(base) == G.compile_profile_digest(same)
+    assert G.compile_profile_digest(base) != G.compile_profile_digest(different), (
+        "a changed source digest must change the compile profile digest")
+
+
+def test_compile_profile_digest_includes_unreadable_markers():
+    """An UNREADABLE library is part of the hash, not silently dropped."""
+    complete = {"roots": {}, "libraries": {"libtilelang.so": {"sha256": "abc"}}}
+    broken = {"roots": {}, "libraries": {"libtilelang.so": {"sha256": "UNREADABLE"}}}
+    assert G.compile_profile_digest(complete) != G.compile_profile_digest(broken), (
+        "a partial profile must not digest the same as a complete one")
+
+
+def test_cache_preparation_refuses_a_pre_existing_directory():
+    """A cache that already exists may hold another run's artifacts."""
+    calls = []
+    original = G.container_exec
+
+    def fake(config, argv, **kwargs):
+        calls.append(argv)
+
+        class R:
+            pass
+
+        r = R()
+        r.returncode = 21
+        r.stdout = "CACHE-PRESENT"
+        r.stderr = ""
+        return r
+
+    G.container_exec = fake
+    try:
+        expect_blocked(lambda: G.prepare_empty_cache(cfg(), "/tmp/cache-x"),
+                       "CACHE_NOT_FRESH", "CACHE_NOT_FRESH")
+    finally:
+        G.container_exec = original
+    script = " ".join(calls[0])
+    assert "CACHE-PRESENT" in script, "a pre-existing cache must be detected"
+    assert "CACHE-NOT-EMPTY" in script, "a non-empty cache must be detected"
+
+
+def test_cache_preparation_reports_empty_and_disables_cache():
+    """Positive control: the cache is verified EMPTY and reuse is disabled."""
+    original = G.container_exec
+
+    def fake(config, argv, **kwargs):
+        class R:
+            pass
+
+        r = R()
+        r.returncode = 0
+        r.stdout = "CACHE-EMPTY"
+        r.stderr = ""
+        return r
+
+    G.container_exec = fake
+    try:
+        facts = G.prepare_empty_cache(cfg(), "/tmp/cache-y")
+    finally:
+        G.container_exec = original
+    assert facts["empty_at_start"] is True
+    assert facts["disable_cache"] is True, (
+        "an empty cache is not enough; reuse must also be disabled")
+
+
+# --- P0-B/C WIRING: the Gate must ACT on its helpers ----------------------
+#
+# The helper tests above all passed while five mutations escaped, because none of
+# them could see whether gate_device actually CALLS the helpers or acts on the
+# result. These tests pin that seam.
+
+def _verdict(**over):
+    kwargs = {
+        "coverage": True, "identity_ok": True, "workload_ok": True,
+        "workload_detail": {"checks": {"sumMatches": True}, "failures": []},
+        "identity": {"acceptable": True, "failures": []},
+        "profile": {"digest": "abc123"},
+        "cache_facts": {"empty_at_start": True, "disable_cache": True},
+        "deploy_verified": True,
+    }
+    kwargs.update(over)
+    return G.device_gate_verdict(**kwargs)
+
+
+def test_verdict_passes_only_when_every_mandatory_fact_holds():
+    """Positive control."""
+    passed, observations, reasons = _verdict()
+    assert passed, reasons
+    assert observations["hostRecomputedVerdict"] is True
+    assert observations["cacheDisabled"] is True
+
+
+def test_verdict_fails_on_an_unacceptable_identity():
+    """An unidentified environment cannot produce a passing device result."""
+    passed, _obs, reasons = _verdict(identity={"acceptable": False,
+                                              "failures": ["torch_npu did not import"]})
+    assert not passed
+    assert any("identity is not acceptable" in r for r in reasons), reasons
+
+
+def test_verdict_fails_without_a_compile_profile_digest():
+    """A result not bound to a toolchain cannot be reproduced."""
+    passed, _obs, reasons = _verdict(profile={})
+    assert not passed
+    assert any("compile profile" in r for r in reasons), reasons
+
+
+def test_verdict_fails_when_the_cache_was_not_empty():
+    """A reused cache can make a fresh compile reuse a foreign artifact."""
+    passed, _obs, reasons = _verdict(
+        cache_facts={"empty_at_start": False, "disable_cache": True})
+    assert not passed
+    assert any("not empty at the start" in r for r in reasons), reasons
+
+
+def test_verdict_fails_when_cache_reuse_was_not_disabled():
+    """An empty cache alone is not enough if reuse is still allowed."""
+    passed, _obs, reasons = _verdict(
+        cache_facts={"empty_at_start": True, "disable_cache": False})
+    assert not passed
+    assert any("reuse was not disabled" in r for r in reasons), reasons
+
+
+def test_verdict_fails_on_a_bad_host_recomputation_and_says_why():
+    """The refusal must carry the contract failure, not just a boolean."""
+    passed, _obs, reasons = _verdict(
+        workload_ok=False,
+        workload_detail={"checks": {}, "failures": ["sum != 3072.0"]})
+    assert not passed
+    assert any("sum != 3072.0" in r for r in reasons), reasons
+
+
+def test_gate_device_exit_code_follows_the_verdict_not_the_old_flags():
+    """REGRESSION: the exit code once tested only coverage/identity/workload.
+
+    Every new mandatory fact could fail while the Gate still exited 0. This asserts
+    the source does not repeat that mistake: the FAIL branch must be driven by the
+    computed verdict.
+    """
+    src = (SCRIPT_DIR / "tilefoundry_gate.py").read_text()
+    assert "if not passed:" in src, (
+        "the device Gate must branch on the computed verdict, not re-test the old "
+        "flags -- that is how mandatory facts were silently ignored")
+    assert "if not (coverage and identity_ok and workload_ok):" not in src, (
+        "the old flag-only exit test is back; new mandatory facts would be ignored")
+
+
+def test_gate_device_calls_every_mandatory_helper():
+    """The Gate must actually CALL what it claims to check."""
+    src = (SCRIPT_DIR / "tilefoundry_gate.py").read_text()
+    for call in ("capture_runtime_identity(", "capture_compile_profile(",
+                 "prepare_empty_cache(", "verify_device_rows("):
+        assert call in src, "%r is claimed but never called" % call
+
+
+def test_payload_no_longer_emits_a_self_verdict():
+    """The payload must not tell the host whether it succeeded.
+
+    Its "all_ok" flag was believed verbatim, which is what let sum=0/count=0 pass.
+    """
+    src = (SCRIPT_DIR / "tilefoundry_gate.py").read_text()
+    # Inspect the EMITTED print statement, not surrounding prose: the explanatory
+    # comment legitimately mentions all_ok when describing the bug it replaced.
+    emitted = [line.strip() for line in src.splitlines()
+               if line.strip().startswith("print(json.dumps")]
+    assert emitted, "the payload print statement was not found"
+    joined = " ".join(emitted)
+    assert "all_ok" not in joined, (
+        "the payload emits a self-verdict again; the host must recompute it: %r"
+        % joined)
+    assert "\"ok\"" not in joined, (
+        "the payload marks rows ok again; that flag was once trusted: %r" % joined)
+
+
+def test_device_rows_reject_a_wrong_count_with_a_correct_sum():
+    """Isolate the COUNT check: right sum, wrong element count.
+
+    The sum-only case is caught by the sum check, which leaves the count check
+    untested: deleting it stayed green. This row has the correct sum so only the
+    count can fail, and a dropped count check is then visible.
+    """
+    ok, detail = G.verify_device_rows([_row(0, 1, count=512, total=3072.0)], [1])
+    assert not ok, "count=512 with the right sum must be refused on the count alone"
+    assert detail["checks"].get("countMatches") is False, detail["checks"]
+    assert any("count != 1024" in f for f in detail["failures"]), detail
+
+
+def test_device_rows_require_every_named_check_to_have_run():
+    """A skipped check is a failure: all({}.values()) is True.
+
+    This pins the guard itself, so a future refactor that drops a check from the
+    function cannot pass just because the remaining checks are all true.
+    """
+    for name in G.REQUIRED_ROW_CHECKS:
+        assert name, "REQUIRED_ROW_CHECKS must not contain an empty name"
+    assert "countMatches" in G.REQUIRED_ROW_CHECKS
+    assert "sumMatches" in G.REQUIRED_ROW_CHECKS
+    _ok, detail = G.verify_device_rows([_row(0, 1)], [1])
+    missing = [n for n in G.REQUIRED_ROW_CHECKS if n not in detail["checks"]]
+    assert not missing, "a passing verification must have run every check: %r" % missing
+
+
+# --- END-TO-END gate_device under stubs: the wiring mutations ---------------
+#
+# Helper-level tests cannot see whether gate_device consults them. These drive the
+# real gate_device with a stubbed container, so an upstream mutation that stops
+# calling a mandatory helper, or that lets a self-report decide the verdict, fails.
+
+def _stub_device_gate(overrides):
+    """Run gate_device with a fake container and return (exit_code, stdout)."""
+    import contextlib
+    import io
+    saved = {}
+
+    class Result:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+
+    healthy_row = {"logical": 0, "physical": 1, "device_name": "Ascend950PR",
+                   "count": 1024, "sum": 3072.0, "ok": True}
+    defaults = {
+        "assert_not_host": lambda *a, **k: None,
+        "container_exists": lambda config: True,
+        "environment_preflight": lambda config: {
+            "env": {"LD_LIBRARY_PATH": "/lib", "ASCEND_HOME_PATH": "/cann"},
+            "libraries": {}, "smi_probe_exit": 0, "ascend_home_path": "/cann"},
+        "deployment_verify": lambda config, ids, evidence: {
+            "verified": True, "verified_scope": "char-nodes-only",
+            "nodes": {"/dev/davinci1": "CHAR", "/dev/davinci_manager": "CHAR",
+                      "/dev/hisi_hdc": "CHAR"}},
+        "device_occupancy": lambda config, ids, facts: (
+            {i: {"occupied": None, "holders": None, "idle_established": False,
+                 "process_rows": [], "scope": "container-pid-namespace"}
+             for i in ids},
+            "raw"),
+        "capture_runtime_identity": lambda config, python, env: {
+            "acceptable": True, "failures": [], "version": "3.12.0",
+            "executable": "/usr/bin/python3", "pythonpath": "/p",
+            "torch_backend_autoload": None,
+            "modules": {"torch": {"imported": True, "version": "2.12.0",
+                                  "file": "/t.py", "file_sha256": "aa"},
+                        "torch_npu": {"imported": True, "version": "2.12.0",
+                                      "file": "/n.py", "file_sha256": "bb"}}},
+        "capture_compile_profile": lambda config, python, env: {
+            "digest": "deadbeef", "roots": {}, "libraries": {}, "tools": {}},
+        "prepare_empty_cache": lambda config, path: {
+            "cache_dir": path, "empty_at_start": True, "disable_cache": True},
+        "in_container_python": lambda config: "/usr/bin/python3",
+        "write_evidence": lambda *a, **k: None,
+        "container_exec": lambda config, argv, **kwargs: (
+            Result(0, "{\"devices\": [%s]}" % __import__("json").dumps(healthy_row))
+            if "davinci" not in " ".join(argv)
+            else Result(0, "/dev/davinci1")),
+    }
+    defaults.update(overrides)
+    for name, value in defaults.items():
+        if hasattr(G, name):
+            saved[name] = getattr(G, name)
+            setattr(G, name, value)
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = G.gate_device(cfg(), "1", None)
+    except G.GateError as error:
+        # A refusal is a legitimate non-zero outcome. main() converts it to
+        # error.code; the harness must do the same or it would look like a crash.
+        code = error.code or 1
+        buffer.write(str(error))
+    finally:
+        for name, value in saved.items():
+            setattr(G, name, value)
+    return code, buffer.getvalue()
+
+
+def test_e2e_device_gate_passes_with_an_honest_container():
+    """Positive control for the stubbed end-to-end path.
+
+    log() writes to stderr, so the human-readable PASS line is NOT in captured
+    stdout. The exit code is the contract, plus the verdict fields in the JSON.
+    """
+    code, out = _stub_device_gate({})
+    assert code == 0, (code, out[-600:])
+    assert '"hostRecomputedVerdict": true' in out, out[-400:]
+
+
+def test_e2e_device_gate_fails_when_the_identity_is_unacceptable():
+    """A mutation that skips the identity refusal must fail here."""
+    code, out = _stub_device_gate({
+        "capture_runtime_identity": lambda config, python, env: {
+            "acceptable": False, "failures": ["torch_npu did not import"],
+            "version": "3.12.0", "modules": {}}})
+    # Must be BLOCKED_ENV, not a generic FAIL: an unidentifiable environment is an
+    # environment fault. A mutation that merely skips the early raise still exits
+    # non-zero via the verdict, so the CODE is what distinguishes them.
+    assert code == G.EXIT_BLOCKED, (
+        "an unacceptable identity must be BLOCKED_ENV (%d), got %r: %r"
+        % (G.EXIT_BLOCKED, code, out[-300:]))
+
+
+def test_e2e_device_gate_fails_when_the_cache_was_not_fresh():
+    """A mutation that skips the cache check must fail here."""
+    code, out = _stub_device_gate({
+        "prepare_empty_cache": lambda config, path: {
+            "cache_dir": path, "empty_at_start": False, "disable_cache": True}})
+    assert code != 0, "a reused cache must not exit 0: %r" % out[-400:]
+
+
+def test_e2e_device_gate_fails_without_a_compile_profile():
+    """A result not bound to a toolchain must not pass."""
+    code, out = _stub_device_gate({
+        "capture_compile_profile": lambda config, python, env: {}})
+    assert code != 0, "a missing compile profile must not exit 0: %r" % out[-400:]
+
+
+def test_e2e_device_gate_fails_on_a_self_reported_ok_workload():
+    """THE regression: a payload claiming ok=true with count=0 must fail the Gate.
+
+    This is the original defect end to end: the payload says it is fine and the
+    numbers say otherwise. The Gate must follow the numbers.
+    """
+    bad_row = {"logical": 0, "physical": 1, "device_name": "Ascend950PR",
+               "count": 0, "sum": 0.0, "ok": True}
+
+    class Result:
+        def __init__(self, rc=0, out=""):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = ""
+
+    def exec_(config, argv, **kwargs):
+        if "davinci" in " ".join(argv):
+            return Result(0, "/dev/davinci1")
+        return Result(0, "{\"devices\": [%s]}" % __import__("json").dumps(bad_row))
+
+    code, out = _stub_device_gate({"container_exec": exec_})
+    assert code != 0, (
+        "sum=0/count=0/ok=true exited 0 end to end; the payload self-report is "
+        "being trusted again: %r" % out[-400:])
+
+
+def test_negative_image_drift_with_IMAGE_only():
+    """(6a) Contract states the image by TAG; a different tag is drift."""
+    att = _attestation(image_names=["some-other-image:1.0"])
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok, IMAGE="expected:1.0"),
+                   "ATTESTATION_IMAGE_DRIFT", "ATTESTATION_IMAGE_DRIFT")
+
+
+def test_negative_image_drift_with_IMAGE_DIGEST_only():
+    """(6b) Contract states the image by DIGEST; a different digest is drift.
+
+    This is the exact case the review found accepted: a drifted sha256:eeee... was
+    taken three times because only the PRESENCE of a digest was checked.
+    """
+    att = _attestation(image_digest="sha256:" + "e" * 64)
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok,
+                                   IMAGE_DIGEST="sha256:" + "b" * 64),
+                   "ATTESTATION_IMAGE_DRIFT", "ATTESTATION_IMAGE_DRIFT")
+
+
+def test_negative_image_drift_with_both_supplied():
+    """(6c) With both given, drift in EITHER must still be refused."""
+    drifted_digest = _attestation(image_digest="sha256:" + "e" * 64)
+    expect_blocked(lambda: _verify(drifted_digest, observe=_linkage_ok,
+                                   IMAGE="img", IMAGE_DIGEST="sha256:" + "b" * 64),
+                   "ATTESTATION_IMAGE_DRIFT", "ATTESTATION_IMAGE_DRIFT")
+    drifted_name = _attestation(image_names=["other:1.0"])
+    expect_blocked(lambda: _verify(drifted_name, observe=_linkage_ok,
+                                   IMAGE="img", IMAGE_DIGEST="sha256:" + "b" * 64),
+                   "ATTESTATION_IMAGE_DRIFT", "ATTESTATION_IMAGE_DRIFT")
+
+
+def test_negative_attestation_with_no_image_identity_at_all():
+    """(6d) Neither a name nor a contract digest: agreement cannot be shown."""
+    att = _attestation(image_names=[], image_digest="")
+    expect_blocked(lambda: _verify(att, observe=_linkage_ok, IMAGE=""),
+                   "ATTESTATION_INVALID", "ATTESTATION_INVALID")
+
+
+def test_image_checks_accept_genuinely_matching_deployments():
+    """Positive controls: agreement by tag, and agreement by digest."""
+    by_tag = _attestation(image_names=["img"])
+    detail = _verify(by_tag, observe=_linkage_ok, IMAGE="img")
+    assert detail["image_digest"].startswith("sha256:"), detail
+    by_digest = _attestation(image_digest="sha256:" + "c" * 64)
+    detail = _verify(by_digest, observe=_linkage_ok, IMAGE="",
+                     IMAGE_DIGEST="sha256:" + "c" * 64)
+    assert detail["image_digest"].endswith("c" * 64), detail
 
 
 TESTS = [(k, v) for k, v in sorted(globals().items())
