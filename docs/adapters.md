@@ -1,6 +1,6 @@
 # Adapter configuration
 
-AgentGates bundles five independent, digest-pinned adapters. It runs fixed argv recipes from the selected source root. It does not import PiEngineeringHarness or require a Claude session.
+AgentGates bundles several independent, digest-pinned adapters. It runs fixed argv recipes from the selected source root. It does not import PiEngineeringHarness or require a Claude session.
 
 | Adapter | Gate | Fixed operation | Inner / outer timeout |
 | --- | --- | --- | --- |
@@ -12,6 +12,7 @@ AgentGates bundles five independent, digest-pinned adapters. It runs fixed argv 
 | `tla-npu` | `tla-npu-e2e` | `test_tla.py`: TLA SIMD FP8 cast-back plus its plain-Triton reference, on one authorized device | 1200 / 1260 s |
 | `forgekernel-ascend-npu` | `forgekernel-ascend-npu-smoke` | Real device work inside a lease window: FP32 and BF16 elementwise arithmetic and a reduction against a CPU reference | 300 / 420 s |
 | `forgekernel-ascend-npu` | `forgekernel-ascend-npu-build` | Host-local install of the adapted ForgeKernel tree into a private venv, plus an import/version/entry-point probe. No Docker, no root, no device | 900 / 1260 s |
+| `bska-npu` | `bska-npu-smoke` | Inside a configured container on one authorized device: source CANN, import torch/torch_npu/triton from one conda environment, run a real Triton vector-add against its Torch reference, and check node, claude and helix | 1500 / 1800 s |
 
 The container timeout sends TERM then allows 15 seconds before KILL. The outer timeout remains larger. Nonzero exits, interruption and timeout never become PASS. The source must have a configured `build/build.ninja`; gates do not configure a fresh build tree.
 

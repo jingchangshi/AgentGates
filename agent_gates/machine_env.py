@@ -120,6 +120,24 @@ FK_ASCEND_KEYS = (
     'FK_ASCEND_DEPENDENCY_POLICY',
     'FK_ASCEND_TILELANG_CACHE_DIR',
 )
+# The BSKA-NPU Adapter configures the BiShengKernelAgent (helix) runtime inside a
+# container: a complete CANN setup, one conda environment and the node/claude
+# executables. The device id is a launch value (BSKA_NPU_DEVICE_ID), not a key.
+BSKA_NPU_KEYS = (
+    'BSKA_NPU_CONTAINER_NAME',
+    'BSKA_NPU_CONTAINER_USER',
+    'BSKA_NPU_CONTAINER_HOME',
+    'BSKA_NPU_CANN_SETUP',
+    'BSKA_NPU_CANN_EXTRA_LIB',
+    'BSKA_NPU_CONDA_SH',
+    'BSKA_NPU_CONDA_ENV',
+    'BSKA_NPU_CONDA_ENVS_PATH',
+    'BSKA_NPU_PYTHON_VERSION',
+    'BSKA_NPU_HELIX_REPO',
+    'BSKA_NPU_BUILD_SUBDIR',
+    'BSKA_NPU_NODE_BIN',
+    'BSKA_NPU_CLAUDE_BIN',
+)
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
 ADAPTERS = {
@@ -152,6 +170,12 @@ ADAPTERS = {
         'selector': 'FK_ASCEND_ENV_FILE',
         'directory': 'forgekernel-ascend-npu',
         'keys': FK_ASCEND_KEYS,
+    },
+    'bska-npu': {
+        'prefix': 'BSKA_NPU_',
+        'selector': 'BSKA_NPU_ENV_FILE',
+        'directory': 'bska-npu',
+        'keys': BSKA_NPU_KEYS,
     },
 }
 

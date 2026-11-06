@@ -15,14 +15,14 @@ from .source_identity import snapshot, source_root
 
 ENV_KEYS = {"ascendnpu-ir": "ASCENDNPU_ENV_FILE", "tilelang-hivm": "TILELANG_HIVM_ENV_FILE",
             "tilelang-hivm-npu": "TILELANG_HIVM_ENV_FILE", "tla-npu": "TLA_NPU_ENV_FILE",
-            "forgekernel-ascend-npu": "FK_ASCEND_ENV_FILE"}
+            "forgekernel-ascend-npu": "FK_ASCEND_ENV_FILE", "bska-npu": "BSKA_NPU_ENV_FILE"}
 
 # The environment prefix each Adapter owns. An Adapter reads only its own prefix,
 # so a stray export for one Adapter cannot steer another; this map is the single
 # place that association is written.
 OWN_PREFIX = {"ascendnpu-ir": "ASCENDNPU_", "tilelang-hivm": "TILELANG_HIVM_",
               "tilelang-hivm-npu": "TILELANG_HIVM_", "tla-npu": "TLA_NPU_",
-              "forgekernel-ascend-npu": "FK_ASCEND_"}
+              "forgekernel-ascend-npu": "FK_ASCEND_", "bska-npu": "BSKA_NPU_"}
 
 # The Adapters that require an explicitly authorized NPU device. Each names its
 # own device variable and leases an npu:<id> on it, so two AgentGates runs cannot
@@ -30,7 +30,8 @@ OWN_PREFIX = {"ascendnpu-ir": "ASCENDNPU_", "tilelang-hivm": "TILELANG_HIVM_",
 # other; it does not, and cannot, exclude other tenants of a shared machine.
 DEVICE_ADAPTERS = {"tilelang-hivm-npu": "TILELANG_HIVM_DEVICE_ID",
                    "tla-npu": "TLA_NPU_DEVICE_ID",
-                   "forgekernel-ascend-npu": "FK_ASCEND_DEVICE_ID"}
+                   "forgekernel-ascend-npu": "FK_ASCEND_DEVICE_ID",
+                   "bska-npu": "BSKA_NPU_DEVICE_ID"}
 
 # The variables a windowed Recipe reads to open the device lease itself. The
 # engine writes them only for a recipe that declares `deviceWindow`; every other
@@ -51,7 +52,8 @@ LEASE_ENVIRONMENT = (DEVICE_LEASE_PATH, DEVICE_LEASE_RESOURCE, DEVICE_LEASE_WAIT
 # look forwarded and be silently ignored by the Gate.
 EXCLUSIVE_VARIABLE = {"tilelang-hivm-npu": "TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVICE",
                       "tla-npu": "TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE",
-                      "forgekernel-ascend-npu": "FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE"}
+                      "forgekernel-ascend-npu": "FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE",
+                      "bska-npu": "BSKA_NPU_REQUIRE_EXCLUSIVE_DEVICE"}
 
 # A configuration check explains itself on stderr. Only the last line is kept,
 # bounded, and it is the Adapter's own message: no environment values, no
@@ -89,7 +91,7 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     # steer this run without being part of what `configuration()` hashes.
     own = OWN_PREFIX.get(manifest.id, "")
     for name in [name for name in env
-                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_", "TLA_NPU_", "FK_ASCEND_"))
+                 if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_", "TLA_NPU_", "FK_ASCEND_", "BSKA_NPU_"))
                  and not name.startswith(own)]:
         del env[name]
     if env_file is not None:
