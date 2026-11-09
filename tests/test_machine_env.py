@@ -35,6 +35,7 @@ def load_script(path, name):
 
 
 ASCEND = load_script(ADAPTERS / 'ascendnpu-ir/scripts/docker_gate.py', 'machine_env_ascend')
+HOST = load_script(ADAPTERS / 'ascendnpu-ir/scripts/host_gate.py', 'machine_env_ascend_host')
 TILELANG = load_script(ADAPTERS / 'tilelang-hivm/scripts/docker_gate.py', 'machine_env_tilelang')
 NPU = load_script(ADAPTERS / 'tilelang-hivm-npu/scripts/npu_gate.py', 'machine_env_npu')
 TLA = load_script(ADAPTERS / 'tla-npu/scripts/tla_gate.py', 'machine_env_tla')
@@ -67,6 +68,15 @@ class KeySetParityCase(EnvironmentCase):
     def test_the_ascend_key_set_matches_the_engine(self):
         self.assertEqual(tuple(sorted(ASCEND.FILE_KEYS)),
                          tuple(sorted(machine_env.ASCENDNPU_KEYS)))
+        # Both routes read one file, so the Host wrapper must accept exactly the
+        # same keys. If it accepted fewer, a key the engine leases on would be a
+        # file the Host Gate refuses; if it accepted more, the Host Gate could
+        # read machine configuration the engine never leased.
+        self.assertEqual(tuple(sorted(HOST.FILE_KEYS)),
+                         tuple(sorted(machine_env.ASCENDNPU_KEYS)))
+        # And the Host wrapper binds the sibling's own tuple rather than
+        # restating it: there is one key set, owned by the pinned bridge.
+        self.assertIs(HOST.FILE_KEYS, HOST.shared.FILE_KEYS)
 
     def test_each_adapter_key_set_matches_the_engine(self):
         # tilelang-hivm and tilelang-hivm-npu share one file, so both scripts must
@@ -305,6 +315,214 @@ class LeaseParityCase(EnvironmentCase):
         with self.assertRaises(ValueError):
             engine.build_directory(self.source, self.manifest, os.environ)
 
+
+class RouteParityCase(EnvironmentCase):
+    """The Docker and Host routes must refuse and accept the same machine files.
+
+    Key-name parity alone cannot prevent semantic drift: the Host wrapper binds
+    the Docker bridge's parser today, but nothing stops a later edit from forking
+    it. These cases therefore drive BOTH modules over one corpus of files and
+    compare what they DO - the values they resolve and whether they refuse - so a
+    fork that changes one side's behaviour fails here.
+    """
+
+    # Each entry is (description, file text, extra environment). The environment
+    # is what the launching shell would hold; a case that exports a machine value
+    # is exercising the file-wins / disagreement-refused rules.
+    CORPUS = (
+        ('plain', 'ASCENDNPU_CANN_SETUP=/cann/set_env.sh\n', {}),
+        ('quotes', 'ASCENDNPU_CANN_SETUP="/cann/set_env.sh"\n'
+                    "ASCENDNPU_CONDA_SH='/conda/c.sh'\n"
+                    'ASCENDNPU_CONDA_ENV="mk"\n', {}),
+        ('comments and blanks', '# a comment\n\nASCENDNPU_CONDA_ENV=mk\n', {}),
+        ('duplicate key', 'ASCENDNPU_CONDA_ENV=a\nASCENDNPU_CONDA_ENV=b\n', {}),
+        ('unknown key', 'ASCENDNPU__CANN_SETUP=/a\n', {}),
+        ('unbalanced quote', 'ASCENDNPU_CANN_SETUP="/a\n', {}),
+        ('unbalanced trailing quote', "ASCENDNPU_CONDA_ENV=mk'\n", {}),
+        ('not an assignment', 'rm -rf /\n', {}),
+        ('export line', 'export X=/a\n', {}),
+        ('space before equals', 'ASCENDNPU_CANN_SETUP =/a\n', {}),
+        ('relative cann path', 'ASCENDNPU_CANN_SETUP=cann/set_env.sh\n', {}),
+        ('relative ccec path', 'ASCENDNPU_CCEC_BIN=relative/bin\n', {}),
+        ('empty cann disables it', 'ASCENDNPU_CANN_SETUP=\nASCENDNPU_CONDA_ENV=\n', {}),
+        ('empty build subdir', 'ASCENDNPU_BUILD_SUBDIR=\n', {}),
+        ('build subdir traversal', 'ASCENDNPU_BUILD_SUBDIR=../build\n', {}),
+        ('build subdir absolute', 'ASCENDNPU_BUILD_SUBDIR=/build\n', {}),
+        ('plain build subdir', 'ASCENDNPU_BUILD_SUBDIR=build-release\n', {}),
+        ('non-numeric jobs', 'ASCENDNPU_NINJA_JOBS=sixty\n', {}),
+        ('zero jobs', 'ASCENDNPU_NINJA_JOBS=0\n', {}),
+        ('positive jobs', 'ASCENDNPU_NINJA_JOBS=8\n', {}),
+        ('command substitution is literal',
+         'ASCENDNPU_CANN_SETUP=$(touch {marker})\n', {}),
+        ('export agrees with the file',
+         'ASCENDNPU_BUILD_SUBDIR=build-release\n',
+         {'ASCENDNPU_BUILD_SUBDIR': 'build-release'}),
+        ('export contradicts the file',
+         'ASCENDNPU_BUILD_SUBDIR=build\n',
+         {'ASCENDNPU_BUILD_SUBDIR': 'build-fast'}),
+        ('export not in the file', 'ASCENDNPU_CANN_SETUP=\n',
+         {'ASCENDNPU_BUILD_SUBDIR': 'build-fast'}),
+        ('container keys', ''.join(f'{key}=value\n' for key in
+                                    ('ASCENDNPU_CONTAINER_NAME',
+                                     'ASCENDNPU_CONTAINER_USER',
+                                     'ASCENDNPU_CONTAINER_HOME')), {}),
+    )
+
+    # The values both routes resolve, in a fixed order. `toolchain_from_env_file`
+    # covers PATH-valued keys with their own absolute-path rules, so the corpus
+    # exercises the grammar and the semantic rules together.
+    READERS = ('toolchain_from_env_file', 'build_subdir', 'ninja_jobs', 'ccec_bin',
+               'require_conda_pair')
+
+    @staticmethod
+    def owner(module):
+        """The module that DEFINES the parser: the wrapper's sibling, if any."""
+        return getattr(module, 'shared', module)
+
+    def behaviour(self, module, path):
+        """What one module resolves: ok+value, or refused, per reader."""
+        result = []
+        for name in self.READERS:
+            reader = getattr(module, name)
+            try:
+                if name == 'require_conda_pair':
+                    cann, conda_sh, conda_env = module.toolchain_from_env_file()
+                    reader(conda_sh, conda_env)
+                    result.append((name, 'ok', None))
+                else:
+                    result.append((name, 'ok', repr(reader())))
+            except module.BridgeError:
+                result.append((name, 'refused', None))
+        return result
+
+    def test_the_two_routes_agree_on_one_corpus_of_machine_files(self):
+        for number, (label, text, extra) in enumerate(self.CORPUS):
+            with self.subTest(label=label):
+                text = text.format(marker=self.root / 'executed')
+                path = self.root / f'corpus-{number}.env'
+                path.write_text(text)
+                values = dict(os.environ)
+                values['ASCENDNPU_ENV_FILE'] = str(path)
+                values.update(extra)
+                with patch.dict(os.environ, values, clear=True):
+                    docker = self.behaviour(ASCEND, path)
+                    self.assertFalse((self.root / 'executed').exists(),
+                                     'a machine file was executed, not parsed')
+                with patch.dict(os.environ, values, clear=True):
+                    host = self.behaviour(HOST, path)
+                self.assertEqual(docker, host, label)
+
+    def test_a_missing_selector_is_refused_by_both_routes(self):
+        # The engine refuses an explicitly selected file that does not exist, so a
+        # route that quietly used the default would gate a machine nobody named.
+        values = {'ASCENDNPU_ENV_FILE': str(self.root / 'absent.env')}
+        for module in (ASCEND, HOST):
+            with self.subTest(module=module.__name__), patch.dict(os.environ, values, clear=True):
+                with self.assertRaises(module.BridgeError):
+                    module.toolchain_from_env_file()
+
+    def test_a_relative_selector_is_refused_by_both_routes(self):
+        values = {'ASCENDNPU_ENV_FILE': 'relative/env.sh'}
+        for module in (ASCEND, HOST):
+            with self.subTest(module=module.__name__), patch.dict(os.environ, values, clear=True):
+                with self.assertRaises(module.BridgeError):
+                    module.toolchain_from_env_file()
+
+    def test_no_file_at_all_means_the_same_empty_configuration(self):
+        for module in (ASCEND, HOST):
+            with self.subTest(module=module.__name__), \
+                    patch.dict(os.environ, {'ASCENDNPU_CANN_SETUP': ''}, clear=True):
+                # `default_env_file` is the sibling's, so it has to be patched
+                # where the parser looks it up - on the module that owns the
+                # search path, not on the wrapper that binds the parser.
+                with patch.object(self.owner(module), 'default_env_file',
+                                  return_value=None):
+                    self.assertEqual(module.toolchain_from_env_file(),
+                                     (None, None, None))
+                    self.assertEqual(module.build_subdir(), 'build')
+                    self.assertEqual(module.ninja_jobs(), '$(nproc)')
+                    self.assertIsNone(module.ccec_bin())
+
+
+class RouteLeaseCase(EnvironmentCase):
+    """A Host run and a Docker run must contend for the SAME build tree lease.""
+
+    The engine derives a run's resources from the Adapter ID and the resolved
+    build directory, and the resource string carries no Adapter identity
+    (locking.normalise realpaths only the path). That is what makes the two
+    routes serialize correctly: they are the same Adapter writing one tree. A
+    second Adapter ID would acquire a second, distinct lease for the same
+    directory, and two runs could then write it concurrently.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.source = self.root / 'source'
+        self.source.mkdir()
+
+    def resources(self, adapter, subdir):
+        """The leases a run of `adapter` would take, as the engine builds them."""
+        from agent_gates import engine, locking
+        manifest = Manifest(ADAPTERS / adapter / 'manifest.json')
+        name = ADAPTERS / machine_env.ADAPTERS[adapter]['directory']
+        path = self.write_env(f'{adapter}.env',
+                              {machine_env.ADAPTERS[adapter]['prefix'] + 'BUILD_SUBDIR':
+                               subdir})
+        env = {'ASCENDNPU_ENV_FILE': str(path),
+               'TILELANG_HIVM_ENV_FILE': str(path)}
+        with patch.dict(os.environ, env, clear=True):
+            build = engine.build_directory(self.source, manifest, os.environ)
+        resources = ['source:' + str(self.source), 'build:' + str(build)]
+        return [locking.lock_path(resource, self.root / 'locks') for resource in resources], build
+
+    def test_the_host_gate_builds_where_the_engine_leases(self):
+        from agent_gates import engine
+        manifest = Manifest(ADAPTERS / 'ascendnpu-ir/manifest.json')
+        for subdir in ('build', 'build-release', 'out.dir'):
+            with self.subTest(subdir=subdir):
+                path = self.write_env('m.env', {'ASCENDNPU_BUILD_SUBDIR': subdir})
+                with patch.dict(os.environ, {'ASCENDNPU_ENV_FILE': str(path)}, clear=True):
+                    leased = engine.build_directory(self.source, manifest, os.environ)
+                    # The Host wrapper resolves the same name from the same file,
+                    # and the pin is `name`, not a private copy of the default.
+                    self.assertEqual(leased, (self.source / subdir).resolve())
+                    self.assertEqual(HOST.build_subdir(), subdir)
+                    self.assertEqual(leased, (self.source / HOST.build_subdir()).resolve())
+
+    def test_both_routes_take_the_same_lease_for_one_tree(self):
+        # One Adapter, two routes: the IDs the engine leases under are identical
+        # because the resource string is derived from the PATH, not the route.
+        for subdir in ('build', 'build-release'):
+            with self.subTest(subdir=subdir):
+                from agent_gates import locking
+                host_paths, host_build = self.resources('ascendnpu-ir', subdir)
+                # The same manifest serves both routes, so there is nothing to
+                # compare across Adapter IDs here - the point is that the Host
+                # gate's own directory produces the lease the engine takes.
+                self.assertEqual(host_build, (self.source / subdir).resolve())
+                self.assertEqual(host_paths,
+                                 [locking.lock_path('source:' + str(self.source),
+                                                    self.root / 'locks'),
+                                  locking.lock_path('build:' + str(host_build),
+                                                    self.root / 'locks')])
+                # No adapter identity appears in the resource name.
+                for resource in ('source:' + str(self.source),
+                                 'build:' + str(host_build)):
+                    self.assertNotIn('ascendnpu', locking.normalise(resource))
+
+    def test_two_adapter_ids_on_one_build_path_still_collide(self):
+        # The reason the host route is a new gate on the SAME Adapter rather than
+        # a new Adapter: two IDs pointing at one directory must hash to one lock
+        # file, or the serialization the lease exists for does not happen.
+        from agent_gates import locking
+        ascend, ascend_build = self.resources('ascendnpu-ir', 'build')
+        tilelang, tilelang_build = self.resources('tilelang-hivm', 'build')
+        self.assertEqual(ascend_build, tilelang_build)
+        self.assertEqual(ascend, tilelang)
+        # Stated as the property, not just as this pair: the file one resource
+        # leases is a hash of the resolved path alone.
+        self.assertEqual(locking.lock_path('build:' + str(ascend_build), self.root / 'locks'),
+                         locking.lock_path('build:' + str(tilelang_build), self.root / 'locks'))
 
 class WorkerBackstopCase(EnvironmentCase):
     """The worker backstop is derived from the Adapters, never guessed."""

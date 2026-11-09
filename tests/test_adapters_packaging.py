@@ -3,12 +3,17 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTERS = ROOT / 'agent_gates/adapters'
+
+import sys
+sys.path.insert(0, str(ROOT))
+from agent_gates.manifest import Manifest, ManifestError as ContractError
 
 
 def load(name, file):
@@ -17,6 +22,78 @@ def load(name, file):
     spec.loader.exec_module(module)
     return module
 
+
+class HostPackCase(unittest.TestCase):
+    """The Host wrapper must work from an installed Pack, not just a checkout.
+
+    A Pack is a directory holding manifest.json, its pinned scripts and the
+    adapter's data files - it is not inside the source checkout, and no
+    `agent_gates` package is importable from it. The wrapper therefore reaches
+    its sibling by its own resolved path, which is the only locator a Pack can
+    rely on.
+    """
+
+    SCRIPTS = ('docker_gate.py', 'host_gate.py')
+
+    def build_pack(self):
+        """Copy the pinned payload into an isolated tmpdir and return its path."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        pack = Path(temp.name) / 'installed' / 'ascendnpu-ir'
+        (pack / 'scripts').mkdir(parents=True)
+        shutil.copy2(ADAPTERS / 'ascendnpu-ir/manifest.json', pack / 'manifest.json')
+        for name in self.SCRIPTS + ('init-toolchain.sh', 'full-build.sh'):
+            shutil.copy2(ADAPTERS / 'ascendnpu-ir/scripts' / name, pack / 'scripts' / name)
+        return pack
+
+    def test_the_host_wrapper_finds_its_sibling_in_an_isolated_pack(self):
+        pack = self.build_pack()
+        # Imported from the pack, not from the checkout: SIBLING must resolve to
+        # the copy beside it. A PYTHONPATH-dependent lookup would find the
+        # checkout's bridge here and hide a broken Pack.
+        module = load('isolated_host_gate', pack / 'scripts/host_gate.py')
+        self.assertEqual(Path(module.__file__).resolve(),
+                         (pack / 'scripts/host_gate.py').resolve())
+        self.assertEqual(module.SIBLING, (pack / 'scripts/host_gate.py').resolve().with_name(
+            'docker_gate.py'))
+        self.assertEqual(Path(module.shared.__file__).resolve(), module.SIBLING)
+        # And the parser it bound really is that copy, not the checkout's.
+        self.assertIs(module._parse_env_file, module.shared._parse_env_file)
+
+    def test_a_pack_without_the_sibling_refuses_instead_of_running(self):
+        # A Pack missing the file it reuses is broken, and it must say so at
+        # import time. Falling back to a copy elsewhere would run an unpinned
+        # parser, which is the failure the wrapper exists to prevent.
+        pack = self.build_pack()
+        (pack / 'scripts/docker_gate.py').unlink()
+        with self.assertRaises(SystemExit) as caught:
+            load('isolated_host_gate_missing', pack / 'scripts/host_gate.py')
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_the_pack_validates_only_with_the_payload_it_pins(self):
+        # Both python payloads are pinned. A pack whose copy drifted from the
+        # digest - a stale install, a hand edit, a bad build - must be refused,
+        # whether the drift is in the Docker bridge or in the Host wrapper.
+        for name in self.SCRIPTS:
+            with self.subTest(name=name):
+                pack = self.build_pack()
+                self.assertEqual(Manifest(pack / 'manifest.json').manifest_hash,
+                                 Manifest(ADAPTERS / 'ascendnpu-ir/manifest.json').manifest_hash)
+                (pack / 'scripts' / name).write_text('# tampered\n')
+                with self.assertRaises(ContractError):
+                    Manifest(pack / 'manifest.json')
+
+    def test_the_new_script_is_pinned_and_packaged(self):
+        # Both halves matter: a script the manifest does not pin could be edited
+        # without invalidating the Adapter, and a script the wheel does not ship
+        # would make every Host recipe fail after installation.
+        manifest = json.loads((ADAPTERS / 'ascendnpu-ir/manifest.json').read_text())
+        self.assertIn('scripts/host_gate.py', manifest['files'])
+        listing = (ROOT / 'pyproject.toml').read_text().split(
+            '[tool.setuptools.package-data]', 1)[1]
+        self.assertIn('"adapters/*/scripts/*"', listing)
+        self.assertTrue((ADAPTERS / 'ascendnpu-ir/scripts/host_gate.py').is_file())
+        self.assertTrue((ADAPTERS / 'ascendnpu-ir/scripts/docker_gate.py').is_file())
 
 class PackagingCase(unittest.TestCase):
     def test_every_bridge_finds_its_packaged_configuration(self):

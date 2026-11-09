@@ -1,13 +1,17 @@
 """Offline checks for the ascendnpu-ir Adapter: planning, mapping and failure paths.
 
 Every Docker interaction is faked, so these tests need neither a container nor a
-compiler build. They cover the deterministic rules the Adapter is responsible
-for: manifest/hash validity, plan composition with compiler-engineering, Gate
-dependency order, authorization and install/enablement refusal, build-subdir
-traversal refusal, mount-mapping rejection, declared-path mismatch, and the
-requirement that a non-zero Ninja exit can never be reported as PASS.
+compiler build, and the Host route is exercised against a temporary PATH of fake
+tools, so it needs no real cmake, ninja or clang either. They cover the
+deterministic rules the Adapter is responsible for: manifest/hash validity, plan
+composition with compiler-engineering, Gate dependency order, authorization and
+install/enablement refusal, build-subdir traversal refusal, mount-mapping
+rejection, declared-path mismatch, the Host toolchain floors, and the requirement
+that a non-zero Ninja exit can never be reported as PASS.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -23,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ADAPTERS = ROOT / 'agent_gates/adapters'
 ADAPTER = ADAPTERS / 'ascendnpu-ir'
 BRIDGE = ADAPTER / 'scripts/docker_gate.py'
+HOST_BRIDGE = ADAPTER / 'scripts/host_gate.py'
 FULL_BUILD = ADAPTER / 'scripts/full-build.sh'
 
 sys.path.insert(0, str(ROOT))
@@ -34,14 +39,17 @@ def load_manifest(path):
     return dict(manifest.raw, manifestHash=manifest.manifest_hash)
 
 
-def load_bridge():
-    spec = importlib.util.spec_from_file_location('ascendnpu_bridge', BRIDGE)
+def load_bridge(path=BRIDGE, name='ascendnpu_bridge'):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 bridge = load_bridge()
+# The no-Docker route. Loading it also proves it can find its pinned sibling by
+# its own resolved path: the module refuses to import without that file.
+host_bridge = load_bridge(HOST_BRIDGE, 'ascendnpu_host_bridge')
 
 
 class ManifestCase(unittest.TestCase):
@@ -50,20 +58,119 @@ class ManifestCase(unittest.TestCase):
         self.assertEqual(manifest['id'], 'ascendnpu-ir')
         self.assertEqual(manifest['permissions'], {'sourceWrite': False, 'hostExecution': True})
         self.assertEqual(manifest['runtimeCompatibility'], {'engineeringCore': '>=2.0.0'})
+        # Two routes, two recipes each. Both are the same Adapter on purpose: the
+        # engine derives the build lease from the Adapter ID, so a second ID would
+        # let a Docker run and a Host run write one build tree under two locks.
         self.assertEqual([r['id'] for r in manifest['recipes']],
-                         ['ascendnpu-ir.incremental-build', 'ascendnpu-ir.regression'])
-        self.assertEqual({g['id'] for g in manifest['gates']}, {'ascend-build', 'ascend-regression'})
-        self.assertEqual(len(manifest['files']), 3)
+                         ['ascendnpu-ir.incremental-build', 'ascendnpu-ir.regression',
+                          'ascendnpu-ir.host-build', 'ascendnpu-ir.host-regression'])
+        self.assertEqual({g['id'] for g in manifest['gates']},
+                         {'ascend-build', 'ascend-regression',
+                          'ascend-build-host', 'ascend-regression-host'})
+        self.assertEqual(len(manifest['files']), 4)
         self.assertEqual(set(manifest['files']),
                          {'scripts/docker_gate.py', 'scripts/init-toolchain.sh',
-                          'scripts/full-build.sh'})
+                          'scripts/full-build.sh', 'scripts/host_gate.py'})
+
+    def test_the_docker_route_is_byte_identical_after_the_host_route_exists(self):
+        # The non-regression guard: the working Docker route was reviewed and
+        # measured, so adding a second route must not touch a single byte of what
+        # it runs. Asserted as whole records rather than field by field, because a
+        # field-by-field check is what lets a new key slip in unnoticed.
+        manifest = load_manifest(ADAPTER / 'manifest.json')
+        recipes = {item['id']: item for item in manifest['recipes']}
+        self.assertEqual(recipes['ascendnpu-ir.incremental-build'], {
+            'id': 'ascendnpu-ir.incremental-build',
+            'cwd': 'source',
+            'timeout': 23400,
+            'argv': ['python3', '-B', '{pack}/scripts/docker_gate.py', '--timeout', '840',
+                     '--full-build-timeout', '21600', '--allow-full-build', 'bishengir-opt',
+                     'bishengir-compile', 'install-bishengir-publish-products'],
+            'configCheck': ['python3', '-B', '{pack}/scripts/docker_gate.py', '--check-config'],
+        })
+        self.assertEqual(recipes['ascendnpu-ir.regression'], {
+            'id': 'ascendnpu-ir.regression',
+            'cwd': 'source',
+            'timeout': 1200,
+            'argv': ['python3', '-B', '{pack}/scripts/docker_gate.py', '--timeout', '1140',
+                     'check-bishengir'],
+            'configCheck': ['python3', '-B', '{pack}/scripts/docker_gate.py', '--check-config'],
+        })
+        gates = {item['id']: item for item in manifest['gates']}
+        self.assertEqual(gates['ascend-build'], {
+            'id': 'ascend-build',
+            'recipeId': 'ascendnpu-ir.incremental-build',
+            'gateType': 'deterministic-test',
+            'observationChecks': {'exitCodeZero': True},
+        })
+        self.assertEqual(gates['ascend-regression'], {
+            'id': 'ascend-regression',
+            'recipeId': 'ascendnpu-ir.regression',
+            'gateType': 'deterministic-test',
+            'observationChecks': {'exitCodeZero': True},
+            'dependsOn': ['ascend-build'],
+        })
+        # No host-only key leaked into the Docker records: the two routes share an
+        # Adapter, so a stray "device": "none" here would silently stop the Docker
+        # gate from taking the card it needs.
+        for gate in ('ascend-build', 'ascend-regression'):
+            self.assertNotIn('device', gates[gate])
+            self.assertNotIn('deviceWindow', gates[gate])
+
+    def test_the_host_route_mirrors_the_docker_bounds_with_its_own_preflight(self):
+        # Same measured numbers - a Host build is the same build - but its own
+        # pinned script and its own configuration check, because the preflight a
+        # Host needs (cmake/ninja/clang on PATH) is not the preflight a container
+        # needs (container identity).
+        manifest = load_manifest(ADAPTER / 'manifest.json')
+        recipes = {item['id']: item for item in manifest['recipes']}
+        docker_build = recipes['ascendnpu-ir.incremental-build']
+        docker_regression = recipes['ascendnpu-ir.regression']
+        for host_id, docker in (('ascendnpu-ir.host-build', docker_build),
+                                ('ascendnpu-ir.host-regression', docker_regression)):
+            host = recipes[host_id]
+            self.assertEqual(host['cwd'], 'source')
+            self.assertEqual(host['argv'][:3],
+                             ['python3', '-B', '{pack}/scripts/host_gate.py'])
+            # The bound is the same job, so the same numbers. Only the script path
+            # and the preflight differ.
+            self.assertEqual(host['timeout'], docker['timeout'])
+            self.assertEqual(host['argv'][3:], docker['argv'][3:])
+            self.assertEqual(host['configCheck'][:3],
+                             ['python3', '-B', '{pack}/scripts/host_gate.py'])
+            self.assertNotIn('--check-config', host['configCheck'])
+        self.assertEqual(recipes['ascendnpu-ir.host-build']['configCheck'],
+                         ['python3', '-B', '{pack}/scripts/host_gate.py',
+                          '--check-config-build'])
+        self.assertEqual(recipes['ascendnpu-ir.host-regression']['configCheck'],
+                         ['python3', '-B', '{pack}/scripts/host_gate.py',
+                          '--check-config-regression'])
+
+    def test_the_two_routes_are_independent_in_dependency_order(self):
+        # A Host-only operator must be able to run both host gates without a
+        # container, and a Docker operator must not be made to run a Host build.
+        # Dependency closure is what a run walks, so a cross-route edge here
+        # would make each route demand the other one's machine.
+        contract = Manifest(ADAPTER / 'manifest.json')
+        self.assertEqual(contract.order(['ascend-regression-host']),
+                         ['ascend-build-host', 'ascend-regression-host'])
+        self.assertEqual(contract.order(['ascend-regression']),
+                         ['ascend-build', 'ascend-regression'])
+        # Each host gate names only its own host dependency, and each docker gate
+        # only its own docker one.
+        self.assertEqual(contract.gates['ascend-regression-host'].get('dependsOn'),
+                         ['ascend-build-host'])
+        self.assertEqual(contract.gates['ascend-regression'].get('dependsOn'),
+                         ['ascend-build'])
+        self.assertNotIn('dependsOn', contract.gates['ascend-build-host'])
+        self.assertNotIn('dependsOn', contract.gates['ascend-build'])
 
     def test_no_absolute_path_container_name_or_branch_is_hard_coded(self):
         # The project may be named; machine- and checkout-specific values may not.
-        # All three pinned files are scanned: the two shell scripts are read
-        # inside the container, so they must stay as machine-neutral as the Gate.
+        # All four pinned files are scanned: the two shell scripts are read
+        # inside the container, so they must stay as machine-neutral as the Gates.
         for text in (path.read_text()
-                     for path in (BRIDGE, bridge.INIT_SCRIPT, FULL_BUILD)):
+                     for path in (BRIDGE, HOST_BRIDGE, bridge.INIT_SCRIPT, FULL_BUILD)):
             for forbidden in ('/home/shijingchang', 's00653124', 'AscendNPU-IR-1',
                               'dev-compiletime-skippass', 'bisheng-async', 'triton-py311',
                               '/opt/cmake', '/opt/miniconda3', 'CANN/cann-'):
@@ -226,6 +333,21 @@ class ManifestCase(unittest.TestCase):
         self.assertIn('--allow-full-build', recipes['ascendnpu-ir.incremental-build']['argv'])
         self.assertNotIn('--allow-full-build', recipes['ascendnpu-ir.regression']['argv'])
         self.assertFalse(bridge.timeout_seconds(['--timeout', '1140', 'check-bishengir'])[3])
+        # The same rule on the Host route: exactly ONE recipe carries the flag,
+        # and it is the build one. A host regression gate that could build from
+        # scratch would pass on a tree where check-bishengir never ran.
+        carrying = {recipe['id'] for recipe in manifest['recipes']
+                    if '--allow-full-build' in recipe['argv']}
+        self.assertEqual(carrying, {'ascendnpu-ir.incremental-build',
+                                    'ascendnpu-ir.host-build'})
+        # Stated per route as well: within the Host route exactly one recipe
+        # carries it, so a host regression gate can never build from scratch.
+        host_carrying = {recipe['id'] for recipe in manifest['recipes']
+                         if recipe['argv'][2].endswith('/host_gate.py')
+                         and '--allow-full-build' in recipe['argv']}
+        self.assertEqual(host_carrying, {'ascendnpu-ir.host-build'})
+        self.assertFalse(host_bridge.timeout_seconds(
+            ['--timeout', '1140', 'check-bishengir'])[3])
 
     def test_the_regression_script_refuses_to_build_from_scratch(self):
         script = bridge.container_script('/src', 'build', '4', 840, None, None, None)
@@ -246,11 +368,11 @@ class ManifestCase(unittest.TestCase):
             self.assertNotEqual(timeout, 1, recipe['id'])
 
     def test_drifted_script_digest_is_refused(self):
-        # All three pinned files are covered: a drifted Gate or a drifted shell
+        # All four pinned files are covered: a drifted Gate or a drifted shell
         # script each break the manifest contract, because a Pack that pins a
         # file that no longer matches its own bytes cannot be trusted.
         for name in ('scripts/docker_gate.py', 'scripts/init-toolchain.sh',
-                     'scripts/full-build.sh'):
+                     'scripts/full-build.sh', 'scripts/host_gate.py'):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 copy = Path(tmp) / 'ascendnpu-ir'
                 shutil.copytree(ADAPTER, copy)
@@ -662,7 +784,14 @@ class RunCase(unittest.TestCase):
     def test_the_recipes_run_the_bridge_with_the_pinned_timeout(self):
         manifest = load_manifest(ADAPTER / 'manifest.json')
         mounts = [{'Type': 'bind', 'Source': str(self.root), 'Destination': str(self.root)}]
-        for recipe in manifest['recipes']:
+        # Only the Docker recipes reach the Docker bridge. The Host recipes are
+        # covered by HostRunCase, which drives host_gate.py against a fake PATH:
+        # running them here would either contact real Docker or prove nothing.
+        docker_recipes = [recipe for recipe in manifest['recipes']
+                          if recipe['argv'][2] == '{pack}/scripts/docker_gate.py']
+        self.assertEqual([recipe['id'] for recipe in docker_recipes],
+                         ['ascendnpu-ir.incremental-build', 'ascendnpu-ir.regression'])
+        for recipe in docker_recipes:
             # The manifest invokes `python3 -B {pack}/scripts/docker_gate.py ...`;
             # the bridge itself receives only the arguments after the script path.
             self.assertEqual(recipe['argv'][:3], ['python3', '-B', '{pack}/scripts/docker_gate.py'])
@@ -673,6 +802,15 @@ class RunCase(unittest.TestCase):
                           for part in call if 'timeout --signal=TERM' in part)
             self.assertIn(f'--kill-after={bridge.KILL_AFTER_SECONDS} {recipe["argv"][4]} ', script)
             self.assertLess(int(recipe['argv'][4]) + bridge.KILL_AFTER_SECONDS, recipe['timeout'])
+
+    def test_no_manifest_recipe_reaches_a_bridge_that_is_not_pinned(self):
+        # Every recipe must run a script the manifest pins, whatever route it
+        # takes. A recipe naming an unpinned path would execute bytes no digest
+        # covers - the exact hole the files map exists to close.
+        manifest = load_manifest(ADAPTER / 'manifest.json')
+        for recipe in manifest['recipes']:
+            self.assertIn(recipe['argv'][2].removeprefix('{pack}/'), manifest['files'],
+                          recipe['id'])
 
     def test_missing_container_fails_before_any_exec(self):
         calls = []
@@ -1015,6 +1153,645 @@ class ScriptExecutionCase(unittest.TestCase):
         self.assertTrue((self.source / 'build/CMakeCache.txt').is_file())
         self.assertFalse(self.ninja_log.exists())
 
+
+class HostToolchain:
+    """A temporary PATH of fake tools, so a Host preflight needs no real compiler.
+
+    host_gate resolves every tool from the EFFECTIVE PATH, after CANN and Conda.
+    Staging one executable per name - each answering --version with a chosen
+    string - is what makes the numeric comparison and the refusal paths testable
+    without installing or downgrading anything on the machine running the suite.
+    """
+
+    # What each tool reports by default. The version strings are the shapes the
+    # real tools print, including clang's "Ubuntu clang version 18.1.3 (1ubuntu1)",
+    # because a pattern that only matches a bare 1.2.3 would pass here and fail
+    # on the machine this Gate exists for.
+    VERSIONS = {
+        'cmake': 'cmake version 3.28.3',
+        'ninja': '1.13.2',
+        'clang': 'Ubuntu clang version 18.1.3 (1ubuntu1)',
+        'clang++': 'Ubuntu clang version 18.1.3 (1ubuntu1)',
+        'g++': 'g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0',
+        'ld.lld': 'Ubuntu LLD 18.1.3',
+        'python3': 'Python 3.12.3',
+        'git': 'git version 2.43.0',
+    }
+    # bash, timeout and nproc are staged too: the preflight probes them, and a
+    # case that only staged the interesting tools would fail for a boring reason.
+    TOOLS = ('bash', 'timeout', 'nproc') + tuple(VERSIONS)
+
+    def __init__(self, root, source):
+        self.root = Path(root)
+        self.source = Path(source)
+        self.path = self.root / 'tools'
+        self.path.mkdir()
+
+    def write(self, *, versions=None, omit=(), git_root='source'):
+        versions = versions or {}
+        for name in self.TOOLS:
+            if name in omit:
+                # Removing the file is what "missing" means. Skipping the write
+                # would leave a tool staged by an earlier call in place, and every
+                # refusal case here would silently assert nothing.
+                (self.path / name).unlink(missing_ok=True)
+                continue
+            reported = versions.get(name, self.VERSIONS.get(name))
+            lines = ['#!/bin/bash']
+            if reported is not None:
+                lines.append('if [ "$1" = --version ]; then printf "%s\\n" '
+                             + shlex.quote(reported) + '; exit 0; fi')
+            if name == 'bash':
+                # The generated script IS bash, so re-exec the real one rather
+                # than pretending to be it.
+                lines.append('exec /bin/bash "$@"')
+            if name == 'timeout':
+                # The generated script runs its work under `timeout`, so a stub
+                # that merely exited would never execute the command it wraps,
+                # and every run case would assert nothing. Drop the options and
+                # the duration, then run the command for real, untimed.
+                lines += ['while [ $# -gt 0 ]; do',
+                          '  case "$1" in',
+                          '    -*) shift ;;',
+                          '    *) break ;;',
+                          '  esac',
+                          'done',
+                          'shift',  # the duration
+                          'exec "$@"']
+            if name == 'nproc':
+                # `ninja_jobs()` defaults to $(nproc). A stub that printed
+                # nothing would delete the -j value and shift the Ninja argv.
+                lines += ['if [ "$1" = --version ]; then exit 0; fi',
+                          'printf "4\\n"',
+                          'exit 0']
+            if name == 'git' and git_root is not None:
+                root = self.source if git_root == 'source' else self.root / 'not-a-tree'
+                lines.append('if [ "$1" = rev-parse ]; then printf "%s\\n" '
+                             + shlex.quote(str(root)) + '; exit 0; fi')
+            lines.append('exit 0')
+            tool = self.path / name
+            tool.write_text('\n'.join(lines) + '\n')
+            tool.chmod(0o755)
+        return self.path
+
+
+class HostCase(unittest.TestCase):
+    """A staged machine file, a staged source tree and a staged PATH.
+
+    ASCENDNPU_ENV_FILE is always explicit, so the outcome cannot depend on
+    whether the machine running the suite keeps a real, git-ignored env.sh
+    beside the packaged Adapter.
+    """
+
+    def setUp(self):
+        self.saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.saved)))
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / 'source'
+        self.source.mkdir()
+        self.machine = self.root / 'env.sh'
+        self.write_machine('ASCENDNPU_CANN_SETUP=\n')
+        self.tools = HostToolchain(self.root, self.source)
+        self.tools.write()
+        origin = os.getcwd()
+        self.addCleanup(os.chdir, origin)
+        os.chdir(self.source)
+
+    def write_machine(self, text):
+        self.machine.write_text(text)
+        os.environ['ASCENDNPU_ENV_FILE'] = str(self.machine)
+        return self.machine
+
+    def stage_tree(self, state='incremental', subdir='build'):
+        """Put the build directory in one of the generator's three states."""
+        build = self.source / subdir
+        if state == 'incremental':
+            build.mkdir(parents=True, exist_ok=True)
+            (build / 'build.ninja').write_text('# fake\n')
+        elif state == 'half':
+            build.mkdir(parents=True, exist_ok=True)
+            (build / 'CMakeCache.txt').write_text('# configured, never built\n')
+        return build
+
+    def stage_third_party(self, llvm='populated', shmem='populated'):
+        for name, how in (('llvm-project', llvm), ('shmem', shmem)):
+            tree = self.source / 'third-party' / name
+            if how == 'absent':
+                continue
+            tree.mkdir(parents=True, exist_ok=True)
+            if how == 'populated':
+                (tree / 'CMakeLists.txt').write_text('# source\n')
+
+    def stage_ccec(self, executable=('ccec', 'llvm-link')):
+        """A ccec directory; names outside executable exist but are not +x."""
+        ccec = self.root / 'ccec'
+        ccec.mkdir(exist_ok=True)
+        for name in ('ccec', 'llvm-link'):
+            tool = ccec / name
+            tool.write_text('#!/bin/bash\nexit 0\n')
+            tool.chmod(0o755 if name in executable else 0o644)
+        self.write_machine('ASCENDNPU_CANN_SETUP=\nASCENDNPU_CCEC_BIN=' + str(ccec) + '\n')
+        return ccec
+
+    def check(self, mode='build'):
+        """Run one configuration check with the staged PATH as the whole PATH."""
+        os.environ['PATH'] = str(self.tools.path)
+        os.environ['HOME'] = str(self.root)
+        return host_bridge.main(['--check-config-' + mode])
+
+    def refusal(self, mode='build'):
+        """The message a refused check reported, or a failure if it passed."""
+        with self.assertRaises(host_bridge.BridgeError) as caught:
+            self.check(mode)
+        return caught.exception.message
+
+class HostPreflightCase(HostCase):
+    """The Host toolchain floors, proven numerically and with real refusals.
+
+    These are the checks Docker mode cannot provide: it inherits the image's
+    cmake and ninja, so a Host run is the only place a too-old tool needs to be
+    caught - and catching it here means catching it before a configure that
+    would spend minutes on LLVM first.
+    """
+
+    def test_a_satisfied_toolchain_validates(self):
+        self.stage_tree()
+        self.assertEqual(self.check(), 0)
+        # Nothing was built, configured or written.
+        self.assertEqual(sorted(p.name for p in self.source.iterdir()), ['build'])
+        self.assertEqual(sorted(p.name for p in (self.source / 'build').iterdir()),
+                         ['build.ninja'])
+
+    def test_ninja_1_11_is_refused_and_1_12_and_1_13_are_accepted(self):
+        # The exact boundary the source enforces at CMakeLists.txt:6-13, and the
+        # exact pair this machine has installed: /usr/bin/ninja is 1.11.1 and
+        # /usr/local/bin/ninja is 1.13.2, so which one PATH found decides.
+        self.stage_tree()
+        for version in ('1.11.1', '1.11.0', '1.9.0'):
+            self.tools.write(versions={'ninja': version})
+            message = self.refusal()
+            self.assertIn('ninja', message)
+            self.assertIn('1.12.0', message)
+            self.assertIn('CMakeLists.txt:6-13', message)
+        for version in ('1.12.0', '1.12.1', '1.13.2'):
+            self.tools.write(versions={'ninja': version})
+            self.assertEqual(self.check(), 0, version)
+
+    def test_cmake_3_27_is_refused_and_3_28_is_accepted(self):
+        self.stage_tree()
+        for version in ('cmake version 3.27.9', 'cmake version 3.27.0'):
+            self.tools.write(versions={'cmake': version})
+            message = self.refusal()
+            self.assertIn('cmake', message)
+            self.assertIn('3.28.0', message)
+        for version in ('cmake version 3.28.0', 'cmake version 3.28.3',
+                        'cmake version 4.0.1'):
+            self.tools.write(versions={'cmake': version})
+            self.assertEqual(self.check(), 0, version)
+
+    def test_the_version_comparison_is_numeric_not_lexical(self):
+        # 3.9 is older than 3.28, but "3.9" > "3.28" as a string, and as a Bash
+        # integer test the comparison is not even a number. Both directions are
+        # asserted so a comparison that merely reverses the bug cannot pass.
+        self.stage_tree()
+        self.tools.write(versions={'cmake': 'cmake version 3.9.6'})
+        self.assertIn('3.28.0', self.refusal())
+        self.tools.write(versions={'cmake': 'cmake version 3.28.0'})
+        self.assertEqual(self.check(), 0)
+        # And the same for ninja: 1.9 is older than 1.12 although "1.9" > "1.12".
+        self.tools.write(versions={'ninja': '1.9.0'})
+        self.assertIn('1.12.0', self.refusal())
+        self.tools.write(versions={'ninja': '1.12.0'})
+        self.assertEqual(self.check(), 0)
+
+    def test_a_version_with_fewer_components_is_padded_not_compared_by_length(self):
+        # ninja --version prints three components, but a tool reporting two must
+        # not be judged by tuple length: 3.28 has to satisfy a 3.28.0 floor.
+        self.stage_tree()
+        self.tools.write(versions={'ninja': '1.12', 'cmake': 'cmake version 3.28'})
+        self.assertEqual(self.check(), 0)
+
+    def test_every_required_tool_must_resolve_from_the_effective_path(self):
+        # Each of these is a tool the build really runs, so a missing one has to
+        # be named at t=0 rather than surfacing as a Ninja or lit failure.
+        self.stage_tree()
+        for name in ('clang', 'clang++', 'g++', 'ld.lld', 'git', 'timeout',
+                     'nproc', 'python3'):
+            with self.subTest(name=name):
+                self.tools.write(omit=(name,))
+                self.assertIn(name, self.refusal())
+        # cmake and ninja are refused even earlier, by the inlined init script,
+        # whose message is more specific. Assert the refusal, not its wording.
+        for name in ('cmake', 'ninja'):
+            with self.subTest(name=name):
+                self.tools.write(omit=(name,))
+                self.assertIn(name, self.refusal())
+
+    def test_a_missing_shell_still_fails_the_check(self):
+        # bash is not a probed tool: it is what RUNS the probe. Without it Python
+        # cannot even launch the check, so the failure is an OSError rather than a
+        # BridgeError with a nice message. What matters is that it is not 0 -
+        # a preflight that cannot run must never report a valid configuration.
+        self.stage_tree()
+        self.tools.write(omit=('bash',))
+        os.environ['PATH'] = str(self.tools.path)
+        os.environ['HOME'] = str(self.root)
+        with self.assertRaises((host_bridge.BridgeError, OSError)):
+            host_bridge.main(['--check-config-build'])
+
+    def test_a_failure_outside_a_git_work_tree_is_refused(self):
+        # build-tools/build.sh:75-77 exits 1 outside a repository, so a Host tree
+        # that is not a work tree cannot be built - and saying so here is cheaper
+        # than the same failure after Ninja starts.
+        self.stage_tree()
+        self.tools.write(git_root=None)
+        self.assertIn('git rev-parse --show-toplevel failed', self.refusal())
+
+    def test_the_resolved_path_is_reported_so_a_shadowed_tool_is_actionable(self):
+        # "ninja 1.11.1" is not actionable; "the first ninja on PATH is
+        # /usr/bin/ninja" is. The report goes to stderr, before any judgement.
+        self.stage_tree()
+        self.tools.write(versions={'ninja': '1.11.1'})
+        os.environ['PATH'] = str(self.tools.path)
+        os.environ['HOME'] = str(self.root)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(host_bridge.BridgeError):
+                host_bridge.main(['--check-config-build'])
+        report = stderr.getvalue()
+        # The path is printed beside the version, and the refusal repeats it:
+        # the operator has to know WHICH ninja was judged.
+        self.assertIn(str(self.tools.path / 'ninja'), report)
+        self.assertIn('1.11.1', report)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(host_bridge.BridgeError) as caught:
+                host_bridge.main(['--check-config-build'])
+        self.assertIn(str(self.tools.path / 'ninja'), caught.exception.message)
+
+
+class HostFromZeroCase(HostCase):
+    """What only a from-zero build needs, demanded only when it is needed."""
+
+    def setUp(self):
+        super().setUp()
+        # state=full means neither build.ninja nor CMakeCache.txt exists.
+        self.ccec = self.stage_ccec()
+        self.stage_third_party()
+
+    def test_a_populated_from_zero_tree_validates(self):
+        self.assertEqual(self.check(), 0)
+
+    def test_a_ccec_directory_without_the_tools_is_refused(self):
+        # bishengir/lib/Template/CMakeLists.txt:573-578 makes both tools FATAL, so
+        # a half-populated directory would fail after a configure that already ran.
+        for missing in ('ccec', 'llvm-link'):
+            with self.subTest(missing=missing):
+                self.stage_ccec()
+                (self.ccec / missing).unlink()
+                message = self.refusal()
+                self.assertIn(missing, message)
+                self.assertIn('bishengir/lib/Template/CMakeLists.txt:573-578', message)
+
+    def test_a_non_executable_ccec_is_refused(self):
+        # The CMake check is EXISTS, so mode 0644 passes CMake and then fails
+        # inside the tool with nothing naming the cause. This machine's real copy
+        # is 0750, which is why the executable bit is the property that matters.
+        self.stage_ccec(executable=('llvm-link',))
+        message = self.refusal()
+        self.assertIn('is not executable', message)
+        self.assertIn(str(self.ccec / 'ccec'), message)
+
+    def test_an_absent_ccec_selection_is_refused(self):
+        self.write_machine('ASCENDNPU_CANN_SETUP=\n')
+        self.assertIn('ASCENDNPU_CCEC_BIN', self.refusal())
+
+    def test_an_empty_or_absent_third_party_tree_is_refused(self):
+        # A submodule directory that exists but is empty is not populated: a
+        # from-zero configure would compile nothing and fail much later.
+        for name in ('llvm-project', 'shmem'):
+            for how in ('empty', 'absent'):
+                with self.subTest(name=name, how=how):
+                    self.stage_third_party()
+                    tree = self.source / 'third-party' / name
+                    if how == 'empty':
+                        for child in tree.iterdir():
+                            if child.is_dir():
+                                shutil.rmtree(child)
+                            else:
+                                child.unlink()
+                    else:
+                        shutil.rmtree(tree)
+                    message = self.refusal()
+                    self.assertIn(str(tree), message)
+                    self.assertIn(name, message)
+
+    def test_an_incremental_tree_needs_none_of_the_from_zero_prerequisites(self):
+        # The rule is "a from-zero build needs a compiler", not "a build gate
+        # does". A machine that only ever builds an existing tree may leave
+        # CCEC_BIN empty, which is what ccec_bin() already documents.
+        self.stage_tree('incremental')
+        self.write_machine('ASCENDNPU_CANN_SETUP=\n')
+        self.assertEqual(self.check(), 0)
+
+    def test_a_half_configured_tree_is_refused_by_both_checks(self):
+        # Same refusal as the generated MODE_PROBE, for the same reason: that
+        # tree can neither be built incrementally nor reconfigured without
+        # deleting state the Gate did not create, and no Gate may delete a tree.
+        self.stage_tree('half')
+        message = self.refusal('build')
+        self.assertIn('CMakeCache.txt exists without', message)
+        self.assertIn('build.ninja', message)
+        # A refused tree must be left exactly as it was found.
+        self.assertTrue((self.source / 'build' / 'CMakeCache.txt').is_file())
+        self.assertFalse((self.source / 'build' / 'build.ninja').exists())
+        # The regression check refuses it too: this is not a machine that merely
+        # lacks a build tree, it is a tree that is in neither state.
+        self.assertIn('CMakeCache.txt exists without', self.refusal('regression'))
+
+    def test_the_regression_check_is_tolerable_before_any_build_tree_exists(self):
+        # doctor runs on a NEW machine, which is exactly when no build tree exists
+        # yet. Refusing there would make the diagnostic useless on the machine it
+        # is for; the regression RECIPE is what refuses, and it says so itself.
+        self.assertFalse((self.source / 'build').exists())
+        self.assertEqual(self.check('regression'), 0)
+        # Still nothing written: the check reports the state, it does not create it.
+        self.assertFalse((self.source / 'build').exists())
+
+    def test_the_regression_check_does_not_require_the_from_zero_prerequisites(self):
+        # A regression run never configures, so demanding CCEC_BIN or populated
+        # submodules would refuse a machine that can run the regression gate.
+        self.write_machine('ASCENDNPU_CANN_SETUP=\n')
+        shutil.rmtree(self.source / 'third-party')
+        self.assertEqual(self.check('regression'), 0)
+
+    def test_an_unknown_check_flag_is_refused(self):
+        self.stage_tree()
+        for flag in ('--check-config', '--check-config-everything'):
+            with self.subTest(flag=flag):
+                os.environ['PATH'] = str(self.tools.path)
+                with self.assertRaises(host_bridge.BridgeError) as caught:
+                    host_bridge.main([flag])
+                self.assertIn('unknown configuration check', caught.exception.message)
+
+class HostRunCase(HostCase):
+    """The Host bridge end to end, with a recording fake ninja on PATH."""
+
+    def setUp(self):
+        super().setUp()
+        self.ninja_log = self.root / 'ninja-args'
+        self.stage_tree()
+        self.fake_ninja('exit 0')
+
+    def fake_ninja(self, tail):
+        """A ninja that answers --version and then runs `tail` instead of building."""
+        (self.tools.path / 'ninja').write_text(
+            '#!/bin/bash\n'
+            'if [ "$1" = --version ]; then printf "1.13.2\\n"; exit 0; fi\n'
+            'printf "%s\\n" "$@" > ' + shlex.quote(str(self.ninja_log)) + '\n'
+            + tail + '\n')
+        (self.tools.path / 'ninja').chmod(0o755)
+
+    def run_host(self, *args):
+        # The staged tools come first so the fake ninja wins, but /usr/bin stays
+        # behind them: the from-zero branch runs the committed shell script, which
+        # uses coreutils, and a PATH of stubs alone would fail for that reason.
+        os.environ['PATH'] = f'{self.tools.path}:/usr/bin:/bin'
+        os.environ['HOME'] = str(self.root)
+        return host_bridge.main(list(args))
+
+    def test_the_incremental_run_uses_the_shared_command_and_returns_its_code(self):
+        self.assertEqual(self.run_host('--timeout', '840', 'bishengir-opt'), 0)
+        # `$(nproc)` is the default job count the file leaves unset; the generated
+        # script expands it in the shell, which is why ninja sees the number.
+        self.assertEqual(self.ninja_log.read_text().split(),
+                         ['-C', 'build', '-j', '4', 'bishengir-opt'])
+
+    def test_a_failing_ninja_is_never_reported_as_pass(self):
+        self.fake_ninja('exit 17')
+        self.assertEqual(self.run_host('check-bishengir'), 17)
+
+    def test_a_timeout_is_returned_unchanged(self):
+        # 124 is timeout saying the tree was too slow. Laundering it into 0, or
+        # into a generic 3, would report PASS for work that never finished.
+        self.fake_ninja('exit 124')
+        self.assertEqual(self.run_host('--timeout', '840', 'check-bishengir'), 124)
+
+    def test_the_regression_run_refuses_to_build_from_scratch(self):
+        shutil.rmtree(self.source / 'build')
+        self.assertEqual(self.run_host('--timeout', '1140', 'check-bishengir'), 3)
+        self.assertFalse(self.ninja_log.exists())
+
+    def test_the_timeout_chain_is_the_shared_one(self):
+        self.fake_ninja('exit 0')
+        self.run_host('--timeout', '840', 'bishengir-opt')
+        # The generated script is the sibling's, so the same TERM/15s chain runs.
+        script = host_bridge.container_script(str(self.source), 'build', '$(nproc)', 840,
+                                             None, None, None, targets=('bishengir-opt',))
+        self.assertIn(f'--kill-after={bridge.KILL_AFTER_SECONDS} 840 ', script)
+
+    def test_a_full_build_is_opt_in_and_supersedes_the_named_targets(self):
+        # This is the build gate's own flag. A regression gate must never be
+        # satisfiable by a build, which is why the branch is opt-in per recipe.
+        shutil.rmtree(self.source / 'build')
+        tools_dir = self.source / 'build-tools'
+        tools_dir.mkdir()
+        recorded = self.root / 'build-args'
+        (tools_dir / 'build.sh').write_text(
+            '#!/bin/bash\n'
+            'printf "%s\\n" "$@" > ' + shlex.quote(str(recorded)) + '\n'
+            'build=.\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  if [ "$1" = --build ]; then build=$2; fi\n'
+            '  shift\n'
+            'done\n'
+            'mkdir -p "$build/bin"\n'
+            'for name in bishengir-opt bishengir-compile; do\n'
+            '  printf "#!/bin/bash\\nexit 0\\n" > "$build/bin/$name"\n'
+            '  chmod 755 "$build/bin/$name"\n'
+            'done\n')
+        (tools_dir / 'build.sh').chmod(0o755)
+        self.stage_ccec()
+        self.stage_third_party()
+        code = self.run_host('--timeout', '840', '--full-build-timeout', '21600',
+                             '--allow-full-build', 'bishengir-opt')
+        self.assertEqual(code, 0)
+        # Ninja is never run against a tree that has no build.ninja.
+        self.assertFalse(self.ninja_log.exists())
+        self.assertTrue((self.source / 'build/bin/bishengir-opt').is_file())
+        # The named targets are NOT forwarded: a flag-shaped target would reach
+        # build.sh as an option. The from-zero command builds every target.
+        argv = recorded.read_text().split()
+        self.assertNotIn('bishengir-opt', argv)
+        self.assertIn('--build', argv)
+
+
+class HostParityCase(unittest.TestCase):
+    """Host mode is Docker mode with the transport removed, proven by identity.
+
+    Not "the two agree today" but "there is one implementation": each of these
+    names must resolve to the SAME object the pinned sibling defines. A copy -
+    even a byte-identical one - would pass a behavioural test this morning and
+    drift the first time either side was edited, so identity is the assertion.
+    """
+
+    SHARED = ('BridgeError', 'FILE_KEYS', '_parse_env_file', 'machine_values',
+              'machine_value', 'build_subdir', 'ninja_jobs',
+              'toolchain_from_env_file', 'require_conda_pair',
+              'timeout_seconds', 'init_snippet', 'init_args', 'container_script')
+
+    # The one rule this file re-words, and the reason it may: the sibling's
+    # refusal says "absolute container path" (docker_gate.py:709), which is wrong
+    # on a route with no container. The RULE must stay the sibling's, so the
+    # wrapper is asserted to delegate rather than to reimplement.
+    REREWORDED = 'ccec_bin'
+
+    def test_every_shared_name_is_the_siblings_own_object(self):
+        for name in self.SHARED:
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(host_bridge, name), name)
+                self.assertIs(getattr(host_bridge, name),
+                              getattr(host_bridge.shared, name),
+                              name + ' is a copy, not the pinned implementation')
+        # And the sibling it loaded is the pinned file, resolved from this one.
+        self.assertEqual(Path(host_bridge.shared.__file__).resolve(),
+                         HOST_BRIDGE.resolve().with_name('docker_gate.py'))
+
+    def test_the_one_rewording_still_delegates_the_rule_to_the_sibling(self):
+        # A wrapper that re-derived the absoluteness check would be a second rule
+        # for one key. It must call the sibling's function, and it must pass the
+        # sibling's verdict through except for the noun it exists to correct.
+        self.assertIsNot(getattr(host_bridge, self.REREWORDED),
+                         getattr(host_bridge.shared, self.REREWORDED))
+        self.assertIs(host_bridge._shared_ccec_bin,
+                      host_bridge.shared.ccec_bin)
+
+        seen = []
+        original = host_bridge._shared_ccec_bin
+
+        def recorder(*args, **kwargs):
+            seen.append((args, kwargs))
+            return original(*args, **kwargs)
+        # This call must name its own machine file, like every other case in this
+        # module: reading the packaged (git-ignored) env.sh would make the outcome
+        # depend on the developer's machine - a real CCEC_BIN there, or a stray
+        # export in the launching shell, would fail this case for an unrelated
+        # reason. The value is also the assertion: the wrapper must return the
+        # sibling's result unchanged, not re-derive it.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        chosen = Path(directory) / 'delegation.env'
+        chosen.write_text('ASCENDNPU_CCEC_BIN=/opt/ccec/bin' + chr(10))
+        with patch.dict(os.environ, {'ASCENDNPU_ENV_FILE': str(chosen)}, clear=True):
+            with patch.object(host_bridge, '_shared_ccec_bin', recorder):
+                self.assertEqual(host_bridge.ccec_bin(), Path('/opt/ccec/bin'))
+        self.assertEqual(len(seen), 1, 'the wrapper did not delegate to the sibling')
+
+        # The reworded branch: a relative value, still refused, host wording.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        relative = Path(directory) / 'machine.env'
+        relative.write_text('ASCENDNPU_CCEC_BIN=relative/bin\n')
+        with patch.dict(os.environ, {'ASCENDNPU_ENV_FILE': str(relative)}, clear=True):
+            with self.assertRaises(host_bridge.BridgeError) as caught:
+                host_bridge.ccec_bin()
+        self.assertIn('absolute host path', caught.exception.message)
+        self.assertNotIn('container path', caught.exception.message)
+        # ... and the Docker route on the same file still says "container", because
+        # the rewording is a difference between ROUTES, not a change to the rule.
+        # Asserting only the Host side would let a future edit make both routes say
+        # "host path" and pass, leaving the Docker message wrong for its own machine.
+        with patch.dict(os.environ, {'ASCENDNPU_ENV_FILE': str(relative)}, clear=True):
+            with self.assertRaises(bridge.BridgeError) as docker:
+                bridge.ccec_bin()
+        self.assertIn('absolute container path', docker.exception.message)
+        self.assertNotIn('host path', docker.exception.message)
+
+        # Any OTHER refusal from that function keeps its own wording: the wrapper
+        # corrects one sentence, it does not relabel every failure.
+        def other(*args, **kwargs):
+            raise host_bridge.BridgeError('some unrelated refusal')
+        with patch.object(host_bridge, '_shared_ccec_bin', other):
+            with self.assertRaises(host_bridge.BridgeError) as caught:
+                host_bridge.ccec_bin()
+        self.assertIn('some unrelated refusal', caught.exception.message)
+
+    def test_the_host_gate_never_calls_the_container_transport(self):
+        # Reusing the parser is the point; reusing the transport is the bug. The
+        # names are absent from this module's globals, and a source scan keeps it
+        # that way even if a later edit reaches them through `shared.`.
+        for name in ('docker_exec_prefix', 'container_mounts', 'verify_same_tree',
+                     'identity_probe', 'container_identity', 'map_host_to_container'):
+            with self.subTest(name=name):
+                self.assertNotIn(name, vars(host_bridge))
+                self.assertNotIn(name, HOST_BRIDGE.read_text())
+
+    def test_the_config_checks_never_spawn_docker(self):
+        # The whole point of the Host route: it must work on a machine that
+        # cannot reach the socket. Every argv the preflight issues is recorded and
+        # none of them may name docker - a `docker inspect` here would make the
+        # diagnostic refuse on exactly the machine it exists for.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        source = root / 'source'
+        (source / 'build').mkdir(parents=True)
+        (source / 'build/build.ninja').write_text('# fake\n')
+        for name in ('third-party/llvm-project', 'third-party/shmem'):
+            tree = source / name
+            tree.mkdir(parents=True)
+            (tree / 'CMakeLists.txt').write_text('# source\n')
+        tools = HostToolchain(root, source)
+        tools.write()
+        machine = root / 'env.sh'
+        ccec = root / 'ccec'
+        ccec.mkdir()
+        for name in ('ccec', 'llvm-link'):
+            (ccec / name).write_text('#!/bin/bash\nexit 0\n')
+            (ccec / name).chmod(0o755)
+        machine.write_text('ASCENDNPU_CANN_SETUP=\nASCENDNPU_CCEC_BIN=' + str(ccec) + '\n')
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        origin = os.getcwd()
+        self.addCleanup(os.chdir, origin)
+        os.chdir(source)
+        real_run = host_bridge.subprocess.run
+        issued = []
+        def record(argv, *args, **kwargs):
+            issued.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+        with patch.object(host_bridge.subprocess, 'run', side_effect=record):
+            os.environ.update({'PATH': str(tools.path), 'HOME': str(root),
+                               'ASCENDNPU_ENV_FILE': str(machine)})
+            for mode in ('build', 'regression'):
+                self.assertEqual(host_bridge.main(['--check-config-' + mode]), 0, mode)
+        self.assertTrue(issued, 'the preflight issued no command at all')
+        # No argv may name docker as a WORD. Matched per element rather than on
+        # the joined text: the probe payload inlines the committed init script,
+        # whose comments legitimately mention docker_gate.py as that file's
+        # other caller, and a substring test would fail on documentation.
+        for argv in issued:
+            self.assertNotIn('docker', [part.lower() for part in argv], argv[:2])
+        # The only command a config check may run is the bash probe script. Its
+        # -c text inlines the committed init script, whose COMMENT mentions
+        # docker_gate.py - that is documentation, not transport, so the check
+        # above is on the argv that would be executed, not on the payload text.
+        self.assertEqual({argv[0] for argv in issued}, {'bash'})
+        for argv in issued:
+            self.assertEqual(argv[:2], ['bash', '-c'])
+            self.assertEqual(argv[-1], 'bash')
+
+    def test_the_generated_script_is_the_shared_generators_own_text(self):
+        # Same argv, same tree probe, same timeout chain, same from-zero command:
+        # only the source root differs, because the Host root IS the tree.
+        arguments = dict(full_timeout=21600, ccec_bin=Path('/opt/ccec/bin'),
+                         targets=('bishengir-opt',), allow_full_build=True)
+        self.assertEqual(
+            host_bridge.container_script('/src', 'build', '64', 840, None, None,
+                                        None, **arguments),
+            bridge.container_script('/src', 'build', '64', 840, None, None,
+                                    None, **arguments))
 
 class InitScriptCase(unittest.TestCase):
     """Run the committed init script the way a human does: sourced, no arguments.
