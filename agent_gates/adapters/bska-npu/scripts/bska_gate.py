@@ -44,6 +44,8 @@ BSKA_NPU_KEYS = (
     "BSKA_NPU_BUILD_SUBDIR",
     "BSKA_NPU_NODE_BIN",
     "BSKA_NPU_CLAUDE_BIN",
+    "BSKA_NPU_TRITON_WHEEL",
+    "BSKA_NPU_TRITON_ASCEND_VERSION",
 )
 
 # Alias used by the repository machine-file parity test: the keys this script
@@ -147,6 +149,9 @@ def _check_config(values):
         ("CANN setup", "test -r " + shlex.quote(values["BSKA_NPU_CANN_SETUP"])),
         ("conda python", "test -x " + shlex.quote(python)),
     ]
+    wheel = values.get("BSKA_NPU_TRITON_WHEEL", "").strip()
+    if wheel:
+        checks.append(("triton wheel", "test -r " + shlex.quote(wheel)))
     for label, command in checks:
         result = _docker(["exec", name, "bash", "-lc", command], timeout=30)
         if result.returncode != 0:
@@ -184,6 +189,32 @@ try:
 except Exception as exc:
     record("tritonImported", False)
     print("triton import failed:", exc, file=sys.stderr)
+
+# The exact triton_ascend build. Distribution metadata is authoritative: these
+# vendor wheels do not expose an importable `triton_ascend` module.
+expected_version = os.environ.get("BSKA_EXPECT_TRITON_VERSION", "").strip()
+installed_version = ""
+try:
+    import importlib.metadata as _md
+    for _dist in ("triton-ascend", "triton_ascend"):
+        try:
+            installed_version = _md.version(_dist) or ""
+            break
+        except Exception:
+            continue
+except Exception as exc:
+    print("triton_ascend metadata failed:", exc, file=sys.stderr)
+record("tritonAscendInstalled", bool(installed_version))
+if expected_version:
+    record("tritonAscendVersionMatch", installed_version == expected_version)
+    facts["tritonAscendVersionPinned"] = True
+else:
+    # No pin declared: nothing to enforce, and the receipt says so.
+    record("tritonAscendVersionMatch", True)
+    facts["tritonAscendVersionPinned"] = False
+facts["tritonAscendVersion"] = installed_version
+facts["tritonAscendExpectedVersion"] = expected_version
+print("triton_ascend installed=%r expected=%r" % (installed_version, expected_version), file=sys.stderr)
 
 if torch is not None and facts.get("torchNpuImported"):
     try:
@@ -263,6 +294,7 @@ def _smoke(values):
     extra_lib = values.get("BSKA_NPU_CANN_EXTRA_LIB", "").strip()
     node_bin = values.get("BSKA_NPU_NODE_BIN", "/usr/local/bin/node")
     claude_bin = values.get("BSKA_NPU_CLAUDE_BIN", "/usr/local/bin/claude")
+    expect_triton_version = values.get("BSKA_NPU_TRITON_ASCEND_VERSION", "").strip()
 
     inner = (
         'source "$BSKA_CANN"; '
@@ -284,6 +316,7 @@ def _smoke(values):
         "-e", "BSKA_DEVICE=" + device,
         "-e", "BSKA_NODE_BIN=" + node_bin,
         "-e", "BSKA_CLAUDE_BIN=" + claude_bin,
+        "-e", "BSKA_EXPECT_TRITON_VERSION=" + expect_triton_version,
         name, "bash", "-lc", inner,
     ]
     try:
@@ -318,8 +351,12 @@ def _smoke(values):
         "torchImported", "torchNpuImported", "tritonImported", "npuAvailable",
         "deviceCountPositive", "tensorOnDevice", "numericalOk", "synchronizeOk",
         "nodeAvailable", "claudeAvailable", "helixAvailable",
+        "tritonAscendInstalled", "tritonAscendVersionMatch",
     ):
         observations[key] = bool(facts.get(key, False))
+    observations["tritonAscendVersionPinned"] = bool(facts.get("tritonAscendVersionPinned", False))
+    observations["tritonAscendVersion"] = str(facts.get("tritonAscendVersion", ""))
+    observations["tritonAscendExpectedVersion"] = str(facts.get("tritonAscendExpectedVersion", ""))
     print(json.dumps(observations))
     return 0
 

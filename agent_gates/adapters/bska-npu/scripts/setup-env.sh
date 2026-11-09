@@ -11,6 +11,10 @@
 # --base-env names an existing conda environment that already imports torch,
 # torch_npu and triton; it is cloned into BSKA_NPU_CONDA_ENV. Required only when
 # the target environment does not exist yet.
+#
+# When BSKA_NPU_TRITON_WHEEL is set in the machine file, this script installs
+# that exact vendor wheel (--force-reinstall --no-deps) and refuses to continue
+# if BSKA_NPU_TRITON_ASCEND_VERSION disagrees with what got installed.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +46,10 @@ ENVS_PATH="${BSKA_NPU_CONDA_ENVS_PATH:?}"
 CONDA_ENV="${BSKA_NPU_CONDA_ENV:?}"
 HELIX_REPO="${HELIX_REPO:-${BSKA_NPU_HELIX_REPO:-}}"
 DST="$ENVS_PATH/$CONDA_ENV"
+TRITON_WHEEL="${BSKA_NPU_TRITON_WHEEL:-}"
+TRITON_VERSION="${BSKA_NPU_TRITON_ASCEND_VERSION:-}"
+[ -z "$TRITON_WHEEL" ] || [ -r "$TRITON_WHEEL" ] \
+    || { echo "triton wheel not readable: $TRITON_WHEEL" >&2; exit 2; }
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || { echo "container $CONTAINER does not exist" >&2; exit 2; }
 [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" = true ] || { echo "container $CONTAINER is not running" >&2; exit 2; }
@@ -91,14 +99,26 @@ fi
 
 echo "== python packages + helix =="
 docker exec -i -u root "${PROXY_ENV[@]}" -e "PIP_INDEX=$PIP_INDEX" -e "DST=$DST" -e "HELIX_REPO=$HELIX_REPO" \
+    -e "TRITON_WHEEL=$TRITON_WHEEL" -e "TRITON_VERSION=$TRITON_VERSION" \
     "$CONTAINER" bash -s <<'INNER'
 set -e
+if [ -n "$TRITON_WHEEL" ]; then
+    "$DST/bin/python" -m pip install -q --force-reinstall --no-deps "$TRITON_WHEEL"
+fi
 "$DST/bin/python" -m pip install -q pybind11 -i "$PIP_INDEX"
 if [ -n "$HELIX_REPO" ]; then
     "$DST/bin/python" -m pip install -q --no-build-isolation --no-deps -e "$HELIX_REPO"
 fi
 "$DST/bin/python" -c "import pybind11; print('pybind11', pybind11.__version__)"
 if [ -n "$HELIX_REPO" ]; then "$DST/bin/helix" --help >/dev/null && echo "helix installed"; fi
+"$DST/bin/python" - <<'PY'
+import importlib.metadata, os
+installed = importlib.metadata.version('triton-ascend')
+expected = os.environ.get('TRITON_VERSION', '')
+print('triton_ascend', installed)
+if expected and installed != expected:
+    raise SystemExit('triton_ascend version mismatch: installed %s expected %s' % (installed, expected))
+PY
 INNER
 
 echo "provisioning complete for $CONTAINER"

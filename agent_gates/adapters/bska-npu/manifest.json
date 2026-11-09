@@ -14,7 +14,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/bska_gate.py": "2f5ebd205caa728e86db9ee6d810c0523441bf0289cb2cebabdc57b041c81f4b"
+    "scripts/bska_gate.py": "02b4075a2f13d2027c5e1e865cdcbc89f2e13f9ffa7983670e9c1ce00b284780"
   },
   "recipes": [
     {
@@ -58,7 +58,9 @@
         "synchronizeOk": true,
         "nodeAvailable": true,
         "claudeAvailable": true,
-        "helixAvailable": true
+        "helixAvailable": true,
+        "tritonAscendInstalled": true,
+        "tritonAscendVersionMatch": true
       }
     }
   ]

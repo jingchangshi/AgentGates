@@ -137,6 +137,10 @@ BSKA_NPU_KEYS = (
     'BSKA_NPU_BUILD_SUBDIR',
     'BSKA_NPU_NODE_BIN',
     'BSKA_NPU_CLAUDE_BIN',
+    # Pin one exact triton_ascend build. The wheel names the artifact to
+    # install; the version string is what the Gate enforces at run time.
+    'BSKA_NPU_TRITON_WHEEL',
+    'BSKA_NPU_TRITON_ASCEND_VERSION',
 )
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
