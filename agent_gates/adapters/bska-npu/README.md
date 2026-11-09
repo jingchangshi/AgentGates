@@ -46,9 +46,10 @@ paths. Pass an absolute path with --env-file (mapped to BSKA_NPU_ENV_FILE) or
 keep the git-ignored env.sh in place. The Gate parses it as data and never
 executes it.
 
-On this host the /home/<user>/CANN/cann tree is incomplete (no libhccl.so and no
-Ascend950PR operator package), so env.sh points BSKA_NPU_CANN_SETUP at the
-complete 9.3.0-weekly toolkit under /data/pri/9.3.0-weekly/cann.
+BSKA_NPU_CANN_SETUP must name a CANN toolkit complete enough for torch_npu on
+Ascend950PR: libhccl.so must resolve and ASCEND_OPP_PATH must carry the 950
+operator package. A toolkit missing either one fails the Gate closed rather
+than producing a partial PASS.
 
 ## Pinning the triton_ascend build
 

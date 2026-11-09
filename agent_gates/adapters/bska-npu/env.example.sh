@@ -30,10 +30,10 @@
 # ---------------------------------------------------------------------------
 # Machine values
 # ---------------------------------------------------------------------------
-# CANN set_env.sh. It must be complete enough for torch_npu: it must provide
-# libhccl.so and the Ascend950PR operator package under ASCEND_OPP_PATH. The
-# /home/<user>/CANN/cann tree on this host is NOT complete (no libhccl.so, no
-# 950 ops), so this points at the complete 9.3.0 toolkit under /data.
+# CANN set_env.sh. It must be complete enough for torch_npu on Ascend950PR:
+# libhccl.so must resolve and ASCEND_OPP_PATH must carry the 950 operator
+# package. A toolkit missing either one fails the Gate closed, so check the
+# toolkit before filling this in rather than after a failed run.
 BSKA_NPU_CANN_SETUP=
 
 # Optional extra directory prepended to LD_LIBRARY_PATH after CANN is sourced.
@@ -88,8 +88,8 @@ BSKA_NPU_CONTAINER_HOME=
 # ---------------------------------------------------------------------------
 # Illustrative shapes ONLY (not values from any machine)
 # ---------------------------------------------------------------------------
-# BSKA_NPU_CANN_SETUP=/data/pri/9.3.0-weekly/cann/set_env.sh
-# BSKA_NPU_CONDA_SH=/data/miniconda3/etc/profile.d/conda.sh
+# BSKA_NPU_CANN_SETUP=/data/<toolkit>/cann/set_env.sh
+# BSKA_NPU_CONDA_SH=/data/<miniconda>/etc/profile.d/conda.sh
 # BSKA_NPU_CONDA_ENV=bska-npu
 # BSKA_NPU_CONDA_ENVS_PATH=/home/<user>/.conda/envs
 # BSKA_NPU_HELIX_REPO=/home/<user>/workspace/BiShengKernelAgent
