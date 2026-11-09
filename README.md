@@ -2,7 +2,7 @@
 
 AgentGates is a standalone Python 3.11+ CLI for deterministic compiler build and test gates. Claude Code can plan and modify code; AgentGates executes digest-pinned recipes and records machine results, source identity, artifacts, logs, and verifiable local receipts. The CLI has no dependency on PiEngineeringHarness, Claude Code, or an agent runtime.
 
-The adapters are `ascendnpu-ir`, `tilelang-hivm`, `tilelang-hivm-npu`, `tla-npu`, `forgekernel-ascend-npu`, `tilefoundry-npu` and `bska-npu`. The NPU sanity gate exercises basic Ascend SIMD behavior; it does not prove full HIVM CodeGen correctness.
+The adapters are `ascendnpu-ir`, `tilelang-hivm`, `tilelang-hivm-npu`, `tilelang-npu`, `tla-npu`, `forgekernel-ascend-npu`, `tilefoundry-npu` and `bska-npu`. The NPU sanity gate exercises basic Ascend SIMD behavior; it does not prove full HIVM CodeGen correctness. `tilelang-npu` is the host-local one: it builds a plain TileLang checkout against the conda environment the result will run under, with no Docker, no HIVM backend and no container, then runs the pinned example tests on an authorized device.
 
 `scripts/bootstrap.sh` performs the first-time configuration as one command — virtualenv, editable install, then `list`, `doctor`, a full gate run, and the receipt's `report` and `verify` — with every machine value supplied as a parameter:
 
