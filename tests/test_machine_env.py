@@ -41,6 +41,7 @@ NPU = load_script(ADAPTERS / 'tilelang-hivm-npu/scripts/npu_gate.py', 'machine_e
 TLA = load_script(ADAPTERS / 'tla-npu/scripts/tla_gate.py', 'machine_env_tla')
 FK = load_script(ADAPTERS / 'forgekernel-ascend-npu/scripts/fk_gate.py', 'machine_env_fk')
 BSKA = load_script(ADAPTERS / 'bska-npu/scripts/bska_gate.py', 'machine_env_bska')
+TLNPU = load_script(ADAPTERS / 'tilelang-npu/scripts/tilelang_npu_gate.py', 'machine_env_tlnpu')
 
 
 class EnvironmentCase(unittest.TestCase):
@@ -87,7 +88,8 @@ class KeySetParityCase(EnvironmentCase):
                                  (NPU, machine_env.TILELANG_HIVM_KEYS),
                                  (TLA, machine_env.TLA_NPU_KEYS),
                                  (FK, machine_env.FK_ASCEND_KEYS),
-                                 (BSKA, machine_env.BSKA_NPU_KEYS)):
+                                 (BSKA, machine_env.BSKA_NPU_KEYS),
+                                 (TLNPU, machine_env.TILELANG_NPU_KEYS)):
             self.assertEqual(tuple(sorted(module.TOOLCHAIN_KEYS)),
                              tuple(sorted(expected)), module.__name__)
 
@@ -123,7 +125,8 @@ class KeySetParityCase(EnvironmentCase):
         for adapter, spec in machine_env.ADAPTERS.items():
             module = {'ascendnpu-ir': ASCEND, 'tilelang-hivm': TILELANG,
                       'tilelang-hivm-npu': NPU, 'tla-npu': TLA,
-                      'forgekernel-ascend-npu': FK, 'bska-npu': BSKA}[adapter]
+                      'forgekernel-ascend-npu': FK, 'bska-npu': BSKA,
+                      'tilelang-npu': TLNPU}[adapter]
             path = self.root / f'{adapter}.env'
             text = ''.join(f'{key}=' + chr(10) for key in spec['keys'])
             path.write_text(text)
