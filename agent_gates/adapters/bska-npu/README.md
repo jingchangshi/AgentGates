@@ -13,7 +13,9 @@ sources CANN, uses the configured conda environment and proves that:
 * an NPU is visible and a device allocation succeeds;
 * a real Triton vector-add kernel compiles, runs, synchronizes and matches the
   Torch reference numerically;
-* node, claude and helix are available inside the container.
+* node, claude and helix are available inside the container;
+* the exact `triton_ascend` build named in the machine file is installed, and
+  when a version is pinned the running interpreter matches it.
 
 It does not drive a helix optimize round; that is a deliberate, more expensive
 gate for later work.
@@ -24,7 +26,10 @@ The Gate fails unless the process exits zero and the receipt records every
 observation as true: containerRunning, cannSetupReadable, condaEnvPresent,
 torchImported, torchNpuImported, tritonImported, npuAvailable,
 deviceCountPositive, tensorOnDevice, numericalOk, synchronizeOk, nodeAvailable,
-claudeAvailable, helixAvailable. A missing observation is false, never assumed.
+claudeAvailable, helixAvailable, tritonAscendInstalled,
+tritonAscendVersionMatch. A missing observation is false, never assumed.
+The receipt also records `tritonAscendVersion`, `tritonAscendExpectedVersion`
+and `tritonAscendVersionPinned` for review.
 
 ## Device selection
 
@@ -43,7 +48,33 @@ executes it.
 
 On this host the /home/<user>/CANN/cann tree is incomplete (no libhccl.so and no
 Ascend950PR operator package), so env.sh points BSKA_NPU_CANN_SETUP at the
-complete 9.3.0 toolkit under /data/mcl/Ascend/9.3.0.w.
+complete 9.3.0-weekly toolkit under /data/pri/9.3.0-weekly/cann.
+
+## Pinning the triton_ascend build
+
+Vendor `triton_ascend` wheels change the TLA API between daily drops, so an
+optimize run is reproducible only when one exact build is named. Two optional
+keys in env.sh do that:
+
+* `BSKA_NPU_TRITON_WHEEL` — absolute CONTAINER path to one vendor wheel.
+  `scripts/setup-env.sh` installs it with `--force-reinstall --no-deps`, and
+  `--check-config` refuses a run if the file is not readable inside the
+  container. The wheel is already reachable through the `/data:/data` bind
+  mount, for example
+  `/data/daily/<date>/triton_ascend-<version>-cp311-cp311-linux_x86_64.whl`.
+* `BSKA_NPU_TRITON_ASCEND_VERSION` — the exact distribution version string,
+  the same value as `importlib.metadata.version("triton-ascend")`.
+
+The Gate reads the installed version at run time and records
+`tritonAscendInstalled`, `tritonAscendVersionMatch`, `tritonAscendVersion`,
+`tritonAscendExpectedVersion` and `tritonAscendVersionPinned`. With a version
+pin set, a mismatch fails `tritonAscendVersionMatch`; the receipt also shows
+both version strings. With no pin, the Gate does not enforce a version and
+records `tritonAscendVersionPinned=false`, so an unpinned PASS cannot be
+mistaken for a verified one.
+
+To switch builds, set both keys and re-run `scripts/setup-env.sh`; the next
+Gate run then proves the running interpreter matches.
 
 ## Container and provisioning
 

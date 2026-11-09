@@ -60,6 +60,25 @@ BSKA_NPU_NODE_BIN=/usr/local/bin/node
 BSKA_NPU_CLAUDE_BIN=/usr/local/bin/claude
 
 # ---------------------------------------------------------------------------
+# Exact triton_ascend build - read by the Gate and setup-env.sh
+# ---------------------------------------------------------------------------
+# Vendor triton_ascend wheels change the TLA API between daily drops, so naming
+# one exact build is what makes an optimize run reproducible. Both keys are
+# optional; set both for a pinned machine.
+#
+# BSKA_NPU_TRITON_WHEEL is an absolute CONTAINER path to one vendor wheel. It is
+# reachable through the /data bind mount. setup-env.sh installs it with
+# --force-reinstall --no-deps, and --check-config refuses a run if the file is
+# not readable inside the container. Leave empty to keep what the env has.
+#
+# BSKA_NPU_TRITON_ASCEND_VERSION is the exact distribution version string, i.e.
+# importlib.metadata.version("triton-ascend"). When empty, the Gate still
+# reports the installed version but does not fail on a mismatch, and the receipt
+# records tritonAscendVersionPinned=false.
+BSKA_NPU_TRITON_WHEEL=
+BSKA_NPU_TRITON_ASCEND_VERSION=
+
+# ---------------------------------------------------------------------------
 # Container identity - read by the Gate
 # ---------------------------------------------------------------------------
 BSKA_NPU_CONTAINER_NAME=
@@ -69,11 +88,13 @@ BSKA_NPU_CONTAINER_HOME=
 # ---------------------------------------------------------------------------
 # Illustrative shapes ONLY (not values from any machine)
 # ---------------------------------------------------------------------------
-# BSKA_NPU_CANN_SETUP=/data/mcl/Ascend/9.3.0.w/ascend-toolkit/set_env.sh
+# BSKA_NPU_CANN_SETUP=/data/pri/9.3.0-weekly/cann/set_env.sh
 # BSKA_NPU_CONDA_SH=/data/miniconda3/etc/profile.d/conda.sh
 # BSKA_NPU_CONDA_ENV=bska-npu
 # BSKA_NPU_CONDA_ENVS_PATH=/home/<user>/.conda/envs
 # BSKA_NPU_HELIX_REPO=/home/<user>/workspace/BiShengKernelAgent
+# BSKA_NPU_TRITON_WHEEL=/data/daily/<date>/triton_ascend-<version>-cp311-cp311-linux_x86_64.whl
+# BSKA_NPU_TRITON_ASCEND_VERSION=<version>
 # BSKA_NPU_CONTAINER_NAME=<user>-bska
 # BSKA_NPU_CONTAINER_USER=<user>
 # BSKA_NPU_CONTAINER_HOME=/home/<user>
