@@ -326,16 +326,35 @@ class Engine:
         self.store = store or EvidenceStore()
         self.lock_root = lock_root
 
-    def doctor(self, adapter, source, *, env_file=None, device_id=None,
+    def doctor(self, adapter, source, *, selected=None, env_file=None, device_id=None,
                require_exclusive_device=False):
+        """Probe the configuration checks of one adapter, optionally for one route.
+
+        Every route is the default, because a machine diagnostic that silently
+        narrowed itself would answer a question nobody asked. A caller that names
+        gates is instead naming the route it can actually run - a host-only
+        machine has no Docker - so the selection is expanded with the same
+        `order` helper `run` uses, and an unknown id is refused there rather
+        than being diagnosed away.
+
+        `selected` is deliberately not a required positional: no caller, and no
+        receipt, changes meaning because this argument exists. An empty selection
+        is the all-route default and never "check nothing", because a PASS over
+        zero recipes would be a vacuous claim rather than a diagnosis.
+        """
         manifest = self.registry.get(adapter)
         source = source_root(Path(source))
         if self.store.root.resolve().is_relative_to(source):
             raise ValueError("evidence directory must be outside the source root")
         env = environment(manifest, env_file, device_id, require_exclusive_device)
+        # Expanded before any run directory exists, and in the same position
+        # `run` expands its own selection, so a mistyped gate costs the caller
+        # the same error with the same precedence rather than an evidence tree
+        # to clean up.
+        gates = manifest.order(selected) if selected else None
         run_id, directory = self.store.create_run()
-        checks, failures = [], []
-        for recipe_id in manifest.recipes:
+        checks, failures, checked, deduplicated = [], [], [], {}
+        for recipe_id in self._doctor_recipes(manifest, gates, source, deduplicated):
             recipe = manifest.resolve_recipe(recipe_id, source)
             try:
                 manifest.validate_files()
@@ -346,12 +365,60 @@ class Engine:
                 result = execute(recipe.config_check, cwd=recipe.cwd, env=env, timeout=min(120, recipe.timeout),
                                  log_dir=directory / "doctor" / recipe_id)
                 checks.append({"recipeId": recipe_id, **result})
+                checked.append(recipe_id)
                 if result["exitCode"] != 0 or result["timedOut"] or result["interrupted"]:
                     failures.append(f"CONFIG_CHECK_FAILED: {recipe_id}; inspect {result['stderr']['path']}")
             except (OSError, ValueError, RuntimeError) as exc:
                 failures.append(str(exc))
-        return {"runId": run_id, "adapter": adapter, "source": str(source), "status": "BLOCKED_ENV" if failures else "PASS",
+        # The scope is stated, not implied. A reader must be able to tell "every
+        # route on this machine is configured" from "the route I named is
+        # configured", and `allRoutes` is the single bit that says which one this
+        # report is: false unless every route of the adapter was probed.
+        return {"runId": run_id, "adapter": adapter, "source": str(source),
+                "status": "BLOCKED_ENV" if failures else "PASS",
+                "allRoutes": gates is None,
+                "selectedGates": self._doctor_gates(manifest, gates),
+                "checkedRecipes": checked, "deduplicatedRecipes": deduplicated,
                 "checks": checks, "failures": failures, "logDirectory": str(directory)}
+
+    @staticmethod
+    def _doctor_gates(manifest, gates):
+        """The gates this report speaks for: the closure, or every gate."""
+        return list(gates) if gates is not None else manifest.order(list(manifest.gates))
+
+    @staticmethod
+    def _doctor_recipes(manifest, gates, source, deduplicated):
+        """Which recipes to check, and which were folded into an identical one.
+
+        Every selected recipe is checked once. Two routes may also share one
+        configuration check - the Docker and host routes of one adapter can read
+        the same machine file - and running byte-identical argv twice would spend
+        a subprocess to learn the same fact. Folding is recorded in
+        `deduplicated` so the report still accounts for every selected recipe:
+        a folded recipe is checked THROUGH its twin, not silently dropped.
+        """
+        if gates is None:
+            # Untouched legacy scope: every declared recipe, each checked once,
+            # in manifest order. No folding, because that would change how many
+            # checks an existing caller sees.
+            return list(manifest.recipes)
+        recipes, seen, owner = [], set(), {}
+        for gate_id in gates:
+            recipe_id = manifest.gates[gate_id]["recipeId"]
+            if recipe_id in seen:
+                continue
+            seen.add(recipe_id)
+            recipe = manifest.resolve_recipe(recipe_id, source)
+            if not recipe.config_check:
+                recipes.append(recipe_id)
+                continue
+            identity = (recipe.config_check, recipe.cwd)
+            if identity in owner:
+                deduplicated[recipe_id] = owner[identity]
+                continue
+            owner[identity] = recipe_id
+            recipes.append(recipe_id)
+        return recipes
 
     def run(self, adapter, source, selected, *, env_file=None, device_id=None,
             require_exclusive_device=False):

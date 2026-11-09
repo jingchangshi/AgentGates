@@ -212,6 +212,14 @@ class DoctorReport(_Model):
 
     A doctor PASS proves the machine is configured. It is NOT evidence that any
     gate ran, and it can never satisfy a completion requirement (E3).
+
+    The scope keys exist so a PASS cannot be read as wider than it is. `status`
+    answers only for the recipes this report actually probed: `allRoutes` says
+    whether that was every route of the adapter, `selected_gates` names the
+    gate closure the caller asked for, and `checked_recipes` names the
+    configuration checks that ran. A host-only operator who scoped to the host
+    route gets a PASS that claims the host route and nothing about Docker -
+    which is why a scoped PASS must never be quoted as a whole-adapter result.
     """
 
     workspace: str
@@ -219,6 +227,14 @@ class DoctorReport(_Model):
     status: GateStatus
     checks: list[DoctorCheck] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)
+    # Defaults keep an older producer's payload loadable: a report that says
+    # nothing about scope is the historical all-route report, so `allRoutes`
+    # defaults to True rather than to the narrower claim.
+    all_routes: bool = True
+    selected_gates: list[str] = Field(default_factory=list)
+    checked_recipes: list[str] = Field(default_factory=list)
+    # recipe id -> the recipe whose identical configuration check covered it.
+    deduplicated_recipes: dict[str, str] = Field(default_factory=dict)
 
 
 # ── execution ────────────────────────────────────────────────────────────────

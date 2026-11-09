@@ -15,6 +15,11 @@ import pytest
 
 from agent_gates import api_types as api
 from agent_gates import config as cfg
+from agent_gates.cli import main
+from agent_gates.engine import Engine
+from agent_gates.evidence import EvidenceStore
+from agent_gates.manifest import digest
+from agent_gates.registry import Registry
 
 
 def write_config(tmp_path: Path, body: str, name: str = "config.toml") -> Path:
@@ -402,3 +407,167 @@ def test_requirement_verification_result_defaults_are_safe():
     assert result.run_id is None
     assert result.matched_gates == []
     assert result.failures == []
+
+
+# ── doctor scope (D8) ────────────────────────────────────────────────────────
+
+def test_doctor_report_defaults_to_the_all_route_claim():
+    """A report that says nothing about scope is the historical all-route one.
+
+    The default matters more than it looks: if the narrower claim were the
+    default, a payload from an older producer would read as scoped and an
+    operator could quote a host-only PASS where a full diagnosis was meant.
+    """
+    report = api.DoctorReport(workspace="w", adapter="a", status=api.GateStatus.PASS)
+    assert report.all_routes is True
+    assert report.selected_gates == []
+    assert report.checked_recipes == []
+    assert report.deduplicated_recipes == {}
+
+
+def test_doctor_report_states_a_scoped_claim_explicitly():
+    report = api.DoctorReport(
+        workspace="w", adapter="a", status=api.GateStatus.PASS,
+        all_routes=False, selected_gates=["host-regression"],
+        checked_recipes=["host-build"],
+        deduplicated_recipes={"host-regression": "host-build"})
+    rendered = api.jsonable(report)
+    assert rendered["all_routes"] is False
+    assert rendered["selected_gates"] == ["host-regression"]
+    assert rendered["deduplicated_recipes"] == {"host-regression": "host-build"}
+
+
+def test_doctor_report_rejects_an_undeclared_scope_key():
+    """The model stays closed, so no surface grows a private scope field."""
+    with pytest.raises(Exception):
+        api.DoctorReport(workspace="w", adapter="a", status=api.GateStatus.PASS,
+                         scope={"allRoutes": True})
+
+
+# ── doctor scoping: engine and CLI (D8) ──────────────────────────────────────
+
+@pytest.fixture
+def two_routes(tmp_path):
+    """One adapter, two routes: Docker checks fail here, host checks pass.
+
+    This is the machine the feature exists for. The two recipes of each route
+    share one configuration check, exactly as the real adapter does when both
+    routes read the same machine file, so the fold is exercised rather than
+    described.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (tmp_path / "evidence").mkdir()
+    pack = tmp_path / "adapters/two-route"
+    (pack / "scripts").mkdir(parents=True)
+    script = pack / "scripts/gate.py"
+    script.write_text(
+        "import sys\n"
+        "if '--check-config-docker' in sys.argv:\n"
+        "    print('docker socket unreadable for this uid', file=sys.stderr)\n"
+        "    sys.exit(2)\n"
+        "if '--check-config' in sys.argv:\n"
+        "    sys.exit(0)\n"
+        "sys.exit(0)\n")
+    routes = [("docker-build", "--check-config-docker", None),
+              ("docker-regression", "--check-config-docker", "docker-build"),
+              ("host-build", "--check-config", None),
+              ("host-regression", "--check-config", "host-build")]
+    (pack / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 1, "id": "two-route", "version": "1",
+        "files": {"scripts/gate.py": digest(script)},
+        "permissions": {"sourceWrite": False, "hostExecution": True},
+        "recipes": [{"id": f"two.{gate_id}", "cwd": "source", "timeout": 60,
+                     "argv": [sys.executable, "-I", "{pack}/scripts/gate.py"],
+                     "configCheck": [sys.executable, "-I", "{pack}/scripts/gate.py", flag]}
+                    for gate_id, flag, _ in routes],
+        "gates": [{"id": gate_id, "recipeId": f"two.{gate_id}",
+                   "gateType": "deterministic-test",
+                   "observationChecks": {"exitCodeZero": True},
+                   **({"dependsOn": [depends]} if depends else {})}
+                  for gate_id, _, depends in routes],
+    }))
+    engine = Engine(registry=Registry(tmp_path / "adapters"),
+                    store=EvidenceStore(tmp_path / "evidence"))
+    return engine, source
+
+
+def test_unscoped_doctor_keeps_the_all_route_behaviour(two_routes):
+    """Omitting the selection is today's behaviour: every recipe, aggregated."""
+    engine, source = two_routes
+    result = engine.doctor("two-route", source)
+    assert result["allRoutes"] is True
+    assert result["selectedGates"] == ["docker-build", "docker-regression",
+                                       "host-build", "host-regression"]
+    assert result["checkedRecipes"] == ["two.docker-build", "two.docker-regression",
+                                        "two.host-build", "two.host-regression"]
+    # No folding in the unscoped path: an existing caller must see the same
+    # number of checks it always saw.
+    assert result["deduplicatedRecipes"] == {}
+    assert result["status"] == "BLOCKED_ENV"
+
+
+def test_scoped_doctor_reports_scope_and_never_claims_other_routes(two_routes):
+    engine, source = two_routes
+    result = engine.doctor("two-route", source, selected=["host-build"])
+    assert result["status"] == "PASS"
+    assert result["allRoutes"] is False
+    assert result["selectedGates"] == ["host-build"]
+    assert result["checkedRecipes"] == ["two.host-build"]
+
+
+def test_scoped_doctor_expands_dependencies_and_folds_one_check(two_routes):
+    engine, source = two_routes
+    result = engine.doctor("two-route", source, selected=["host-regression"])
+    assert result["selectedGates"] == ["host-build", "host-regression"]
+    assert result["checkedRecipes"] == ["two.host-build"]
+    assert result["deduplicatedRecipes"] == {"two.host-regression": "two.host-build"}
+    assert result["status"] == "PASS"
+
+
+def test_scoped_doctor_is_still_blocked_when_the_selected_check_fails(two_routes):
+    """Never PASS because a route the caller did not select happens to pass."""
+    engine, source = two_routes
+    result = engine.doctor("two-route", source, selected=["docker-build"])
+    assert result["status"] == "BLOCKED_ENV"
+    assert result["allRoutes"] is False
+    assert result["checkedRecipes"] == ["two.docker-build"]
+    assert len(result["failures"]) == 1
+
+
+def test_unknown_gate_is_refused_before_a_run_directory_is_created(two_routes, tmp_path):
+    """A typo costs an error, not an evidence tree to clean up."""
+    engine, source = two_routes
+    doomed = source.parent / "evidence" / "runs"
+    before = sorted(doomed.iterdir()) if doomed.is_dir() else []
+    with pytest.raises(ValueError, match="unknown gate"):
+        engine.doctor("two-route", source, selected=["host-bulid"])
+    after = sorted(doomed.iterdir()) if doomed.is_dir() else []
+    assert after == before
+
+
+def test_doctor_scope_survives_the_empty_selection(two_routes):
+    """An empty list is the all-route default, never "check nothing"."""
+    engine, source = two_routes
+    result = engine.doctor("two-route", source, selected=[])
+    assert result["allRoutes"] is True
+    assert len(result["checkedRecipes"]) == 4
+
+
+def test_cli_doctor_refuses_an_unknown_gate(tmp_path):
+    """The flag is real on the doctor subcommand, and a bad id exits 2.
+
+    The refusal happens before a run directory exists, so the CLI exit code is
+    the caller-misuse code 2 rather than the BLOCKED_ENV diagnosis code 1.
+    """
+    adapter = Path(__file__).resolve().parent.parent / "agent_gates/adapters/ascendnpu-ir"
+    if not (adapter / "manifest.json").is_file():
+        pytest.skip("ascendnpu-ir adapter is not installed in this checkout")
+    # The evidence directory is a sibling of the source root, never inside it:
+    # the engine refuses that before any check runs, which is a different test.
+    source = tmp_path / "source"
+    source.mkdir()
+    evidence = tmp_path / "evidence"
+    refused = main(["doctor", "--adapter", "ascendnpu-ir", "--source", str(source),
+                    "--gate", "no-such-gate", "--evidence-root", str(evidence), "--json"])
+    assert refused == 2

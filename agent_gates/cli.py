@@ -29,6 +29,12 @@ def parser():
             selection = command.add_mutually_exclusive_group(required=True)
             selection.add_argument("--gate", action="append", help="gate ID; dependencies run first")
             selection.add_argument("--all", action="store_true", help="run every gate in this adapter")
+        if name == "doctor":
+            # Optional, and named exactly as `run` names it: the same operator
+            # scoping a diagnosis and a run should not learn two spellings. No
+            # `--all` counterpart, because every route is already the default.
+            command.add_argument("--gate", action="append",
+                                 help="gate ID; diagnose only this route and its dependencies")
         if name in {"report", "verify"}:
             command.add_argument("--run-id", help="run ID (default: most recent)")
         if name == "submit":
@@ -65,7 +71,7 @@ def main(argv=None):
         elif args.command in {"doctor", "run"}:
             options = {"env_file": args.env_file, "device_id": args.device_id}
             if args.command == "doctor":
-                result = engine.doctor(args.adapter, args.source, **options)
+                result = engine.doctor(args.adapter, args.source, selected=args.gate, **options)
             else:
                 selected = list(registry.get(args.adapter).gates) if args.all else args.gate
                 result = engine.run(args.adapter, args.source, selected, **options)
@@ -104,6 +110,14 @@ def main(argv=None):
             print(f"{result['status']}  run {result['runId']}")
             if result.get("receiptPath"):
                 print(f"Receipt: {result['receiptPath']}")
+            if "allRoutes" in result:
+                # A scoped PASS must not be quotable as a whole-adapter PASS, and
+                # the human-readable output is what an operator pastes into a
+                # ticket. The JSON carries the same facts; this line keeps the
+                # text form from being the one place the scope is invisible.
+                scope = ("all routes" if result["allRoutes"]
+                         else "gates " + ", ".join(result.get("selectedGates") or []))
+                print(f"Scope: {scope}; checked " + ", ".join(result.get("checkedRecipes") or []))
             for gate in result.get("gates", []):
                 print(f"  {gate['gateId']}: {gate['status']}")
                 for failure in gate.get("failures", []):

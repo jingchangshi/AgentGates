@@ -185,6 +185,114 @@ class ProtocolTests(McpFixture):
         self.assertFalse(verified.structured_content["satisfied"])
 
 
+class DoctorScopeTests(McpFixture):
+    """A doctor reply must state which route it speaks for.
+
+    The fixture models the real shape of the problem: one adapter with a
+    Docker route that cannot be configured here and a host route that can. An
+    all-route report is BLOCKED_ENV because the Docker checks fail; a report
+    scoped to the host route is PASS, and it must not be readable as a claim
+    about Docker. Two recipes per route share one configuration check, which is
+    what the fleet does when both routes read one machine file.
+    """
+
+    def setUp(self):
+        super().setUp()
+        script = self.pack / "scripts/gate.py"
+        script.write_text(
+            "import sys\n"
+            "if '--check-config-docker' in sys.argv:\n"
+            "    print('docker socket unreadable for this uid', file=sys.stderr)\n"
+            "    sys.exit(2)\n"
+            "if '--check-config' in sys.argv:\n"
+            "    sys.exit(0)\n"
+            "sys.exit(0)\n")
+        # One shared check per route, on purpose: the fold must be reported, not
+        # silently counted as a recipe that passed on its own.
+        recipes = [
+            ("two.docker-build", "--check-config-docker", []),
+            ("two.docker-regression", "--check-config-docker", ["ascend-build"]),
+            ("two.host-build", "--check-config", []),
+            ("two.host-regression", "--check-config", ["ascend-build-host"]),
+        ]
+        manifest = {
+            "schemaVersion": 1, "id": "test-pack", "version": "1",
+            "files": {"scripts/gate.py": digest(script)},
+            "permissions": {"sourceWrite": False, "hostExecution": True},
+            "recipes": [{"id": recipe_id, "cwd": "source", "timeout": 60,
+                         "argv": [PYTHON, "-I", "{pack}/scripts/gate.py"],
+                         "configCheck": [PYTHON, "-I", "{pack}/scripts/gate.py", flag]}
+                        for recipe_id, flag, _ in recipes],
+            "gates": [{"id": gate_id, "recipeId": recipe_id,
+                       "gateType": "deterministic-test",
+                       "observationChecks": {"exitCodeZero": True},
+                       **({"dependsOn": depends} if depends else {})}
+                      for (recipe_id, _, depends), gate_id in zip(
+                          recipes, ["ascend-build", "ascend-regression",
+                                    "ascend-build-host", "ascend-regression-host"])],
+        }
+        (self.pack / "manifest.json").write_text(json.dumps(manifest))
+
+    def doctor(self, **arguments):
+        async def action(session):
+            return await session.call_tool("doctor", {"workspace": "ws",
+                                                      "adapter": "test-pack", **arguments})
+        return self.call(action)
+
+    def test_unscoped_doctor_checks_every_route_and_never_folds(self):
+        """Omitting the selection is the all-route diagnosis, unchanged."""
+        structured = self.doctor().structured_content
+        self.assertEqual(structured["status"], "BLOCKED_ENV")
+        self.assertIs(structured["all_routes"], True)
+        self.assertEqual(structured["selected_gates"],
+                         ["ascend-build", "ascend-regression",
+                          "ascend-build-host", "ascend-regression-host"])
+        # Every recipe, in manifest order, each checked once - and no folding,
+        # because a caller that saw fewer checks than recipes would lose the fact
+        # that two scripts were consulted.
+        self.assertEqual(structured["checked_recipes"],
+                         ["two.docker-build", "two.docker-regression",
+                          "two.host-build", "two.host-regression"])
+        self.assertEqual(structured["deduplicated_recipes"], {})
+
+    def test_scoped_doctor_reports_its_scope_and_excludes_other_routes(self):
+        structured = self.doctor(gates=["ascend-build-host"]).structured_content
+        self.assertEqual(structured["status"], "PASS")
+        self.assertIs(structured["all_routes"], False)
+        self.assertEqual(structured["selected_gates"], ["ascend-build-host"])
+        self.assertEqual(structured["checked_recipes"], ["two.host-build"])
+        # The unselected Docker route's check did not run at all: a scoped
+        # diagnosis must not spend a subprocess on a route it cannot report on.
+        self.assertNotIn("docker", json.dumps(structured["checked_recipes"]))
+
+    def test_scoped_doctor_expands_dependencies_and_folds_one_check(self):
+        structured = self.doctor(gates=["ascend-regression-host"]).structured_content
+        self.assertEqual(structured["selected_gates"],
+                         ["ascend-build-host", "ascend-regression-host"])
+        # Both recipes declare one identical check, so it runs once and the fold
+        # is stated rather than hidden.
+        self.assertEqual(structured["checked_recipes"], ["two.host-build"])
+        self.assertEqual(structured["deduplicated_recipes"],
+                         {"two.host-regression": "two.host-build"})
+        self.assertEqual(structured["status"], "PASS")
+
+    def test_scoped_doctor_stays_blocked_when_the_selected_check_fails(self):
+        """A passing route elsewhere must never turn a failing one into PASS."""
+        structured = self.doctor(gates=["ascend-build"]).structured_content
+        self.assertEqual(structured["status"], "BLOCKED_ENV")
+        self.assertIs(structured["all_routes"], False)
+        self.assertEqual(structured["selected_gates"], ["ascend-build"])
+        self.assertEqual(structured["checked_recipes"], ["two.docker-build"])
+        self.assertEqual(len(structured["failures"]), 1)
+
+    def test_unknown_gate_is_refused(self):
+        # The transport renders every handler exception as one opaque error, so
+        # the assertion is the refusal itself; the readable reason is covered at
+        # the engine boundary in test_config_and_api.
+        result = self.doctor(gates=["no-such-gate"])
+        self.assertTrue(result.is_error)
+
+
 class LifecycleOverrideTests(McpFixture):
     """The gate machinery keeps working when the server is replaced."""
 

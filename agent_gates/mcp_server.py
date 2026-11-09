@@ -65,6 +65,16 @@ class GatesInput(_Input):
     adapter: str = Field(description="Adapter id available to that workspace.")
 
 
+class DoctorInput(_Input):
+    workspace: str = Field(description="Registered workspace id.")
+    adapter: str = Field(description="Adapter id available to that workspace.")
+    # Optional and additive: omitting it diagnoses every route exactly as before.
+    # A gate id is not a machine parameter - it names a fixpoint of the adapter's
+    # own dependency graph, so it cannot steer a command line.
+    gates: list[str] | None = Field(
+        None, description="Gate ids to diagnose (dependencies included); omit to probe every route.")
+
+
 class SubmitInput(_Input):
     workspace: str = Field(description="Registered workspace id.")
     adapter: str = Field(description="Adapter id available to that workspace.")
@@ -230,9 +240,11 @@ def build_server():
 
     @server.tool(name="doctor",
                  description="Probe the machine configuration for one workspace and "
-                             "adapter. Runs no compiler test and never satisfies a requirement.")
-    async def doctor(workspace: str, adapter: str) -> api.DoctorReport:
-        payload = GatesInput(workspace=workspace, adapter=adapter)
+                             "adapter. Runs no compiler test and never satisfies a requirement. "
+                             "Name gates to diagnose one route only; the reply states its scope.")
+    async def doctor(workspace: str, adapter: str,
+                     gates: list[str] | None = None) -> api.DoctorReport:
+        payload = DoctorInput(workspace=workspace, adapter=adapter, gates=gates)
         from .engine import Engine
         manager = _manager()
         workspace = manager.config.workspace(payload.workspace)
@@ -244,7 +256,7 @@ def build_server():
                         lock_root=manager.config.lock_root)
         adapter = manager.config.adapter(payload.adapter)
         result = engine.doctor(payload.adapter, workspace.source_root,
-                               env_file=adapter.env_file)
+                               selected=payload.gates, env_file=adapter.env_file)
         checks = [api.DoctorCheck(
             recipe_id=item.get("recipeId", ""),
             ok=(item.get("exitCode") == 0 and not item.get("timedOut")
@@ -254,7 +266,11 @@ def build_server():
         return api.DoctorReport(workspace=payload.workspace, adapter=payload.adapter,
                                 status=_status_enum(result.get("status")),
                                 checks=checks,
-                                failures=list(result.get("failures") or []))
+                                failures=list(result.get("failures") or []),
+                                all_routes=bool(result.get("allRoutes", True)),
+                                selected_gates=list(result.get("selectedGates") or []),
+                                checked_recipes=list(result.get("checkedRecipes") or []),
+                                deduplicated_recipes=dict(result.get("deduplicatedRecipes") or {}))
 
     @server.tool(name="submit",
                  description="Submit gates for asynchronous execution. Returns an execution "
