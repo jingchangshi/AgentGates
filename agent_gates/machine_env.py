@@ -142,6 +142,30 @@ BSKA_NPU_KEYS = (
     'BSKA_NPU_TRITON_WHEEL',
     'BSKA_NPU_TRITON_ASCEND_VERSION',
 )
+# The TileLang-NPU Adapter builds and tests a plain TileLang checkout ON THE HOST:
+# there is no container and no HIVM backend involved, so it owns its own prefix
+# rather than sharing the TILELANG_HIVM_ file. It is the only TileLang Adapter
+# that writes a host build tree through its own Gate, which is why it declares a
+# job count the build actually consumes.
+#
+# TILELANG_NPU_CMAKE_BIN exists because this host's conda environment ships a
+# CMake whose major version differs from the one that generated an existing build
+# tree; naming the binary keeps the operator in control of which generator
+# regenerates that tree. TILELANG_NPU_EXAMPLE_TESTS names the fixed example tests
+# the regression runs, so the selection is reviewed configuration rather than a
+# glob that silently grows.
+# The device id (TILELANG_NPU_DEVICE_ID) is a launch value, not a machine key.
+TILELANG_NPU_KEYS = (
+    'TILELANG_NPU_CANN_SETUP',
+    'TILELANG_NPU_CONDA_SH',
+    'TILELANG_NPU_CONDA_ENV',
+    'TILELANG_NPU_CONDA_ENVS_PATH',
+    'TILELANG_NPU_PYTHON',
+    'TILELANG_NPU_CMAKE_BIN',
+    'TILELANG_NPU_BUILD_SUBDIR',
+    'TILELANG_NPU_NINJA_JOBS',
+    'TILELANG_NPU_EXAMPLE_TESTS',
+)
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
 ADAPTERS = {
@@ -180,6 +204,15 @@ ADAPTERS = {
         'selector': 'BSKA_NPU_ENV_FILE',
         'directory': 'bska-npu',
         'keys': BSKA_NPU_KEYS,
+    },
+    # The host-local TileLang Adapter owns both its file and its prefix. Unlike
+    # the two HIVM Adapters it shares nothing with them: a build directory it
+    # leases must not be confused with the one the docker gates write.
+    'tilelang-npu': {
+        'prefix': 'TILELANG_NPU_',
+        'selector': 'TILELANG_NPU_ENV_FILE',
+        'directory': 'tilelang-npu',
+        'keys': TILELANG_NPU_KEYS,
     },
 }
 
