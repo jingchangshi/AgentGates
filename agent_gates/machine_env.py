@@ -120,26 +120,24 @@ FK_ASCEND_KEYS = (
     'FK_ASCEND_DEPENDENCY_POLICY',
     'FK_ASCEND_TILELANG_CACHE_DIR',
 )
-# The BSKA-NPU Adapter configures the BiShengKernelAgent (helix) runtime inside a
-# container: a complete CANN setup, one conda environment and the node/claude
-# executables. The device id is a launch value (BSKA_NPU_DEVICE_ID), not a key.
+# The BSKA-NPU Adapter proves the BiShengKernelAgent (helix) runtime and the
+# vendored official CANNBench evaluator on the HOST: a complete CANN setup, one
+# conda environment, the CANNBench checkout, and the node/claude executables.
+# There is no container key set: the Adapter runs as the invoking user so the
+# interpreter that imports Torch is the one the native extension was compiled
+# against. The device id is a launch value (BSKA_NPU_DEVICE_ID), not a key.
 BSKA_NPU_KEYS = (
-    'BSKA_NPU_CONTAINER_NAME',
-    'BSKA_NPU_CONTAINER_USER',
-    'BSKA_NPU_CONTAINER_HOME',
     'BSKA_NPU_CANN_SETUP',
-    'BSKA_NPU_CANN_EXTRA_LIB',
-    'BSKA_NPU_CONDA_SH',
     'BSKA_NPU_CONDA_ENV',
     'BSKA_NPU_CONDA_ENVS_PATH',
-    'BSKA_NPU_PYTHON_VERSION',
-    'BSKA_NPU_HELIX_REPO',
+    'BSKA_NPU_CANNBENCH_REPO',
+    'BSKA_NPU_CANNBENCH_TASK',
+    'BSKA_NPU_CANNBENCH_ARCH',
     'BSKA_NPU_BUILD_SUBDIR',
     'BSKA_NPU_NODE_BIN',
     'BSKA_NPU_CLAUDE_BIN',
-    # Pin one exact triton_ascend build. The wheel names the artifact to
-    # install; the version string is what the Gate enforces at run time.
-    'BSKA_NPU_TRITON_WHEEL',
+    # Pin one exact triton_ascend build. The version string is what the Gate
+    # enforces at run time.
     'BSKA_NPU_TRITON_ASCEND_VERSION',
 )
 # The TileLang-NPU Adapter builds and tests a plain TileLang checkout ON THE HOST:

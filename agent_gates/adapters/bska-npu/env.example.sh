@@ -1,10 +1,8 @@
-# CANN, Conda, container identity and the BiShengKernelAgent checkout - the
-# bska-npu Adapter.
+# CANN, Conda and the CANNBench checkout - the bska-npu Adapter.
 #
-# This is the single machine file for the bska-npu Adapter. Two readers use it:
-#
-#   * scripts/bska_gate.py   - --check-config and --smoke
-#   * the AgentGates engine  - to resolve the build directory it leases
+# This is the single machine file for the bska-npu Adapter. Readers: the Gate
+# (--check-config, --smoke, --cannbench) and the AgentGates engine, which
+# resolves the build directory it leases from the same file.
 #
 # Create it:
 #     cd <checkout>/agent_gates/adapters/bska-npu
@@ -24,77 +22,67 @@
 #
 # Only plain NAME=value lines are read. '#' comments and blank lines are
 # allowed. The file is parsed as data and never executed. Quotes around a value
-# are optional and stripped. All paths are CONTAINER paths; because /home and
-# /data are bind-mounted at the same path, host and container paths are equal.
+# are optional and stripped.
+#
+# There is no container: the Gate runs as the invoking user, on the host. That
+# is deliberate. A container's login shell pinned ASCEND_RT_VISIBLE_DEVICES and
+# its root identity resolved a different Torch than the one the native extension
+# was compiled against, so a container run could pass every check and still
+# score nothing.
 #
 # ---------------------------------------------------------------------------
 # Machine values
 # ---------------------------------------------------------------------------
-# CANN set_env.sh. It must be complete enough for torch_npu on Ascend950PR:
-# libhccl.so must resolve and ASCEND_OPP_PATH must carry the 950 operator
-# package. A toolkit missing either one fails the Gate closed, so check the
-# toolkit before filling this in rather than after a failed run.
+# CANN set_env.sh, sourced before anything imports torch_npu. It must be
+# complete enough for Ascend950PR: libhccl.so must resolve and ASCEND_OPP_PATH
+# must carry the 950 operator package.
 BSKA_NPU_CANN_SETUP=
 
-# Optional extra directory prepended to LD_LIBRARY_PATH after CANN is sourced.
-BSKA_NPU_CANN_EXTRA_LIB=
-
-# Conda: conda.sh (optional) and the environment that provides torch, torch_npu,
-# triton and helix. CONDA_ENVS_PATH holds the environment; the Gate uses
-# <CONDA_ENVS_PATH>/<CONDA_ENV>/bin/python directly and does not need a conda
-# activation.
-BSKA_NPU_CONDA_SH=
+# The conda environment holding torch, torch_npu, triton and helix. The Gate
+# uses <CONDA_ENVS_PATH>/<CONDA_ENV>/bin/python directly and needs no
+# activation. This interpreter must be the one the native extension was
+# compiled against; see BSKA_NPU_CANNBENCH_REPO below.
 BSKA_NPU_CONDA_ENV=
 BSKA_NPU_CONDA_ENVS_PATH=
-BSKA_NPU_PYTHON_VERSION=3.11
 
-# The BiShengKernelAgent checkout (host and container path are identical under
-# the /home bind mount). Informational for the Gate's reports.
-BSKA_NPU_HELIX_REPO=
+# The CANNBench checkout: the directory holding tools/run_cannbench.py and
+# operators/. The native extension is expected at
+# <CANNBENCH_REPO>/.cannbench-build/cann_bench_utils.
+BSKA_NPU_CANNBENCH_REPO=
+
+# The operator the --cannbench step scores, as levelN/name.
+BSKA_NPU_CANNBENCH_TASK=
+
+# Optional: the build target for the native extension. Leave empty for
+# ascend950. Other values are ascend910b and ascend910_93.
+# BSKA_NPU_CANNBENCH_ARCH=ascend950
 
 # Build selection accepted by the engine so it can take a resource lease.
 # BSKA_NPU_BUILD_SUBDIR=build
 
-# Optional absolute paths of node and claude inside the container.
-BSKA_NPU_NODE_BIN=/usr/local/bin/node
-BSKA_NPU_CLAUDE_BIN=/usr/local/bin/claude
+# Optional absolute paths of node and claude. Leave empty to use the one on
+# PATH; the Gate then reports which it found.
+BSKA_NPU_NODE_BIN=
+BSKA_NPU_CLAUDE_BIN=
 
 # ---------------------------------------------------------------------------
-# Exact triton_ascend build - read by the Gate and setup-env.sh
+# Exact triton_ascend build - read by the Gate
 # ---------------------------------------------------------------------------
 # Vendor triton_ascend wheels change the TLA API between daily drops, so naming
-# one exact build is what makes an optimize run reproducible. Both keys are
-# optional; set both for a pinned machine.
-#
-# BSKA_NPU_TRITON_WHEEL is an absolute CONTAINER path to one vendor wheel. It is
-# reachable through the /data bind mount. setup-env.sh installs it with
-# --force-reinstall --no-deps, and --check-config refuses a run if the file is
-# not readable inside the container. Leave empty to keep what the env has.
-#
-# BSKA_NPU_TRITON_ASCEND_VERSION is the exact distribution version string, i.e.
-# importlib.metadata.version("triton-ascend"). When empty, the Gate still
-# reports the installed version but does not fail on a mismatch, and the receipt
-# records tritonAscendVersionPinned=false.
-BSKA_NPU_TRITON_WHEEL=
+# one exact build is what makes an optimize run reproducible. This is the
+# distribution version string, i.e. importlib.metadata.version("triton-ascend").
+# When empty, the Gate reports the installed version but does not pass: the
+# Adapter has no way to prove the build is the reviewed one.
 BSKA_NPU_TRITON_ASCEND_VERSION=
-
-# ---------------------------------------------------------------------------
-# Container identity - read by the Gate
-# ---------------------------------------------------------------------------
-BSKA_NPU_CONTAINER_NAME=
-BSKA_NPU_CONTAINER_USER=
-BSKA_NPU_CONTAINER_HOME=
 
 # ---------------------------------------------------------------------------
 # Illustrative shapes ONLY (not values from any machine)
 # ---------------------------------------------------------------------------
 # BSKA_NPU_CANN_SETUP=/data/<toolkit>/cann/set_env.sh
-# BSKA_NPU_CONDA_SH=/data/<miniconda>/etc/profile.d/conda.sh
 # BSKA_NPU_CONDA_ENV=bska-npu
 # BSKA_NPU_CONDA_ENVS_PATH=/home/<user>/.conda/envs
-# BSKA_NPU_HELIX_REPO=/home/<user>/workspace/BiShengKernelAgent
-# BSKA_NPU_TRITON_WHEEL=/data/daily/<date>/triton_ascend-<version>-cp311-cp311-linux_x86_64.whl
+# BSKA_NPU_CANNBENCH_REPO=/home/<user>/workspace/cannbot-ops
+# BSKA_NPU_CANNBENCH_TASK=level1/swi_glu
 # BSKA_NPU_TRITON_ASCEND_VERSION=<version>
-# BSKA_NPU_CONTAINER_NAME=<user>-bska
-# BSKA_NPU_CONTAINER_USER=<user>
-# BSKA_NPU_CONTAINER_HOME=/home/<user>
+# BSKA_NPU_NODE_BIN=/home/<user>/Softwares/node/bin/node
+# BSKA_NPU_CLAUDE_BIN=/home/<user>/.local/bin/claude

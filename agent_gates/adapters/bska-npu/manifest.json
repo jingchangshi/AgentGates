@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "bska-npu",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "capabilities": [
     "device-regression"
   ],
@@ -14,18 +14,40 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/bska_gate.py": "02b4075a2f13d2027c5e1e865cdcbc89f2e13f9ffa7983670e9c1ce00b284780"
+    "scripts/bska_gate.py": "d307caa58cc3fdba6b033c414100e95c09f065f3156024556158c2eb6794368c"
   },
   "recipes": [
     {
       "id": "bska-npu.smoke",
       "cwd": "source",
-      "timeout": 1800,
+      "timeout": 900,
       "argv": [
         "python3",
         "-B",
         "{pack}/scripts/bska_gate.py",
         "--smoke"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/bska_gate.py",
+        "--check-config"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "bska-npu.cannbench",
+      "cwd": "source",
+      "timeout": 3600,
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/bska_gate.py",
+        "--cannbench",
+        "--timeout",
+        "3300"
       ],
       "configCheck": [
         "python3",
@@ -45,23 +67,39 @@
       "gateType": "deterministic-test",
       "observationChecks": {
         "exitCodeZero": true,
-        "containerRunning": true,
         "cannSetupReadable": true,
         "condaEnvPresent": true,
         "torchImported": true,
         "torchNpuImported": true,
         "tritonImported": true,
+        "torchvisionImported": true,
         "npuAvailable": true,
         "deviceCountPositive": true,
         "tensorOnDevice": true,
         "numericalOk": true,
         "synchronizeOk": true,
+        "cannBenchUtilsPresent": true,
+        "cannBenchUtilsCallable": true,
         "nodeAvailable": true,
         "claudeAvailable": true,
         "helixAvailable": true,
         "tritonAscendInstalled": true,
         "tritonAscendVersionMatch": true
       }
+    },
+    {
+      "id": "bska-npu-cannbench",
+      "recipeId": "bska-npu.cannbench",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "officialReportValid": true,
+        "allCasesPassed": true,
+        "allTimingsValid": true
+      },
+      "dependsOn": [
+        "bska-npu-smoke"
+      ]
     }
   ]
 }
