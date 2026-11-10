@@ -14,7 +14,8 @@ AgentGates bundles several independent, digest-pinned adapters. It runs fixed ar
 | `tla-npu` | `tla-npu-e2e` | `test_tla.py`: TLA SIMD FP8 cast-back plus its plain-Triton reference, on one authorized device | 1200 / 1260 s |
 | `forgekernel-ascend-npu` | `forgekernel-ascend-npu-smoke` | Real device work inside a lease window: FP32 and BF16 elementwise arithmetic and a reduction against a CPU reference | 300 / 420 s |
 | `forgekernel-ascend-npu` | `forgekernel-ascend-npu-build` | Host-local install of the adapted ForgeKernel tree into a private venv, plus an import/version/entry-point probe. No Docker, no root, no device | 900 / 1260 s |
-| `bska-npu` | `bska-npu-smoke` | Inside a configured container on one authorized device: source CANN, import torch/torch_npu/triton from one conda environment, run a real Triton vector-add against its Torch reference, and check node, claude and helix | 1500 / 1800 s |
+| `bska-npu` | `bska-npu-smoke` | Host-local, on one authorized device: source CANN, import torch/torch_npu/triton/torchvision from one conda environment, run a real Triton vector-add against its Torch reference, call the CANNBench native extension and compare its output, and check node, claude and helix | 600 / 900 s |
+| `bska-npu` | `bska-npu-cannbench` | Host-local, after smoke: score one operator with the vendored official CANNBench evaluator and accept the report only when every case passed and every case carries a valid timing | 3300 / 3600 s |
 | `tilelang-npu` | `tilelang-npu-build` | Host-local CMake configure plus a Ninja build of the default target against the conda environment the result will run under, then an import probe of the built tree. No Docker, no root, no device | 3300 / 3600 s |
 | `tilelang-npu` | `tilelang-npu-examples` | The pinned TileLang example tests on one authorized device, through a JUnit report, after build | 1500 / 1560 s |
 
@@ -29,6 +30,8 @@ The host regression configuration check exits 0 on a machine with no build tree 
 ## Machine configuration
 
 Keep machine files outside the package and pass an absolute `--env-file`. Files contain strict `NAME=value` data, comments and blank lines. Balanced surrounding quotes are removed. Unknown keys, duplicate keys and malformed lines fail. The gate readers never execute the file or expand substitutions. On the Docker route CANN and Conda paths name locations inside the container; on the Ascend host route the same keys name host paths. CANN is initialized before Conda; Conda setup and environment must be supplied together.
+
+`bska-npu` is host-local and has no container route. Its `BSKA_NPU_CANN_SETUP`, `BSKA_NPU_CONDA_ENV`, `BSKA_NPU_CONDA_ENVS_PATH`, `BSKA_NPU_CANNBENCH_REPO`, `BSKA_NPU_CANNBENCH_TASK` are required; `BSKA_NPU_CANNBENCH_ARCH`, `BSKA_NPU_BUILD_SUBDIR`, `BSKA_NPU_NODE_BIN`, `BSKA_NPU_CLAUDE_BIN` and `BSKA_NPU_TRITON_ASCEND_VERSION` are optional. An empty `BSKA_NPU_TRITON_ASCEND_VERSION` is refused rather than skipped: without it the Adapter cannot prove the triton_ascend build is the reviewed one.
 
 `--env-file` maps to `ASCENDNPU_ENV_FILE` for Ascend, `TILELANG_HIVM_ENV_FILE` for both HIVM TileLang adapters, `TILELANG_NPU_ENV_FILE` for the host-local TileLang adapter, `TLA_NPU_ENV_FILE` for the TLA adapter, `FK_ASCEND_ENV_FILE` for the ForgeKernel adapter, `BSKA_NPU_ENV_FILE` for BSKA and `TILEFOUNDRY_ENV_FILE` for TileFoundry. Without an explicit selection, bridges look beside the packaged adapter template, retaining the legacy owning-checkout search for installed pack compatibility. They never search a user's home for machine files. An explicitly selected missing file fails.
 
