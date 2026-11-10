@@ -1,103 +1,111 @@
-# BiShengKernelAgent NPU smoke adapter
+# bska-npu Adapter
 
-This Adapter proves that a deployed BiShengKernelAgent (helix) runtime works on
-a real Ascend NPU. It contributes one Recipe, one Gate and one machine file. It
-does not share the TileLang or TLA files.
+Runs and verifies the BiShengKernelAgent (helix) NPU runtime and the vendored
+official CANNBench evaluator on the host, against one conda environment and one
+authorized card. No container.
 
 ## What it proves
 
-Inside the configured container, on the explicitly authorized device, the Gate
-sources CANN, uses the configured conda environment and proves that:
+Two recipes, in order:
 
-* torch, torch_npu and triton import;
-* an NPU is visible and a device allocation succeeds;
-* a real Triton vector-add kernel compiles, runs, synchronizes and matches the
-  Torch reference numerically;
-* node, claude and helix are available inside the container;
-* the exact `triton_ascend` build named in the machine file is installed, and
-  when a version is pinned the running interpreter matches it.
+* `bska-npu.smoke` — CANN is sourced; the configured interpreter imports torch,
+  torch_npu, triton and torchvision; a real Triton vector-add runs on the
+  authorized card and matches its Torch reference; the CANNBench native
+  extension loads *and executes* on that card; node, claude and helix are
+  available.
+* `bska-npu.cannbench` — the vendored official evaluator scores one operator and
+  produces a report the project would accept: every case passed and every case
+  has a valid timing. Depends on `bska-npu.smoke`.
 
-It does not drive a helix optimize round; that is a deliberate, more expensive
-gate for later work.
+Neither step claims the other's result. A green smoke run says the runtime
+works; it says nothing about whether the evaluator can produce a score.
 
-## Gate requirements
+## Why no container
 
-The Gate fails unless the process exits zero and the receipt records every
-observation as true: containerRunning, cannSetupReadable, condaEnvPresent,
-torchImported, torchNpuImported, tritonImported, npuAvailable,
-deviceCountPositive, tensorOnDevice, numericalOk, synchronizeOk, nodeAvailable,
-claudeAvailable, helixAvailable, tritonAscendInstalled,
-tritonAscendVersionMatch. A missing observation is false, never assumed.
-The receipt also records `tritonAscendVersion`, `tritonAscendExpectedVersion`
-and `tritonAscendVersionPinned` for review.
+An earlier revision entered a Docker container as root. Two defects came out of
+that, and both were silent:
 
-## Device selection
+* the container's login shell exported `ASCEND_RT_VISIBLE_DEVICES`, overriding
+  the card the Gate was told to use;
+* running as root changed `HOME`, so the interpreter resolved the
+  environment-site Torch (2.10) instead of the user-site Torch (2.13) that the
+  native extension had been compiled against.
 
-This is a device Adapter. The Gate requires an explicitly authorized device
-through --device-id or BSKA_NPU_DEVICE_ID; it never discovers or substitutes a
-card. It exports ASCEND_RT_VISIBLE_DEVICES for the in-container process. The
-container is created with all local NPU device nodes and --network host.
+Under the mismatch every import still succeeded and accuracy still passed 20/20;
+only the performance stage failed, so the report carried an accuracy-only score
+that looks healthy and is not a score. Running on the host as the invoking user
+removes both: the interpreter that imports Torch is the one that compiled the
+extension, and the card named is the card used.
+
+The extension check is a *call*, not an existence test, for the same reason. A
+present `_C.so` proves the build finished, not that it fits the loaded Torch.
 
 ## Configuration
 
-One strict NAME=value file, env.sh, beside env.example.sh. It holds the complete
-CANN set_env.sh, the conda environment, the container identity and executable
-paths. Pass an absolute path with --env-file (mapped to BSKA_NPU_ENV_FILE) or
-keep the git-ignored env.sh in place. The Gate parses it as data and never
-executes it.
+One strict NAME=value file, `env.sh`, beside `env.example.sh`. Pass an absolute
+path with `--env-file` (mapped to `BSKA_NPU_ENV_FILE`) or keep the git-ignored
+`env.sh` in place. The Gate parses it as data and never executes it.
 
-BSKA_NPU_CANN_SETUP must name a CANN toolkit complete enough for torch_npu on
-Ascend950PR: libhccl.so must resolve and ASCEND_OPP_PATH must carry the 950
-operator package. A toolkit missing either one fails the Gate closed rather
-than producing a partial PASS.
+Required:
 
-## Pinning the triton_ascend build
+| Key | Meaning |
+| --- | --- |
+| `BSKA_NPU_CANN_SETUP` | `set_env.sh` of a toolkit complete enough for Ascend950PR: `libhccl.so` resolves and `ASCEND_OPP_PATH` carries the 950 operator package |
+| `BSKA_NPU_CONDA_ENV` | the environment holding torch, torch_npu, triton, helix |
+| `BSKA_NPU_CONDA_ENVS_PATH` | its parent directory |
+| `BSKA_NPU_CANNBENCH_REPO` | the checkout holding `tools/run_cannbench.py` and `operators/` |
+| `BSKA_NPU_CANNBENCH_TASK` | the operator the score step evaluates, as `levelN/name` |
 
-Vendor `triton_ascend` wheels change the TLA API between daily drops, so an
-optimize run is reproducible only when one exact build is named. Two optional
-keys in env.sh do that:
+Optional: `BSKA_NPU_CANNBENCH_ARCH` (default `ascend950`),
+`BSKA_NPU_BUILD_SUBDIR` (default `build`), `BSKA_NPU_NODE_BIN`,
+`BSKA_NPU_CLAUDE_BIN`, `BSKA_NPU_TRITON_ASCEND_VERSION`.
 
-* `BSKA_NPU_TRITON_WHEEL` — absolute CONTAINER path to one vendor wheel.
-  `scripts/setup-env.sh` installs it with `--force-reinstall --no-deps`, and
-  `--check-config` refuses a run if the file is not readable inside the
-  container. The wheel is already reachable through the `/data:/data` bind
-  mount, for example
-  `/data/daily/<date>/triton_ascend-<version>-cp311-cp311-linux_x86_64.whl`.
-* `BSKA_NPU_TRITON_ASCEND_VERSION` — the exact distribution version string,
-  the same value as `importlib.metadata.version("triton-ascend")`.
+`BSKA_NPU_TRITON_ASCEND_VERSION` is the exact distribution version the Gate
+enforces. Leaving it empty is refused: the Adapter has no way to prove the
+triton_ascend build is the reviewed one.
 
-The Gate reads the installed version at run time and records
-`tritonAscendInstalled`, `tritonAscendVersionMatch`, `tritonAscendVersion`,
-`tritonAscendExpectedVersion` and `tritonAscendVersionPinned`. With a version
-pin set, a mismatch fails `tritonAscendVersionMatch`; the receipt also shows
-both version strings. With no pin, the Gate does not enforce a version and
-records `tritonAscendVersionPinned=false`, so an unpinned PASS cannot be
-mistaken for a verified one.
+`BSKA_NPU_DEVICE_ID` is deliberately not in the file. It authorizes one run and
+is passed as `--device-id` or an export.
 
-To switch builds, set both keys and re-run `scripts/setup-env.sh`; the next
-Gate run then proves the running interpreter matches.
+## One-time preparation
 
-## Container and provisioning
+The Gate verifies the environment; it does not build it. Prepare once:
 
-docker/ supplies the deployment files:
+```bash
+source <toolkit>/set_env.sh
+PYTHON=<conda-env>/bin/python <cannbench-repo>/tools/build_cannbench_utils.sh ascend950
+```
 
-    cd docker
-    cp config.example.env config.env      # set identity, mounts, devices
-    ./create-container.sh --config ./config.env --dry-run
-    ./create-container.sh --config ./config.env
+The extension lands in `<cannbench-repo>/.cannbench-build/cann_bench_utils`.
+`--check-config` fails closed with the exact command when it is missing.
 
-Then provision node, claude, the conda environment and helix once:
-
-    bash scripts/setup-env.sh --base-env <validated-env-name> \
-        --helix-repo /home/<user>/workspace/BiShengKernelAgent
-
-The Gate never calls create-container.sh or setup-env.sh; they are deliberate
-operator actions.
+Rebuild after changing Python, Torch, torch_npu or CANN: the extension links
+against a specific Torch, and `ldd` on `_C.so` names which one.
 
 ## Usage
 
-    agent-gates doctor --adapter bska-npu --source <bska-checkout> \
-        --env-file <abs>/env.sh
-    agent-gates run --adapter bska-npu --source <bska-checkout> \
-        --env-file <abs>/env.sh --device-id 0 --all
-    agent-gates verify --run-id <RUN_ID>
+```bash
+python3 -B scripts/bska_gate.py --check-config
+BSKA_NPU_DEVICE_ID=2 python3 -B scripts/bska_gate.py --smoke
+BSKA_NPU_DEVICE_ID=2 python3 -B scripts/bska_gate.py --cannbench
+```
+
+`--check-config` is offline and fast: it reads the machine file and stats the
+paths. It neither imports Torch nor touches a card.
+
+Through AgentGates:
+
+```bash
+agent-gates doctor --adapter bska-npu --source <bska-checkout> --env-file <abs>/env.sh
+agent-gates run --adapter bska-npu --source <bska-checkout> \
+    --env-file <abs>/env.sh --device-id 2 --all
+```
+
+## Reading the result
+
+Standard output is one JSON object; every diagnostic goes to stderr. Exit code
+75 means the machine cannot run the Gate (BLOCKED_ENV, not a failed test).
+
+Check `exitCodeZero` and, for the score step, `officialReportValid` — not the
+score alone. A report with `score: 0.0` and `caseCount: 20` is a run whose cases
+never produced timings; `timedCases` distinguishes it from a genuine pass.
