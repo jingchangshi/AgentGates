@@ -279,6 +279,7 @@ def _activation(values):
     substitution inside a path would execute.
     """
     lines = [
+        'set +u',
         'source ' + shlex.quote(_required(values, 'TILELANG_NPU_CANN_SETUP')),
         'export CONDA_ENVS_PATH=' + shlex.quote(_required(values, 'TILELANG_NPU_CONDA_ENVS_PATH')),
         'source ' + shlex.quote(_required(values, 'TILELANG_NPU_CONDA_SH')),
@@ -292,7 +293,7 @@ def _run_shell(values, body, *, cwd, timeout, log):
     started = time.monotonic()
     script = 'set -o pipefail' + os.linesep + _activation(values) + os.linesep + body
     try:
-        result = subprocess.run(['/bin/bash', '-lc', script], cwd=str(cwd),
+        result = subprocess.run(['/bin/bash', '-c', script], cwd=str(cwd),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -391,7 +392,16 @@ def check_config():
 
 
 def check_config_examples():
-    return check_config()
+    rc = check_config()
+    if rc != 0:
+        return rc
+    try:
+        dev = device_id()
+        if dev is not None:
+            require_device_free(dev)
+    except BridgeError as exc:
+        _die(75, PROG + ': ' + str(exc))
+    return 0
 
 
 def build(values, timeout):
@@ -500,8 +510,9 @@ def device_occupancy(device):
     this Gate runs a numerical test, not an occupancy monitor, and a missing tool
     must not be able to fail a run that would otherwise pass.
     """
+    smi = os.environ.get('AGENT_GATES_SMI_COMMAND') or 'npu-smi'
     try:
-        result = subprocess.run(['npu-smi', 'info'], stdout=subprocess.PIPE,
+        result = subprocess.run([smi, 'info'], stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -562,6 +573,8 @@ def examples(values, timeout):
     """Run the pinned example tests on one authorized device."""
     source = _source_root()
     device = device_id()
+    if device is not None:
+        require_device_free(device)
     tests = example_tests(values)
     missing = [name for name in tests if not (source / name).is_file()]
     if missing:
@@ -574,8 +587,15 @@ def examples(values, timeout):
         return 75, _examples_observations(False, 0, 0, 0, 0)
 
     with tempfile.TemporaryDirectory(prefix='tilelang-npu-examples-') as tmp:
-        report = Path(tmp) / 'junit.xml'
-        log_path = Path(tmp) / 'pytest.log'
+        tmp_path = Path(tmp)
+        tmp_dir = tmp_path / 'tmp'
+        ascend_work = tmp_path / 'ascend_work'
+        triton_cache = tmp_path / 'triton_cache'
+        tilelang_cache = tmp_path / 'tilelang_cache'
+        for d in (tmp_dir, ascend_work, triton_cache, tilelang_cache):
+            d.mkdir(parents=True, exist_ok=True)
+        report = tmp_path / 'junit.xml'
+        log_path = tmp_path / 'pytest.log'
 
         # The example modules import each other by bare name
         # (for example "from example_vecadd import vector_add"), so every
@@ -593,6 +613,12 @@ def examples(values, timeout):
         # had nothing to do with the code under test.
         statements = [
             'export PYTHONPATH=' + shlex.quote(os.pathsep.join(directories)) + ':"$PYTHONPATH"',
+            'export TMPDIR=' + shlex.quote(str(tmp_dir)),
+            'export TEMP=' + shlex.quote(str(tmp_dir)),
+            'export TMP=' + shlex.quote(str(tmp_dir)),
+            'export ASCEND_WORK_PATH=' + shlex.quote(str(ascend_work)),
+            'export TRITON_CACHE_DIR=' + shlex.quote(str(triton_cache)),
+            'export TILELANG_CACHE_DIR=' + shlex.quote(str(tilelang_cache)),
         ]
         if device:
             statements.append('export ASCEND_RT_VISIBLE_DEVICES=' + shlex.quote(device))

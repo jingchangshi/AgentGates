@@ -105,7 +105,12 @@ CHECKS = ('venvCreated', 'forgekernelInstalled', 'importOk', 'versionReported',
 
 # Variables that are deliberately NOT machine-file keys: the file selector, the
 # per-run device authorization, and the probe command a test may substitute.
-NOT_MACHINE_KEYS = frozenset({'FK_ASCEND_ENV_FILE', 'FK_ASCEND_DEVICE_ID', 'FK_ASCEND_SMI'})
+NOT_MACHINE_KEYS = frozenset({
+    'FK_ASCEND_ENV_FILE',
+    'FK_ASCEND_DEVICE_ID',
+    'FK_ASCEND_SMI',
+    'FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE',
+})
 
 # A single install is bounded well below the manifest timeout: a resolver that
 # wanders for twenty minutes is a diagnosis, not progress.
@@ -376,6 +381,12 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def exclusive_requested() -> bool:
+    """Whether this run demands a card no other process is using."""
+    raw = (os.environ.get('FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE') or '').strip().lower()
+    return raw in {'1', 'true', 'yes', 'on'}
+
+
 def occupancy(resource: str) -> str:
     """Observed occupancy OF THE LEASED CARD, as a value the contract defines.
 
@@ -389,7 +400,11 @@ def occupancy(resource: str) -> str:
     is reported - other tenants' process ids and command lines never leave the
     probe.
     """
-    smi = env_value('FK_ASCEND_SMI', default='npu-smi') or 'npu-smi'
+    smi = (
+        env_value('FK_ASCEND_SMI')
+        or os.environ.get('AGENT_GATES_SMI_COMMAND')
+        or 'npu-smi'
+    )
     physical = resource.partition(':')[2]
     if not physical.isdigit():
         return 'unknown'
@@ -411,13 +426,6 @@ def occupancy(resource: str) -> str:
     if holders:
         return f'shared({holders})'
     return 'unknown'
-    # A process row is "| <npu id> | <pid> | <name> | <memory> |"; no other row
-    # in this report starts with two integer fields, so the count cannot pick up
-    # a utilisation or memory line.
-    holders = len(re.findall(r'^\|\s*[0-9]+\s*\|\s*[0-9]+\s*\|', done.stdout, re.MULTILINE))
-    if holders == 0:
-        return 'free'
-    return f'shared({holders})'
 
 
 @contextlib.contextmanager
@@ -463,10 +471,15 @@ def device_window():
                         f'AgentGates run holds it') from None
                 time.sleep(min(0.05, remaining))
         opened = time.monotonic()
+        occ = occupancy(resource)
+        if exclusive_requested() and occ.startswith('shared('):
+            raise DeviceWindowBusy(
+                f'device {resource} is {occ} and FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE is set'
+            )
         report = {'resource': resource, 'path': str(path),
                   'startedAt': _timestamp(),
                   'waited': round(opened - started, 3),
-                  'occupancy': occupancy(resource), 'releasedAt': None,
+                  'occupancy': occ, 'releasedAt': None,
                   # The occupancy probe shells out to npu-smi, so it happens before
                   # the work starts. Its own cost is published for the same reason
                   # the warmup is: a window should be dominated by work.

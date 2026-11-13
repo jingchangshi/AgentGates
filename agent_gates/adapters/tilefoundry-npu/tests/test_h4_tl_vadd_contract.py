@@ -40,7 +40,6 @@ def test_launch_failure_has_no_failover():
 
     expect("LAUNCH_FAILED", lambda: H.execute_attempt(selected, {}, {}, {}, ctx, launch_fn=launch))
     assert calls == [0], calls
-    return {"simulated": True, "case": "launch_failure", "code": "LAUNCH_FAILED", "calls": calls}
 
 
 def test_missing_output():
@@ -62,7 +61,6 @@ def test_missing_identity_cannot_pass():
         "artifacts": {k: {"status": "UNOBSERVED"} for k in H.ARTIFACT_KEYS}}
     result = H.evaluate_run(req, evidence, {"status": "PASS"})
     assert result["passed"] is False and result["reason_code"] == "ARTIFACT_IDENTITY_UNOBSERVED", result
-    return {"simulated": True, "case": "missing_identity", "result": result}
 
 
 if __name__ == "__main__":

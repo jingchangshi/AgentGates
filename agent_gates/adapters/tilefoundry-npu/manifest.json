@@ -1,237 +1,83 @@
 {
   "schemaVersion": 1,
   "id": "tilefoundry-npu",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "capabilities": [
-    "build",
-    "regression",
+    "cpu-regression",
     "device-regression"
   ],
   "skills": [],
   "permissions": {
     "sourceWrite": false,
-    "hostExecution": true,
-    "hostReadOnlyCapabilities": [
-      {
-        "id": "deployment-attest",
-        "argv": [
-          "--deployment-attest",
-          "OUT.json"
-        ],
-        "hostOnly": true,
-        "isGate": false,
-        "deviceAccess": false,
-        "executesInContainer": false,
-        "mutatesState": false,
-        "description": "Read-only producer of a host-side deployment attestation. Runs only 'docker inspect' and writes a JSON file with a content hash. It is NOT a Gate, is NOT listed in gates, starts/stops/creates nothing, executes nothing inside the container, and touches no /dev node. It exists because the device Gate runs inside the container where it cannot see its own device binding, so the binding must be attested from the host and then verified in-container via --deployment-attestation."
-      }
-    ]
+    "hostExecution": true
   },
   "runtimeCompatibility": {
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "deployment_profile.json": "2050686838356529cc46a9da01ff1b51cbb8421d975c815a7629babd9a595ec8",
-    "scripts/configure.py": "b24174488b83347a6731be6f060fb266097b9ea0dada2a3170f9691f095a1287",
-    "scripts/env_context.py": "7c44f47e2c3f5509264e246f62b1470c0007f6bd1dbe656876e504e7fef7f112",
-    "scripts/provision.py": "f0cafa3445171ff55e03cf2f3787be7da954365e0c1997504753eaae1abdcd7a",
-    "scripts/setup-tf-env.sh": "3c975084695060c29a8f68bf682c6b8066bbaab289f5a34a5ef45f7fe0259869",
-    "scripts/tilefoundry_gate.py": "fa001ab39755835ee37456bf30a9a20e560b098ee67567b882ddc73a24324c54",
-    "scripts/verify_environment.py": "a4abe5421148957108a091005b363d843ea04e5931b72e236c4c8b843ebc02f6",
-    "tests/env_evidence_check.py": "e3a69a94037c7fbf7acb7dea3dddf588dd07dc4308357efaccf292f72bab6d2e",
-    "tests/fixtures/docker-inspect-foreign.json": "c5dfeb005023f83eb0b3ac181d38e72a3ce82032fae6f4a34f2ed3ae5982db61",
-    "tests/fixtures/provision.env.fixture": "7be66866ccb12f1d89dc9326d39eb55a8b598cc61f3e2431204e91a94909c48f",
-    "tests/identity_check.py": "8828b2d5388b146f6d5d8bf5eb15cc920c17676370d36aab5488b5094783e17f",
-    "tests/manifest_parity.py": "7cee90318fbf3b28f62cc977db824a626c4f6d24b548c9cc8615802a694f64d2",
-    "tests/provision_negatives.sh": "babf88337d3e42822826547102959d8f0f861385f224f8ba0d56906ba84d07fb",
-    "tests/test_configure_negatives.py": "0b680a989b069b5e372a051228e22d0a204b08a202a9efd711d479b383e43ef8",
-    "tests/test_device_failover_policy.py": "01a27a8bdfb8703bcb611d36464e5d7c9840313c8ff481e0a672059e76750127",
-    "tests/test_no_bare_device_subprocess.py": "47770a79d5322a02bc9150088b52c5c5c273f8adef8647aa4f0b66b1676c9d20",
-    "tests/test_verify_evidence_integrity.py": "341e88fa2f4e6f82894af22947dd0ef1ce221130846391ed950d163a614f40be",
-    "tests/test_verify_tf_cpu_chain.py": "9bb5853ec53cdfe031b749e5774679a870f690d4c96b01605c7eb9dfad7d82e1",
-    "tests/tool_report_check.py": "5b845b7e13a499511b1f0089b5311e8a92114b9f6ef83e3b077dfdbd7b3513ae",
-    "tests/verify_negatives.sh": "607c527db9fab36ca80a71843bc703009bdd999b65ebdb1116587bd82270851c",
-    "scripts/device_harness.py": "3095e2f1db5be5c47273f888b88f31f1588a136ce0e3f5fda53caef891662be4",
-    "tests/test_device_harness.py": "bce4a11fac4c36041ff45f00439f47f4fa10368ae3f7901de15ba119dc4fbe1f"
+    "scripts/tilefoundry_host_gate.py": "c7df1fd6a7de292e1e2d5d2a09717a8209cf8d33f2cd4d1b647c82bf9515b9a5"
   },
   "recipes": [
     {
-      "id": "tilefoundry-npu.provision",
-      "cwd": "pack",
-      "timeout": 600,
-      "device": "none",
-      "argv": [
-        "python3",
-        "-B",
-        "{pack}/scripts/provision.py",
-        "--apply"
-      ],
-      "configCheck": [
-        "python3",
-        "-B",
-        "{pack}/scripts/provision.py",
-        "--check-config"
-      ],
-      "dependsOn": [],
-      "description": "Idempotent deployment step: create the container only when it is absent, never rebuild an existing one, and name drift instead of repairing it."
-    },
-    {
-      "id": "tilefoundry-npu.configure",
-      "cwd": "pack",
-      "timeout": 1800,
-      "device": "none",
-      "argv": [
-        "python3",
-        "-B",
-        "{pack}/scripts/configure.py"
-      ],
-      "configCheck": [
-        "python3",
-        "-B",
-        "{pack}/scripts/configure.py",
-        "--check-config"
-      ],
-      "dependsOn": [
-        "tilefoundry-npu.provision"
-      ],
-      "description": "Converge the shared prefix offline-first; a named non-zero stops the sequence."
-    },
-    {
-      "id": "tilefoundry-npu.verify",
-      "cwd": "pack",
-      "timeout": 1800,
-      "device": "none",
-      "argv": [
-        "python3",
-        "-B",
-        "{pack}/scripts/verify_environment.py",
-        "--side",
-        "recipe",
-        "--skip-device"
-      ],
-      "configCheck": [
-        "python3",
-        "-B",
-        "{pack}/scripts/verify_environment.py",
-        "--check-config"
-      ],
-      "dependsOn": [
-        "tilefoundry-npu.configure"
-      ],
-      "description": "CPU-side ENV verification (CANN, layers, configure idempotence, a checked TF program through checked/analyze/finalize, compile smoke). --skip-device keeps a CPU request from implicitly touching the card; device coverage remains the device Gate."
-    },
-    {
-      "id": "tilefoundry-npu.build",
-      "cwd": "source",
-      "timeout": 2400,
-      "device": "none",
-      "argv": [
-        "python3",
-        "-B",
-        "{pack}/scripts/tilefoundry_gate.py",
-        "--build"
-      ],
-      "configCheck": [
-        "python3",
-        "-B",
-        "{pack}/scripts/tilefoundry_gate.py",
-        "--check-config"
-      ],
-      "blockedExitCodes": [
-        75
-      ],
-      "dependsOn": [
-        "tilefoundry-npu.provision",
-        "tilefoundry-npu.configure",
-        "tilefoundry-npu.verify"
-      ]
-    },
-    {
       "id": "tilefoundry-npu.cpu",
       "cwd": "source",
-      "timeout": 1800,
+      "timeout": 660,
       "device": "none",
       "argv": [
         "python3",
         "-B",
-        "{pack}/scripts/tilefoundry_gate.py",
-        "--cpu"
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--cpu",
+        "--timeout",
+        "600"
       ],
       "configCheck": [
         "python3",
         "-B",
-        "{pack}/scripts/tilefoundry_gate.py",
+        "{pack}/scripts/tilefoundry_host_gate.py",
         "--check-config"
       ],
       "blockedExitCodes": [
         75
-      ],
-      "dependsOn": [
-        "tilefoundry-npu.provision",
-        "tilefoundry-npu.configure",
-        "tilefoundry-npu.verify"
       ]
     },
     {
       "id": "tilefoundry-npu.device",
       "cwd": "source",
-      "timeout": 1800,
+      "timeout": 660,
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
       "argv": [
         "python3",
         "-B",
-        "{pack}/scripts/tilefoundry_gate.py",
-        "--device"
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--device",
+        "--timeout",
+        "600"
       ],
       "configCheck": [
         "python3",
         "-B",
-        "{pack}/scripts/tilefoundry_gate.py",
-        "--check-config"
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--check-config-device"
       ],
       "blockedExitCodes": [
         75
-      ],
-      "dependsOn": [
-        "tilefoundry-npu.provision",
-        "tilefoundry-npu.configure",
-        "tilefoundry-npu.verify"
       ]
     }
   ],
   "gates": [
-    {
-      "id": "tilefoundry-npu-build",
-      "recipeId": "tilefoundry-npu.build",
-      "gateType": "deterministic-test",
-      "observationChecks": {
-        "exitCodeZero": true,
-        "imagePresent": true,
-        "containerCreated": true,
-        "recipeReused": true
-      }
-    },
     {
       "id": "tilefoundry-npu-cpu",
       "recipeId": "tilefoundry-npu.cpu",
       "gateType": "deterministic-test",
       "observationChecks": {
         "exitCodeZero": true,
-        "ranInsideContainer": true,
-        "inContainerPythonUsed": true,
-        "importOk": true,
-        "analyzeOk": true,
-        "finalizeOk": true,
-        "cpuEqualityRuns": true,
-        "regressionsRun": true,
-        "verifyTirRuns": true,
-        "checkCopySliceRuns": true,
-        "noHostInterpreter": true,
-        "interpreterIdentityOk": true,
-        "actualUidIsExpected": true,
-        "toolReportsStructured": true,
-        "finalizedArtifactTyped": true
-      },
-      "description": "CPU Gate: interpreter identity challenge, structured per-tool reports, actual in-container uid, and a typed finalized artifact -- each read from evidence, not from an exit code. Exit 0 with nothing run is a FAIL."
+        "testsCollectedPositive": true,
+        "notAllSkipped": true,
+        "testsFailed": 0
+      }
     },
     {
       "id": "tilefoundry-npu-device",
@@ -239,114 +85,22 @@
       "gateType": "deterministic-test",
       "observationChecks": {
         "exitCodeZero": true,
-        "environmentPreflight": true,
-        "deploymentVerified": true,
-        "ranAsRoot": true,
-        "multiDeviceCoverage": true,
-        "assertionInsidePayload": true,
-        "deviceBoundIntoContainer": true,
-        "occupancyRecorded": true,
-        "occupancyReusedPreflightEnv": true,
-        "runtimeIdentityRecorded": true,
-        "compileProfileDigestRecorded": true,
-        "cacheFreshPerRun": true,
-        "cacheDisabled": true,
-        "deviceWorkloadExecuted": true,
-        "hostRecomputedVerdict": true,
-        "deviceIdentityRecorded": true
+        "tilefoundryImported": true,
+        "npuAvailable": true,
+        "deviceCountOne": true,
+        "tensorOnDevice": true,
+        "fp32VectorOk": true,
+        "bf16MatmulOk": true,
+        "numericalOk": true,
+        "synchronizeOk": true,
+        "deviceMemoryPositive": true,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true
       },
-      "description": "Runs a real device workload (set_device + tensor add + synchronize + numeric check) on every device in the requested ASCEND_RT_VISIBLE_DEVICES list, as root inside the container, with the exact list asserted in-payload. Occupancy is read ONCE and recorded as non-verdict metadata; busy and idle run the same workload, with the same verdict rule. No busy wait, poll, skip, fallback, or exclusive refusal exists. BLOCKED_ENV is reserved for real faults: missing root, unreadable/failed npu-smi, health not OK, requested device not bound into the container, or authentication failure."
-    }
-  ],
-  "provenance": {
-    "deprecated": {
-      "/opt/tf-venv": "DEPRECATED and no longer mounted or created. Superseded by the conda env under $HOME/.conda/envs. Nothing under /opt is used.",
-      "tfpy312": "ABANDONED as an interpreter. Never used to run TileFoundry in this adapter. Its site-packages were used once, as plain files, to seed an earlier environment; that environment is itself superseded and removed."
-    },
-    "environment": {
-      "path": "/home/s00653124/.conda/envs/tilefoundry-npu",
-      "manager": "conda",
-      "channel": "conda-forge (repo.anaconda.com requires an interactive ToS acceptance, which is a legal agreement and was not accepted on the user behalf)",
-      "python": "3.12.16",
-      "durability": "under /home, which is bind-mounted, so it survives container recreation without reinstall",
-      "status": "BUILT BUT NOT APPROVED. The packages are installed and z3 was verified by solving. No canonical verification (analyze/finalize/tool suite) has run against this interpreter in a working container, so no result may cite it as evidence yet."
-    },
-    "packages": {
-      "torch": {
-        "version": "2.12.0+cpu",
-        "source": "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl"
-      },
-      "torch_npu": {
-        "version": "2.12.0",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "z3-solver": {
-        "version": "5.3.3.0",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "isl-python": {
-        "version": "0.1.11",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "jinja2": {
-        "version": "3.1.6",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "graphviz": {
-        "version": "0.21",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "apache-tvm-ffi": {
-        "version": "0.1.15.post2",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "ortools": {
-        "version": "9.15.6755",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      },
-      "numpy": {
-        "version": "2.5.4",
-        "source": "https://mirrors.aliyun.com/pypi/simple/"
-      }
-    },
-    "network": {
-      "direct": "~58 KB/s",
-      "viaProxy": "~1.7 MB/s",
-      "ratio": "~30x",
-      "proxySetup": "source /home/s00653124/set_proxy.sh on the host, then pass http_proxy, https_proxy and no_proxy into docker exec with -e. The proxy listens on 127.0.0.1:17890 and the container uses --network host, so loopback is shared."
-    },
-    "ordering": {
-      "fixed": [
-        ". /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh",
-        ". /data/miniconda3/etc/profile.d/conda.sh && conda activate <env>",
-        "export ASCEND_RT_VISIBLE_DEVICES=<id>",
-        "import torch / import torch_npu"
-      ],
-      "observedFailure": "Without CANN sourced first: ImportError: libhccl.so: cannot open shared object file, from torch_npu/npu/utils.py importing torch_npu._C. With CANN sourced first: torch_npu 2.12.0 imports, exit 0. Both directions observed.",
-      "traps": [
-        "set_env.sh breaks under set -u (expands unset LD_LIBRARY_PATH, PYTHONPATH, CMAKE_PREFIX_PATH)",
-        "the path is /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh, not .../cann-9.2.0/set_env.sh"
+      "dependsOn": [
+        "tilefoundry-npu-cpu"
       ]
-    },
-    "busyDevicePolicy": {
-      "default": "RECORD occupancy once and PROCEED. All Ascend cards are shared; busy is non-verdict metadata. Busy and idle run the same workload with the same verdict rule.",
-      "refusalSet": "ONLY real faults: missing root/auth/lock, unreadable/failed npu-smi, health not OK, requested device not bound into the container.",
-      "ordering": "Occupancy is read before torch_npu is imported, so a health fault is reported before a device node opens; the read is not an admission test.",
-      "legacy": "TF_ALLOW_BUSY_DEVICE and TF_REQUIRE_EXCLUSIVE are RETIRED and ignored; neither can change dispatch, selection, verdict, retry, or skip.",
-      "superseded": "A prior policy refused a held card by default and required TF_ALLOW_BUSY_DEVICE=1 to share. That is abrogated and must not be restored."
-    },
-    "registryStatus": {
-      "registeredWithAgentGates": false,
-      "why": "list_workspaces does not list tilefoundry-npu. No server-side gate record or run id exists, so local JSON is self-described evidence, not a service receipt.",
-      "localJsonIs": "self-described evidence from the gate process, with no independent attestation"
-    },
-    "reachableDeviceChain": {
-      "targetInEngineDeviceMaps": false,
-      "targetInEngineExclusiveMap": false,
-      "targetInEngineEnvPrefixMap": false,
-      "callsDeviceSelectSh": false,
-      "callsDeviceRunSh": false,
-      "note": "tilefoundry-npu is not in engine.DEVICE_ADAPTERS, EXCLUSIVE_VARIABLE, OWN_PREFIX, or DEVICE_LEASE maps. gate_device does not call TF docker/ascend950pr/device-select.sh or device-run.sh, so their legacy --exclusive branch is unreachable from this adapter. Generic AgentGates exclusivity remains for other adapters but cannot reach this one; do not add this adapter to those maps."
     }
-  }
+  ]
 }

@@ -445,22 +445,23 @@ def npu_smi(*args: str) -> str:
     binary, a non-zero exit, a timeout, a signal - is an OccupancyBlocked,
     because unknown is not free.
     """
+    smi = os.environ.get('AGENT_GATES_SMI_COMMAND') or NPU_SMI
     try:
-        done = subprocess.run([NPU_SMI, 'info', *args], capture_output=True, text=True,
+        done = subprocess.run([smi, 'info', *args], capture_output=True, text=True,
                               timeout=PROBE_TIMEOUT_SECONDS)
     except FileNotFoundError as error:
-        raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} is not installed on '
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: {smi} is not installed on '
                                f'the Host ({error})') from error
     except subprocess.TimeoutExpired as error:
-        raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} info '
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: {smi} info '
                                f'{" ".join(args)} did not answer within '
                                f'{PROBE_TIMEOUT_SECONDS}s') from error
     except OSError as error:
-        raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} could not be '
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: {smi} could not be '
                                f'started: {error}') from error
     if done.returncode != 0:
         detail = (done.stderr or done.stdout).strip().splitlines()
-        raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} info '
+        raise OccupancyBlocked(f'cannot determine NPU occupancy: {smi} info '
                                f'{" ".join(args)} exited {done.returncode}: '
                                f'{detail[-1] if detail else "no output"}')
     return done.stdout
@@ -513,8 +514,9 @@ def processes_on(npu_id: str) -> list[tuple[str, str]]:
         raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} info -t proc-mem '
                                f'-i {npu_id} did not report NPU ID {npu_id}')
     idle = len(re.findall(r'^\s*No process in device\.?\s*$', text, re.MULTILINE))
-    pattern = re.compile(r'Process id:(\d+)\s+Process name:(\S+)\s+Process memory\(MB\):(\d+)')
-    rows = [(match.group(1), match.group(2)) for match in pattern.finditer(text)]
+    pattern = re.compile(r'Process id:(\d+)\s+Process name:(.*?)\s+Process memory\(MB\):(\d+)')
+    rows = [(match.group(1), match.group(2).strip() or '<unknown>')
+            for match in pattern.finditer(text)]
     announced = len(re.findall(r'Process id:', text))
     if rows and idle:
         raise OccupancyBlocked(f'cannot determine NPU occupancy: {NPU_SMI} info -t proc-mem '
@@ -821,7 +823,7 @@ def container_script(test_dir: str, source_root: str, timeout: int, device: str,
     lines = [
         'set -o pipefail',
         f'fail() {{ echo "{PROG}: $*" >&2; exit 3; }}',
-        'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH',
+        'export PATH="$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
         'export PYTHONDONTWRITEBYTECODE=1',
     ]
     if cache_dir is not None:
@@ -842,6 +844,7 @@ def container_script(test_dir: str, source_root: str, timeout: int, device: str,
         # the runner with no CANN on the loader path - surfacing much later as an
         # ImportError inside the test, which the Gate would then record as a test
         # failure rather than a configuration fault.
+        lines.append('set +u')
         lines.append(f'. {shlex.quote(str(cann))} '
                      f'|| fail {shlex.quote(f"failed to source CANN setup: {cann}")}')
     if conda_sh is not None and conda_env:
@@ -850,6 +853,7 @@ def container_script(test_dir: str, source_root: str, timeout: int, device: str,
         if conda_envs_path is not None:
             lines.append(f'export CONDA_ENVS_PATH={shlex.quote(str(conda_envs_path))}'
                          f'"${{CONDA_ENVS_PATH:+:$CONDA_ENVS_PATH}}"')
+        lines.append('set +u')
         lines.append(f'. {shlex.quote(str(conda_sh))} '
                      f'|| fail {shlex.quote(f"failed to source conda.sh: {conda_sh}")}')
         lines.append(f'conda activate {shlex.quote(conda_env)} '
@@ -1011,16 +1015,19 @@ def require_conda_pair(conda_sh: Path | None, conda_env: str | None) -> None:
 
 
 def check_config() -> int:
-    """Report whether this machine is configured, without entering the container.
-
-    Preflight runs this before the device Gate starts. The device id is part of
-    the check: it authorizes one run, and a run without it must be refused by the
-    Host rather than by a Gate that has already begun.
-    """
-    container, home, identity_file = container_identity()
+    """Report whether this host is configured to run TLA directly on host."""
+    identity_file = resolved_env_file()
+    if identity_file is None:
+        raise BridgeError('no machine configuration file found; set TLA_NPU_ENV_FILE or create env.sh')
+    if not env_file_values():
+        raise BridgeError(f'machine configuration file is empty: {identity_file}')
     device = device_id()
     cann, conda_sh, conda_env = toolchain_from_env_file()
     require_conda_pair(conda_sh, conda_env)
+    if cann is not None and not cann.is_file():
+        raise BridgeError(f'TLA_NPU_CANN_SETUP does not exist: {cann}')
+    if conda_sh is not None and not conda_sh.is_file():
+        raise BridgeError(f'TLA_NPU_CONDA_SH does not exist: {conda_sh}')
     if conda_env is not None and not SAFE_NAME.fullmatch(conda_env):
         raise BridgeError(f'TLA_NPU_CONDA_ENV is not a plain environment name: {conda_env!r}')
     conda_envs_path_from_env_file()
@@ -1028,53 +1035,62 @@ def check_config() -> int:
     # invalid value must fail here rather than in the engine.
     build = machine_value(BUILD_KEY)
     if build is not None and (not SAFE_NAME.fullmatch(build) or build in {'.', '..'}):
-        raise BridgeError(f'{resolved_env_file()}: {BUILD_KEY} is not a plain directory '
+        raise BridgeError(f'{identity_file}: {BUILD_KEY} is not a plain directory '
                           f'name: {build!r}')
-    # Occupancy is a Host fact, so it is checked here, before the Recipe is
-    # dispatched at all. The container's own npu-smi is not used: inside the image
-    # it fails to load its libraries and would report nothing.
+    test_dir = test_dir_from_env_file()
+    if not test_dir.is_dir():
+        raise BridgeError(f'TLA_NPU_TEST_DIR does not exist: {test_dir}')
+    if not (test_dir / GATE_TEST).is_file():
+        raise BridgeError(f'Gate test file is missing: {test_dir / GATE_TEST}')
+    cache_dir = cache_dir_from_env_file()
+    if cache_dir is not None and (cache_dir == test_dir or cache_dir.is_relative_to(test_dir)):
+        label = 'test directory'
+        tree = test_dir
+        raise BridgeError(f'TLA_NPU_CACHE_DIR {cache_dir} is inside the {label} {tree}; '
+                          f'the cache is written to and would pollute an input tree')
     npu_id = require_device_free(device)
     _, holders = device_occupancy(device)
     occupancy = 'free' if not holders else f'shared({len(holders)})'
-    print(f'{PROG}: configuration ready: identity file {identity_file} '
-          f'container={container} home={home} device={device} npuId={npu_id} '
+    print(f'{PROG}: host configuration ready: identity file {identity_file} '
+          f'testDir={test_dir} device={device} npuId={npu_id} '
           f'occupancy={occupancy} exclusive={exclusive_requested()}', file=sys.stderr)
     return 0
 
 
 def main(argv: list[str]) -> int:
+    import hashlib
+    import tempfile
+
     if list(argv) == ['--check-config']:
         return check_config()
-    host_root = Path.cwd()
-    container, home, identity_file = container_identity()
+    host_root = Path.cwd().resolve()
+    identity_file = resolved_env_file()
+    if identity_file is None or not env_file_values():
+        raise BridgeError('no usable machine configuration file found')
 
     device = device_id()
     timeout = parse_argv(list(argv))
     cann, conda_sh, conda_env = toolchain_from_env_file()
     require_conda_pair(conda_sh, conda_env)
+    if cann is not None and not cann.is_file():
+        raise BridgeError(f'TLA_NPU_CANN_SETUP does not exist: {cann}')
+    if conda_sh is not None and not conda_sh.is_file():
+        raise BridgeError(f'TLA_NPU_CONDA_SH does not exist: {conda_sh}')
     if conda_env is not None and not SAFE_NAME.fullmatch(conda_env):
         raise BridgeError(f'TLA_NPU_CONDA_ENV is not a plain environment name: {conda_env!r}')
 
-    # Occupancy is re-read before anything touches Docker: the configuration check
-    # ran earlier and another job may have taken the card since. A held card only
-    # stops the Gate when this run demanded exclusivity.
+    # Occupancy is re-read before running: a held card only stops the Gate when
+    # exclusivity was requested.
     require_device_free(device)
 
-    mounts = container_mounts(container)
-    mapped = map_host_to_container(host_root, mounts, container)
-    declared = declared_container_source()
-    if declared is not None and os.path.realpath(str(declared)) != os.path.realpath(str(mapped)):
-        raise BridgeError(f'TLA_NPU_CONTAINER_SOURCE {declared} does not match the bind-mount '
-                          f'mapping {mapped} of host source root {host_root}')
-    container_root = str(declared if declared is not None else mapped)
-
     # The test directory is a separate input with its own identity: it holds the
-    # bytes that exercise the implementation. Both are mapped through the same
-    # bind mounts and both are proven identical on each side.
-    test_dir = test_dir_from_env_file()
+    # bytes that exercise the implementation.
+    test_dir = test_dir_from_env_file().resolve()
     if not test_dir.is_dir():
         raise BridgeError(f'TLA_NPU_TEST_DIR does not exist: {test_dir}')
-    container_test_dir = str(map_host_to_container(test_dir, mounts, container))
+    test_file = test_dir / GATE_TEST
+    if not test_file.is_file():
+        raise BridgeError(f'Gate test file is missing: {test_file}')
 
     # The cache is written to, so it must live outside both input trees. That is
     # enforced, not merely documented: a cache inside the source or test root
@@ -1084,25 +1100,43 @@ def main(argv: list[str]) -> int:
         if cache_dir is not None and (cache_dir == tree or cache_dir.is_relative_to(tree)):
             raise BridgeError(f'TLA_NPU_CACHE_DIR {cache_dir} is inside the {label} {tree}; '
                               f'the cache is written to and would pollute an input tree')
-    container_cache_dir = None
     if cache_dir is not None:
-        container_cache_dir = map_host_to_container(cache_dir, mounts, container)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_ctx = tempfile.TemporaryDirectory(prefix='run-', dir=str(cache_dir))
+    else:
+        cache_ctx = tempfile.TemporaryDirectory(prefix='tla-npu-cache-')
 
-    prefix = docker_exec_prefix(container, home, container_root)
-    verify_same_tree(host_root, prefix, container_root)
-    verify_same_tree(test_dir, prefix, container_test_dir)
     print(f'{PROG}: identity file {identity_file}', file=sys.stderr)
-    print(f'{PROG}: container={container} user=root source={container_root} '
-          f'testDir={container_test_dir} cache={container_cache_dir} '
-          f'timeout={timeout}s device={device} test={GATE_TEST}', file=sys.stderr)
-    script = container_script(str(container_test_dir), container_root, timeout, device, cann,
-                              conda_sh, conda_env, conda_envs_path_from_env_file(),
-                              container_cache_dir)
-    completed = subprocess.run([*prefix, 'bash', '-c', script], capture_output=True, text=True)
+    print(f'{PROG}: mode=host source={host_root} '
+          f'testDir={test_dir} timeout={timeout}s device={device} test={GATE_TEST}',
+          file=sys.stderr)
+
+    with cache_ctx as run_cache_dir, tempfile.TemporaryDirectory(prefix='tla-npu-work-') as work_dir:
+        run_env = dict(os.environ)
+        run_env['TMPDIR'] = work_dir
+        run_env['TEMP'] = work_dir
+        run_env['TMP'] = work_dir
+        ascend_work = Path(work_dir) / 'ascend_work'
+        ascend_work.mkdir(parents=True, exist_ok=True)
+        run_env['ASCEND_WORK_PATH'] = str(ascend_work)
+
+        script = container_script(
+            str(test_dir), str(host_root), timeout, device, cann,
+            conda_sh, conda_env, conda_envs_path_from_env_file(),
+            Path(run_cache_dir),
+        )
+        completed = subprocess.run(
+            ['/bin/bash', '-c', script],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            timeout=timeout + KILL_AFTER_SECONDS + 30,
+        )
     if completed.stderr:
         sys.stderr.write(completed.stderr)
     report = read_report(completed.stdout)
     result = observations(report, device)
+    result['testFileSha256'] = hashlib.sha256(test_file.read_bytes()).hexdigest()
     if report.get('fatal'):
         result['fatal'] = True
         result['fatalReason'] = str(report['fatal'])

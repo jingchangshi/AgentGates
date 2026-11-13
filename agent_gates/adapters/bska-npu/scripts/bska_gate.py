@@ -61,6 +61,11 @@ import subprocess
 import sys
 import tempfile
 
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from agent_gates import adapter_runtime
+
 PROG = 'bska-npu-gate'
 
 ADAPTER_DIR = Path(__file__).resolve().parent.parent
@@ -93,12 +98,17 @@ REQUIRED = (
     'BSKA_NPU_CONDA_ENVS_PATH',
     'BSKA_NPU_CANNBENCH_REPO',
     'BSKA_NPU_CANNBENCH_TASK',
+    'BSKA_NPU_TRITON_ASCEND_VERSION',
 )
 
 # Values that select a file or authorize one run. They are launch parameters,
 # never machine facts: a device id authorizes one Gate run, and putting it in a
 # file would make a machine look permanently entitled to a card.
-NOT_MACHINE_KEYS = frozenset({'BSKA_NPU_ENV_FILE', 'BSKA_NPU_DEVICE_ID'})
+NOT_MACHINE_KEYS = frozenset({
+    'BSKA_NPU_ENV_FILE',
+    'BSKA_NPU_DEVICE_ID',
+    'BSKA_NPU_REQUIRE_EXCLUSIVE_DEVICE',
+})
 
 _ASSIGN = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
 ALLOWED = set(BSKA_NPU_KEYS)
@@ -239,7 +249,7 @@ def cannbench_arch(values):
 
 
 def expected_triton_version(values):
-    return (values.get('BSKA_NPU_TRITON_ASCEND_VERSION') or '').strip()
+    return _required(values, 'BSKA_NPU_TRITON_ASCEND_VERSION')
 
 
 def device_id():
@@ -259,11 +269,20 @@ def device_id():
     return raw
 
 
+def exclusive_requested():
+    raw = (os.environ.get('BSKA_NPU_REQUIRE_EXCLUSIVE_DEVICE') or '').strip().lower()
+    return raw in {'1', 'true', 'yes', 'on'}
+
+
 def require_device():
     device = device_id()
     if device is None:
         raise BridgeError('explicit BSKA_NPU_DEVICE_ID or --device-id authorization '
                           'required for this Gate')
+    try:
+        adapter_runtime.check_device_ready(int(device), exclusive=exclusive_requested())
+    except adapter_runtime.BlockedEnv as exc:
+        raise BridgeError(str(exc)) from exc
     return device
 
 
@@ -276,7 +295,7 @@ def _run(values, body, *, cwd, timeout, extra_env=None):
     sets its own) silently resolves the environment-site Torch instead and the
     native extension then fails on the first tensor it touches.
     """
-    script = 'source ' + shlex.quote(_required(values, 'BSKA_NPU_CANN_SETUP')) + os.linesep + body
+    script = 'set +u' + os.linesep + 'source ' + shlex.quote(_required(values, 'BSKA_NPU_CANN_SETUP')) + os.linesep + body
     env = dict(os.environ)
     env.pop('ASCEND_RT_VISIBLE_DEVICES', None)
     # pwd, not Path.home(): Path.home() reads HOME, so under an overridden HOME
@@ -409,20 +428,27 @@ def _smoke_facts(values, device):
     python = python_path(values)
     utils = cannbench_repo(values) / UTILS_SUBDIR
     helix = python.parent / 'helix'
-    extra = {
-        'ASCEND_RT_VISIBLE_DEVICES': device,
-        'PYTHONPATH': str(utils),
-        'BSKA_UTILS_PATH': str(utils),
-        'BSKA_EXPECT_TRITON_VERSION': expected_triton_version(values),
-        'BSKA_HELIX_BIN': str(helix),
-        'BSKA_NODE_BIN': (values.get('BSKA_NPU_NODE_BIN') or '').strip(),
-        'BSKA_CLAUDE_BIN': (values.get('BSKA_NPU_CLAUDE_BIN') or '').strip(),
-        'TRITON_CACHE_DIR': '/tmp/bska-triton-cache',
-    }
     # The probe must live in a real file: Triton rejects a @jit kernel defined in
     # a "python -c" string because it resolves the kernel's source by file name.
     with tempfile.TemporaryDirectory(prefix='bska-smoke-') as tmp:
-        probe = Path(tmp) / 'probe.py'
+        tmp_path = Path(tmp)
+        triton_cache = tmp_path / 'triton-cache'
+        ascend_work = tmp_path / 'ascend-work'
+        triton_cache.mkdir(parents=True, exist_ok=True)
+        ascend_work.mkdir(parents=True, exist_ok=True)
+        extra = {
+            'ASCEND_RT_VISIBLE_DEVICES': device,
+            'PYTHONPATH': str(utils),
+            'BSKA_UTILS_PATH': str(utils),
+            'BSKA_EXPECT_TRITON_VERSION': expected_triton_version(values),
+            'BSKA_HELIX_BIN': str(helix),
+            'BSKA_NODE_BIN': (values.get('BSKA_NPU_NODE_BIN') or '').strip() or 'node',
+            'BSKA_CLAUDE_BIN': (values.get('BSKA_NPU_CLAUDE_BIN') or '').strip() or 'claude',
+            'TRITON_CACHE_DIR': str(triton_cache),
+            'ASCEND_WORK_PATH': str(ascend_work),
+            'TMPDIR': str(tmp_path),
+        }
+        probe = tmp_path / 'probe.py'
         probe.write_text(PROBE)
         rc, stdout, stderr = _run(
             values,
@@ -474,7 +500,8 @@ def smoke(values):
         observations[key] = bool(facts.get(key, False))
     for key in SMOKE_FACTS:
         observations[key] = str(facts.get(key, ''))
-    return 0, observations
+    ok = all(observations[key] is True for key in SMOKE_CHECKS)
+    return (0 if ok else 1), observations
 
 
 def _report_facts(path):
@@ -580,6 +607,8 @@ def check_config():
             raise BridgeError(f'native extension missing at {utils}; run '
                               f'tools/build_cannbench_utils.sh {cannbench_arch(values)} '
                               f'with PYTHON={python}')
+        if (os.environ.get('BSKA_NPU_DEVICE_ID') or '').strip():
+            require_device()
     except BridgeError as exc:
         _die(75, PROG + ': ' + str(exc))
     print(PROG + ': configuration ok', file=sys.stderr)
