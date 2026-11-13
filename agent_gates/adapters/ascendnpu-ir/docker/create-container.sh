@@ -336,6 +336,8 @@ if [ "$DRY_RUN" = 1 ]; then
     exit 0
 fi
 
+die 'DOCKER_MODE_DISABLED: Docker container mode is quarantined and disabled; use host-mode adapters instead (see docs/docker-mode-quarantine.md)'
+
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------

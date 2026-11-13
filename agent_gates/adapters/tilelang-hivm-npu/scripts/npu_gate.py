@@ -1088,11 +1088,9 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == '__main__':
-    try:
-        raise SystemExit(main(sys.argv[1:]))
-    except BridgeError as error:
-        print(f'{PROG}: {error.message}', file=sys.stderr)
-        # The instance, not the class: an OccupancyBlocked carries its own code
-        # so the runner can record BLOCKED_ENV instead of a failed test. Reading
-        # `BridgeError.EXIT` here would silently flatten every subclass to 2.
-        raise SystemExit(error.EXIT)
+    print(
+        'DOCKER_MODE_DISABLED: Docker mode is quarantined and disabled; '
+        'use host-mode adapters/gates instead (see docs/docker-mode-quarantine.md)',
+        file=sys.stderr,
+    )
+    raise SystemExit(75)

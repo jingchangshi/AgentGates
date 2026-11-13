@@ -401,4 +401,9 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    print(
+        "DOCKER_MODE_DISABLED: Docker mode is quarantined and disabled; "
+        "use host-mode adapters/gates instead (see docs/docker-mode-quarantine.md)",
+        file=sys.stderr,
+    )
+    raise SystemExit(75)
