@@ -352,6 +352,57 @@ class WaitTests(ExecutionFixture):
         self.assertFalse(result.timed_out)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_config_digest_mismatch_marks_execution_interrupted(self):
+        status = self.manager.submit(self.request())
+        eid = status.execution_id
+        from agent_gates import worker as worker_mod
+        req = self.manager.store.read_request(eid)
+        req["config_digest"] = "0" * 64
+        self.manager.store.request_path(eid).write_text(json.dumps(req))
+        updated = worker_mod.run_execution(eid, store=self.manager.store, config=self.config)
+        self.assertEqual(updated["state"], "INTERRUPTED")
+        self.assertIn("CONFIG_IDENTITY_CHANGED", updated["exitReason"])
+
+    def test_find_receipt_ignores_claimed_and_older_receipts(self):
+        import os
+
+        run_old = "a" * 32
+        run_new = "b" * 32
+        old_dir = self.config.evidence_root / "runs" / run_old
+        new_dir = self.config.evidence_root / "runs" / run_new
+        old_dir.mkdir(parents=True)
+        new_dir.mkdir(parents=True)
+        source_real = os.path.realpath(str(self.source))
+        (old_dir / "receipt.json").write_text(json.dumps({
+            "runId": run_old,
+            "startedAt": "2020-01-01T00:00:00+00:00",
+            "adapter": {"id": "test-pack"},
+            "source": {"root": source_real},
+            "gates": [{"gateId": "test-gate"}],
+        }))
+        claimed_id = "1" * 32
+        self.manager.store.initialize()
+        self.manager.store.create(
+            claimed_id,
+            {"execution_id": claimed_id, "adapter": "test-pack", "source_root": source_real, "gates": ["test-gate"]},
+            {"executionId": claimed_id, "state": "FINISHED", "runId": run_new},
+        )
+        (new_dir / "receipt.json").write_text(json.dumps({
+            "runId": run_new,
+            "startedAt": "2099-01-01T00:00:00+00:00",
+            "adapter": {"id": "test-pack"},
+            "source": {"root": source_real},
+            "gates": [{"gateId": "test-gate"}],
+        }))
+        target_id = "2" * 32
+        found = self.manager._find_receipt(target_id, {
+            "adapter": "test-pack",
+            "source_root": source_real,
+            "gates": ["test-gate"],
+            "submitted_at": time.time(),
+        })
+        self.assertIsNone(found)
+
 
 if __name__ == "__main__":
     unittest.main()

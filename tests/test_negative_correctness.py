@@ -485,3 +485,25 @@ def test_one_adapter_cannot_inherit_the_other_adapters_prefix(monkeypatch):
     assert environment(tilelang)['TILELANG_HIVM_BUILD_SUBDIR'] == 'build'
     assert 'TILELANG_HIVM_BUILD_SUBDIR' not in environment(ascend)
     assert environment(ascend)['ASCENDNPU_BUILD_SUBDIR'] == 'elsewhere'
+
+
+def test_nested_commitless_git_directory_is_hashed_via_filesystem_while_top_level_fails_closed(tmp_path):
+    empty_top = tmp_path / 'empty_top'
+    empty_top.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=empty_top, check=True)
+    with pytest.raises(ValueError, match='no readable committed HEAD'):
+        snapshot(empty_top)
+
+    parent = tmp_path / 'parent'
+    parent.mkdir()
+    _init_repo(parent)
+    sub = parent / 'work'
+    sub.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=sub, check=True)
+    (sub / 'k.py').write_text('x = 1\n', encoding='utf-8')
+    first = snapshot(parent)
+    assert first['mode'] == 'git-files'
+
+    (sub / 'k.py').write_text('x = 2\n', encoding='utf-8')
+    second = snapshot(parent)
+    assert second['hash'] != first['hash']

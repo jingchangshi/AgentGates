@@ -101,9 +101,9 @@ def test_digest_ignores_evidence_and_state_location(machine):
 def test_allowlist_parsed(machine):
     text = minimal(machine).replace(
         'adapters = ["ascendnpu-ir"]',
-        'adapters = ["ascendnpu-ir"]\nallowed_gates = ["ascend-build"]')
+        'adapters = ["ascendnpu-ir"]\nallowed_gates = ["ascend-build-host"]')
     config = load_text(machine, text)
-    assert config.workspaces["ascend"].allowed_gates == {"ascend-build"}
+    assert config.workspaces["ascend"].allowed_gates == {"ascend-build-host"}
 
 
 # ── negative: each names its field ───────────────────────────────────────────
@@ -167,11 +167,11 @@ def test_symlinked_env_file_rejected(machine):
 
 
 def test_workspace_naming_unconfigured_adapter_rejected(machine):
-    text = minimal(machine).replace('adapters = ["ascendnpu-ir"]', 'adapters = ["tilelang-hivm"]')
+    text = minimal(machine).replace('adapters = ["ascendnpu-ir"]', 'adapters = ["tilelang-npu"]')
     with pytest.raises(cfg.ConfigError) as caught:
         load_text(machine, text)
     assert caught.value.field == "workspaces.ascend.adapters"
-    assert "tilelang-hivm" in caught.value.reason
+    assert "tilelang-npu" in caught.value.reason
 
 
 def test_invalid_workspace_id_names_field(machine):
@@ -571,3 +571,22 @@ def test_cli_doctor_refuses_an_unknown_gate(tmp_path):
     refused = main(["doctor", "--adapter", "ascendnpu-ir", "--source", str(source),
                     "--gate", "no-such-gate", "--evidence-root", str(evidence), "--json"])
     assert refused == 2
+
+
+def test_config_example_toml_parses_cleanly():
+    example = Path(__file__).resolve().parent.parent / "docs/v2/config.example.toml"
+    parsed = cfg.tomllib.loads(example.read_text(encoding="utf-8"))
+    assert parsed["schema_version"] == cfg.CONFIG_SCHEMA_VERSION
+    assert parsed["devices"]["smi_command"] == "npu-smi"
+
+
+def test_unknown_config_fields_report_exact_dotted_field(machine):
+    for text, expected_field in [
+        (minimal(machine).replace("schema_version = 1", "schema_version = 1\nextra_top = 1"), "extra_top"),
+        (minimal(machine, extra='[devices]\nsmi_command = "npu-smi"\ndefault_device = "1"'), "devices.default_device"),
+        (minimal(machine, extra='extra_worker = 1'), "worker.extra_worker"),
+    ]:
+        with pytest.raises(cfg.ConfigError) as caught:
+            load_text(machine, text)
+        assert caught.value.field == expected_field
+        assert "unknown" in caught.value.reason

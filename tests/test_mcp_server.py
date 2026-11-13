@@ -307,6 +307,31 @@ class LifecycleOverrideTests(McpFixture):
         second = self.call(doctor)
         self.assertEqual(second.structured_content["status"], "PASS")
 
+    def test_doctor_surfaces_failure_reason_on_failed_check(self):
+        script = self.pack / "scripts/gate.py"
+        script.write_text(
+            'import sys\n'
+            'if "--check-config" in sys.argv:\n'
+            '    print("missing CANN runtime", file=sys.stderr)\n'
+            '    sys.exit(75)\n'
+        )
+        # Re-pin manifest digest after modifying script in test workspace.
+        from agent_gates.manifest import digest
+        manifest_path = self.pack / "manifest.json"
+        raw = json.loads(manifest_path.read_text())
+        raw["files"]["scripts/gate.py"] = digest(script)
+        manifest_path.write_text(json.dumps(raw))
+
+        async def doctor(session):
+            return await session.call_tool("doctor", {"workspace": "ws", "adapter": "test-pack"})
+
+        res = self.call(doctor)
+        self.assertEqual(res.structured_content["status"], "BLOCKED_ENV")
+        check = res.structured_content["checks"][0]
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["exit_code"], 75)
+        self.assertIn("missing CANN runtime", check["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

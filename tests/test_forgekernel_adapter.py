@@ -637,6 +637,21 @@ class ManifestCase(unittest.TestCase):
         self.assertIs(recipe.device_window, None)
         self.assertIs(recipe.uses_device, False)
 
+    def test_device_window_refuses_shared_card_when_exclusive_requested(self):
+        with tempfile.TemporaryDirectory() as td:
+            lease = Path(td) / 'npu.lock'
+            env = {
+                'AGENT_GATES_DEVICE_LEASE_PATH': str(lease),
+                'AGENT_GATES_DEVICE_LEASE_RESOURCE': 'npu:1',
+                'AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS': '1',
+                'FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE': '1',
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                    patch.object(GATE, 'occupancy', return_value='shared(2)'):
+                with self.assertRaises(GATE.DeviceWindowBusy):
+                    with GATE.device_window():
+                        pass
+
 
 if __name__ == '__main__':
     unittest.main()

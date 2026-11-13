@@ -411,5 +411,26 @@ class ManifestCase(unittest.TestCase):
         self.assertEqual(ours, sibling)
 
 
+class HostExecutionCase(unittest.TestCase):
+    def test_processes_on_handles_blank_process_name(self):
+        sample = (
+            "\tNPU ID                         : 0\n"
+            "\tProcess id:2330713 Process name:                  Process memory(MB):796\n"
+            "\tProcess id:12345   Process name:python3           Process memory(MB):512\n"
+        )
+        with patch.object(GATE, 'npu_smi', return_value=sample):
+            rows = GATE.processes_on('0')
+        self.assertEqual(rows, [('2330713', '<unknown>'), ('12345', 'python3')])
+
+    def test_npu_smi_honors_agent_gates_smi_command(self):
+        import types
+        fake = types.SimpleNamespace(returncode=0, stdout='ok\n', stderr='')
+        with patch.dict(os.environ, {'AGENT_GATES_SMI_COMMAND': '/custom/fake-smi'}), \
+                patch.object(GATE.subprocess, 'run', return_value=fake) as run_mock:
+            out = GATE.npu_smi('-m')
+        self.assertEqual(out, 'ok\n')
+        self.assertEqual(run_mock.call_args[0][0][:2], ['/custom/fake-smi', 'info'])
+
+
 if __name__ == '__main__':
     unittest.main()
