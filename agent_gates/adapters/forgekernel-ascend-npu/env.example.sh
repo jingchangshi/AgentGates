@@ -42,9 +42,14 @@
 # mask an edit. An export that DISAGREES with the file is refused outright rather
 # than silently overridden.
 #
-# `FK_ASCEND_DEVICE_ID` is NOT in this file. It authorizes one run, not a
-# machine, so it stays an export of the shell that launches the Gate (or a CLI
-# `--device-id`).
+# `FK_ASCEND_DEVICE_ID` and `FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE` are NOT in this
+# file: they are launch/config parameters passed per run via `--device-id` or
+# local `config.toml`.
+#
+# Test/probe scope note: `forgekernel-ascend-npu` runs fixed verification gates
+# (`fk_device_probe.py` for `forgekernel-ascend-npu-smoke`, and isolated venv
+# editable/no-deps install + import/version probe for `forgekernel-ascend-npu-build`),
+# so there is no custom pytest list key here.
 #
 # ---------------------------------------------------------------------------
 # Format

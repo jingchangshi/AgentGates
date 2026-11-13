@@ -1,93 +1,81 @@
-# Configuration for the tilefoundry-npu adapter.
+# Machine configuration template for the host-local TileFoundry Ascend NPU Adapter.
 #
-# This is the single configuration file. One reader uses it and nothing else
-# does: scripts/tilefoundry_gate.py.
+# Copy to `env.sh` beside this template (git-ignored) and fill in host-specific paths:
 #
-# Create the real file once, on this machine:
-#
+#     cd <repo-root>/agent_gates/adapters/tilefoundry-npu
 #     cp env.example.sh env.sh
 #     chmod 600 env.sh
 #
-# env.sh is git-ignored. It is parsed as DATA and never executed: unknown keys,
-# duplicate keys and malformed lines all fail, because a typo that is silently
-# ignored is a value the operator believes in and the Gate does not have.
+# Lookup order:
+#   1. $TILEFOUNDRY_NPU_ENV_FILE (explicit absolute path; must exist)
+#   2. agent_gates/adapters/tilefoundry-npu/env.sh beside this template
 #
-# Exporting these names in a shell has NO effect. The Gate reads this file only,
-# so a stale export cannot silently override what the machine says it is.
-
-# --- required -------------------------------------------------------------
-
-# The TileFoundry checkout. The adapter REUSES its docker/ascend950pr recipe
-# rather than duplicating it, so this path must contain Dockerfile and
-# create-container.sh.
-TF_REPO=
-
-# Docker image and container names.
-IMAGE=tilefoundry-ascend950pr-dev:24.04
-CONTAINER_NAME=tf-ascend950pr
-
-# Host CANN root, bind-mounted read-only into the container.
-CANN_ROOT=/data/pri/cann-9.2.0
-
-# The Python 3.12 interpreter INSIDE the container: a conda environment under
-# /home, which is bind-mounted, so it survives container recreation without a
-# reinstall or a re-download.
+# Format & strictness rules:
+#   * Plain `NAME=VALUE` data lines only (no shell execution, no `$()` or backtick
+#     expansion, no comments after values, no duplicate keys).
+#   * Conflicting `TILEFOUNDRY_NPU_*` exports in the calling shell are refused by
+#     name so stale shell state cannot mask this file.
 #
-# /opt/tf-venv is DEPRECATED. It is no longer created, mounted or executed, and
-# nothing in this adapter may point at it.
-IN_CONTAINER_PYTHON=/home/s00653124/.conda/envs/tilefoundry-npu/bin/python
+# Launch-only parameters (NEVER write these in env.sh):
+#   * TILEFOUNDRY_NPU_DEVICE_ID: passed per run via `--device-id` or local config.toml.
+#   * TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE: forwarded by AgentGates devices config.
 
-# The account the container runs CPU work as. NPU work must enter as root on
-# this platform, which the device Gate does deliberately and records.
-CONTAINER_USER=s00653124
+# ---------------------------------------------------------------------------
+# Toolchain — host-local CANN & Conda
+# ---------------------------------------------------------------------------
+# Required: absolute host path to CANN `set_env.sh` (e.g. <cann-root>/cann-9.3.0/set_env.sh).
+# Sourced ONLY in `tilefoundry-npu-device`. The CPU gate (`tilefoundry-npu-cpu`)
+# intentionally skips CANN initialization and sets TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# to avoid native library collisions (such as ortools vs CANN).
+TILEFOUNDRY_NPU_CANN_SETUP=
 
-# --- device ---------------------------------------------------------------
+# Required: absolute host path to Conda shell hook (e.g. <conda-root>/etc/profile.d/conda.sh).
+TILEFOUNDRY_NPU_CONDA_SH=
 
-# Empty means: use --device-id/--device-ids, then the inherited
-# ASCEND_RT_VISIBLE_DEVICES, then the default 0,1. A value here is an ordered
-# comma list such as 0,1; it is never a single mandatory id.
-DEVICE_ID=
+# Required: Conda environment name (e.g. tilefoundry-npu) containing matched
+# torch (+cpu), torch_npu, pytest, z3, and TileFoundry runtime dependencies.
+TILEFOUNDRY_NPU_CONDA_ENV=
 
-# RETIRED legacy keys. They parse so old files still load, but they are IGNORED:
-# busy is recorded only, and no flag can restore an exclusive/busy refusal.
-TF_REQUIRE_EXCLUSIVE=0
+# Optional: absolute host path to custom Conda envs directory (e.g. <user-home>/.conda/envs)
+# when TILEFOUNDRY_NPU_CONDA_ENV lives outside `<conda-root>/envs`.
+TILEFOUNDRY_NPU_CONDA_ENVS_PATH=
 
-# --- optional -------------------------------------------------------------
+# Optional: explicit absolute host path to python3 inside TILEFOUNDRY_NPU_CONDA_ENV.
+# Leave empty to derive `<TILEFOUNDRY_NPU_CONDA_ENVS_PATH>/<env>/bin/python3`
+# (or `<conda-root>/envs/<env>/bin/python3` from TILEFOUNDRY_NPU_CONDA_SH).
+TILEFOUNDRY_NPU_PYTHON=
 
-# The conda environment for TileFoundry. Lives under /home so it outlives the
-# container.
-TF_CONDA_ENV=/home/s00653124/.conda/envs/tilefoundry-npu
+# ---------------------------------------------------------------------------
+# Test selection — CPU and NPU pytest targets
+# ---------------------------------------------------------------------------
+# Optional: comma- or whitespace-separated list of RELATIVE pytest file or directory
+# paths inside the TileFoundry checkout (`--source`), e.g.:
+#   TILEFOUNDRY_NPU_CPU_TESTS=tests/tilefoundry,tests/ascend/passes/test_foo.py
+# Rules:
+#   * Leading `/` and `..` path traversal are rejected.
+#   * `--check-config` / `doctor` verifies every configured relative path exists.
+#   * Leave empty to run the 5 default CPU test directories without CANN sourced:
+#     tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators
+TILEFOUNDRY_NPU_CPU_TESTS=
 
-# The in-container venv holding the NPU environment is created by
-# scripts/setup-tf-env.sh. It is python 3.11, not 3.12: every local torch_npu
-# wheel is cp311 and torch_npu-2.10.0.post5 declares 'Requires-Dist:
-# torch ==2.10.0+cpu', so the pair only exists for 3.11. See the setup script.
-TF_NPU_ENV=tilefoundry-npu
+# Optional: comma- or whitespace-separated list of RELATIVE pytest file or directory
+# paths inside the TileFoundry checkout (`--source`), e.g.:
+#   TILEFOUNDRY_NPU_DEVICE_TESTS=tests/ascend/e2e/test_vadd_npu.py
+# Rules:
+#   * Leading `/` and `..` path traversal are rejected.
+#   * `--check-config` / `doctor` verifies every listed path exists when non-empty.
+#   * Leave empty by default: `tilefoundry-npu-device` always executes its built-in
+#     NPU runtime and numerical verification probe (`import tilefoundry`, FP32 vector
+#     add, BF16 Cube `matmul`, device memory > 0, `torch.npu.synchronize()`) inside the
+#     `npu:<id>` lease window. Only when non-empty does it additionally run `pytest` on
+#     these relative NPU test paths inside the same lease window and require >=1 passed
+#     test with 0 failures.
+TILEFOUNDRY_NPU_DEVICE_TESTS=
 
-# The shared conda installation, used only to create OUR OWN env under
-# $HOME/.conda/envs. No other user's environment is read, activated or
-# modified. /data is mounted read-only, which is why this is visible.
-CONDA_SH=/data/miniconda3/etc/profile.d/conda.sh
-
-# CANN must be sourced BEFORE torch_npu is imported, or torch_npu fails with
-# 'ImportError: libhccl.so: cannot open shared object file'. Note the
-# ascend-toolkit/ component: /data/pri/cann-9.2.0/set_env.sh does not exist.
-CANN_SET_ENV=/data/pri/cann-9.2.0/ascend-toolkit/set_env.sh
-
-# RETIRED and IGNORED. A shared card is normal: occupancy is recorded as
-# non-verdict metadata and the same workload runs. Do not set this to request,
-# refuse, skip, downgrade, or wait for a card.
-TF_ALLOW_BUSY_DEVICE=
-
-# The host proxy script. Its exports are passed into docker exec with -e; direct
-# network here runs at ~58 KB/s against ~1.7 MB/s through the proxy.
-PROXY_SH=/home/s00653124/set_proxy.sh
-
-# Local vendor wheels. PyPI torch resolves to a CUDA build on this host, so the
-# torch + torch_npu pair is installed --no-deps from here.
-VENDOR_WHEELS=/home/s00653124/Packages
-
-
-# Host paths bind-mounted into the container. The workspace parent is what makes
-# the repo and the evidence directory visible inside.
-TF_WORKSPACE=/home/s00653124/workspace
+# ---------------------------------------------------------------------------
+# Build / lease directory selection
+# ---------------------------------------------------------------------------
+# Single relative directory name under `--source` used by AgentGates for its
+# `build:<dir>` resource lease. Keep `build` (or comment the line out to use the
+# default `build`; do not set an empty `TILEFOUNDRY_NPU_BUILD_SUBDIR=` value).
+TILEFOUNDRY_NPU_BUILD_SUBDIR=build

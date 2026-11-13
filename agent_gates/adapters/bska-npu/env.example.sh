@@ -17,62 +17,59 @@
 # There is deliberately no home-directory search.
 #
 # This file is the only source of these values. Exporting a BSKA_NPU_* key in
-# the launching shell has no effect. The one exception is BSKA_NPU_DEVICE_ID,
-# which authorizes one run and is passed as --device-id or an export.
+# the launching shell has no effect (and conflicting exports are refused).
+# Launch-only parameters (NEVER write these in env.sh):
+#   * BSKA_NPU_DEVICE_ID: passed per run via `--device-id` or local config.toml.
+#   * BSKA_NPU_REQUIRE_EXCLUSIVE_DEVICE: forwarded by AgentGates devices config.
 #
 # Only plain NAME=value lines are read. '#' comments and blank lines are
 # allowed. The file is parsed as data and never executed. Quotes around a value
 # are optional and stripped.
 #
-# There is no container: the Gate runs as the invoking user, on the host. That
-# is deliberate. A container's login shell pinned ASCEND_RT_VISIBLE_DEVICES and
-# its root identity resolved a different Torch than the one the native extension
-# was compiled against, so a container run could pass every check and still
-# score nothing.
+# Host-local execution only: the Gate runs directly on the host as the invoking
+# user, inside the target Conda Python environment.
 #
 # ---------------------------------------------------------------------------
-# Machine values
+# Machine values & task selection
 # ---------------------------------------------------------------------------
-# CANN set_env.sh, sourced before anything imports torch_npu. It must be
-# complete enough for Ascend950PR: libhccl.so must resolve and ASCEND_OPP_PATH
-# must carry the 950 operator package.
+# Required: CANN set_env.sh, sourced before anything imports torch_npu. It must
+# be complete enough for Ascend950PR (libhccl.so + 950 OPP).
 BSKA_NPU_CANN_SETUP=
 
-# The conda environment holding torch, torch_npu, triton and helix. The Gate
-# uses <CONDA_ENVS_PATH>/<CONDA_ENV>/bin/python directly and needs no
-# activation. This interpreter must be the one the native extension was
-# compiled against; see BSKA_NPU_CANNBENCH_REPO below.
+# Required: Conda environment name and envs root holding torch, torch_npu,
+# triton-ascend, and helix. The Gate executes
+# `<BSKA_NPU_CONDA_ENVS_PATH>/<BSKA_NPU_CONDA_ENV>/bin/python` directly.
 BSKA_NPU_CONDA_ENV=
 BSKA_NPU_CONDA_ENVS_PATH=
 
-# The CANNBench checkout: the directory holding tools/run_cannbench.py and
-# operators/. The native extension is expected at
-# <CANNBENCH_REPO>/.cannbench-build/cann_bench_utils.
+# Required: absolute host path to the CANNBench checkout holding
+# `tools/run_cannbench.py`, `operators/`, and `.cannbench-build/cann_bench_utils`.
 BSKA_NPU_CANNBENCH_REPO=
 
-# The operator the --cannbench step scores, as levelN/name.
+# Required: operator task ID scored by `bska-npu-cannbench` in `levelN/name` form
+# (e.g. `level1/swi_glu`), resolved under `<BSKA_NPU_CANNBENCH_REPO>/operators/<task>`.
 BSKA_NPU_CANNBENCH_TASK=
 
-# Optional: the build target for the native extension. Leave empty for
-# ascend950. Other values are ascend910b and ascend910_93.
+# Optional: build target arch for the native extension. Leave empty/commented
+# for `ascend950`; other valid values are `ascend910b` and `ascend910_93`.
 # BSKA_NPU_CANNBENCH_ARCH=ascend950
 
-# Build selection accepted by the engine so it can take a resource lease.
+# Optional: single relative directory name under `--source` used by AgentGates
+# for its `build:<dir>` resource lease (commented = default `build`; do not set empty).
 # BSKA_NPU_BUILD_SUBDIR=build
 
-# Optional absolute paths of node and claude. Leave empty to use the one on
-# PATH; the Gate then reports which it found.
+# Optional: absolute paths to `node` and `claude` binaries. Leave empty to resolve
+# them from PATH.
 BSKA_NPU_NODE_BIN=
 BSKA_NPU_CLAUDE_BIN=
 
 # ---------------------------------------------------------------------------
 # Exact triton_ascend build - read by the Gate
 # ---------------------------------------------------------------------------
-# Vendor triton_ascend wheels change the TLA API between daily drops, so naming
-# one exact build is what makes an optimize run reproducible. This is the
-# distribution version string, i.e. importlib.metadata.version("triton-ascend").
-# When empty, the Gate reports the installed version but does not pass: the
-# Adapter has no way to prove the build is the reviewed one.
+# Required: exact distribution version string returned by
+# `importlib.metadata.version("triton-ascend")` (e.g. `3.6.0.post...`). Leaving
+# this empty or mismatched fails `--check-config` / `doctor`, so a run cannot
+# pass against an unintended triton-ascend build.
 BSKA_NPU_TRITON_ASCEND_VERSION=
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,15 @@
 # Machine configuration for this machine - AscendNPU-IR Adapter.
 #
+# HOST-FIRST & DOCKER QUARANTINE NOTICE:
+#   The Docker route (`ascend-build` / `ascend-regression`) is currently
+#   QUARANTINED (`DOCKER_MODE_DISABLED`; see `docs/docker-mode-quarantine.md`).
+#   On active host-only machines, run `ascend-build-host` and
+#   `ascend-regression-host`, leave `ASCENDNPU_CONTAINER_*` empty, and fill all
+#   remaining paths below as HOST paths. Note that Ninja targets
+#   (`bishengir-opt bishengir-compile install-bishengir-publish-products` and
+#   `check-bishengir`) are fixed in `manifest.json`; `ASCENDNPU_BUILD_SUBDIR` and
+#   `ASCENDNPU_NINJA_JOBS` control which build subdirectory and concurrency are used.
+#
 # This is the single source of truth for every machine fact this Adapter uses:
 # the container it enters, the toolchain inside it, which build tree it builds,
 # and how wide. The Adapter reads it on every Gate, so editing it takes effect on

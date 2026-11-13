@@ -1,5 +1,11 @@
 # AscendNPU-IR adapter
 
+> [!WARNING]
+> **Docker route quarantined (`DOCKER_MODE_DISABLED`)**: `ascend-build` and
+> `ascend-regression` are currently disabled and isolated (see
+> [`docs/docker-mode-quarantine.md`](../../../docs/docker-mode-quarantine.md)).
+> Active runs use `ascend-build-host` and `ascend-regression-host`.
+
 `ascend-build` runs the fixed Ninja targets `bishengir-opt bishengir-compile install-bishengir-publish-products`. `ascend-regression` depends on that build and runs `check-bishengir`. A real zero exit is required. `ascend-build-host` and `ascend-regression-host` run the same two steps on the host, with no Docker in the path.
 
 ## Two routes

@@ -1,146 +1,132 @@
-# env.sh 配置指南（本服务器）
+# env.sh 配置指南（Host-First 宿主机模式）
 
-**三个 Adapter 读取机器配置的方式完全一致：只读各自的 `env.sh`。**
+所有活跃 Adapter 读取机器配置的方式完全一致：**严格从各自的 `env.sh` 数据文件读取**，从不执行 shell 展开或命令替换（`$(...)`、`` `...` `` 等均视为字面字符串）。
 
-| Adapter | 机器配置文件 |
-|---|---|
-| `ascendnpu-ir` | `agent_gates/adapters/ascendnpu-ir/env.sh` |
-| `tilelang-hivm` | `agent_gates/adapters/tilelang-hivm/env.sh` |
-| `tilelang-hivm-npu` | 与 `tilelang-hivm` **共用**同一文件 |
+| Adapter ID | 默认 `env.sh` 路径 | 覆盖选择器环境变量（或 CLI `--env-file`） |
+| --- | --- | --- |
+| `ascendnpu-ir`（宿主机路由） | `agent_gates/adapters/ascendnpu-ir/env.sh` | `ASCENDNPU_ENV_FILE` |
+| `tilelang-npu` | `agent_gates/adapters/tilelang-npu/env.sh` | `TILELANG_NPU_ENV_FILE` |
+| `tilefoundry-npu` | `agent_gates/adapters/tilefoundry-npu/env.sh` | `TILEFOUNDRY_NPU_ENV_FILE` |
+| `tla-npu` | `agent_gates/adapters/tla-npu/env.sh` | `TLA_NPU_ENV_FILE` |
+| `forgekernel-ascend-npu` | `agent_gates/adapters/forgekernel-ascend-npu/env.sh` | `FK_ASCEND_ENV_FILE` |
+| `bska-npu` | `agent_gates/adapters/bska-npu/env.sh` | `BSKA_NPU_ENV_FILE` |
 
-启动 shell 里的 export **不作为取值来源**。若 export 了与文件不一致的值，Gate 会明确拒绝，
-而不是悄悄二选一：
-
-```
-ASCENDNPU_BUILD_SUBDIR is build-release in the launching environment but build in
-.../env.sh; machine values are read from that file only. Remove the export or edit the file.
-```
-
-这条规则不是为严格而严格：引擎按**同一份文件**解析构建目录并据此加锁。若两者各说各话，
-两个并发运行可能锁住 `build` 却都在写 `build-release`。
-
-`env.sh` 被 `.gitignore` 忽略，不提交、不随 Pack 升级覆盖。
+> [!WARNING]
+> **Docker 模式已隔离（`DOCKER_MODE_DISABLED`）**：`tilelang-hivm`、`tilelang-hivm-npu` 及 `ascendnpu-ir` 容器路由已禁用。本文仅说明当前活跃的 6 个宿主机 Adapter 配置。
 
 ---
 
-## 一、ascendnpu-ir
+## 通用规则
 
-### 本服务器可用的内容
-
-```bash
-# 容器身份（容器必须正在运行，用户/家目录真实存在）
-ASCENDNPU_CONTAINER_NAME=s00653124-tilelang-hivm
-ASCENDNPU_CONTAINER_USER=s00653124
-ASCENDNPU_CONTAINER_HOME=/home/s00653124
-
-# 构建目录与并行度（引擎用同一份文件解析并加锁）
-ASCENDNPU_BUILD_SUBDIR=build
-ASCENDNPU_NINJA_JOBS=64
-
-# ccec 编译器 bin：仅「从零全量构建」需要
-ASCENDNPU_CCEC_BIN=/home/s00653124/workspace/ccec-toolkits/default/ccec_compiler/bin
-
-# 构建前加载 CANN，供 CMake 解析 shmem 头文件路径
-ASCENDNPU_CANN_SETUP=/data/pri/cann-9.1.0/set_env.sh
-# 本机全量构建和回归使用容器的系统 Python 3.12；无需 Conda
-ASCENDNPU_CONDA_SH=
-ASCENDNPU_CONDA_ENV=
-```
-
-也可用 `ASCENDNPU_ENV_FILE=/abs/path` 选择别处的文件——它只**选择文件**，不是参数来源。
-
-### 增量与从零构建
-
-`ascend-build` 按构建树状态自动选择，无需人工干预：
-
-| 目标目录状态 | Gate 行为 |
-|---|---|
-| 有 `build.ninja` | 增量 `ninja`（原行为）|
-| 既无 `build.ninja` 也无 `CMakeCache.txt` | **从零全量构建**：cmake 配置 + 全量编译 + 安装发布产物 |
-| 有 `CMakeCache.txt` 但无 `build.ninja` | 拒绝：既不能增量，也不能重配而不删除别人创建的状态 |
-
-从零构建调用仓库内固定的 `scripts/full-build.sh`，等价于：
-
-```bash
-bash ./build-tools/build.sh \
-  --c-compiler clang --cxx-compiler clang++ \
-  --enable-lld --build-type Release --enable-assertion \
-  -t --bisheng-compiler "$ASCENDNPU_CCEC_BIN" \
-  --disable-werror --disable-bishengir-werror \
-  --build-triton --build-shmem-template \
-  --build ./build -j "$ASCENDNPU_NINJA_JOBS"
-```
-
-`-t` 在源码脚本里是 `--build-bishengir-template`（模板构建），不是测试开关。
-`full-build.sh` 拒绝 `-r/--rebuild`（那会清理构建目录），也不覆盖已有 `build.log`——
-已存在时写入带时间戳的新文件。
-
-`ascend-regression` **不会**触发全量构建：它只接受已存在的构建树。
-
-### 超时链
-
-| 层 | 值 |
-|---|---|
-| 全量构建容器侧 | 21600 s（6 h）|
-| 构建 recipe 外层 | 23400 s |
-| 增量容器侧 | 840 s（原值）|
-| worker backstop | 23700 s，由已安装 manifest 推导，非硬编码 |
-
-worker 单元会**拒绝**比最长 recipe 还小的 backstop，避免装出一个会静默截断全量构建的单元。
-
-### 自检
-
-```bash
-.venv/bin/python -B agent_gates/adapters/ascendnpu-ir/scripts/docker_gate.py --check-config
-# 期望 exit 0，末行 configuration valid (container=... user=...)
-```
+1. **只写 `NAME=VALUE` 数据行**：支持 `#` 注释和空行；成对单/双引号会被去除，未闭合引号报错；未知键或重复键报错。
+2. **禁止在外部 shell 冲突 export**：若启动 shell 中导出了同前缀变量且值与 `env.sh` 不一致，Gate 会明确拒绝，保证引擎加锁路径与 Gate 实际读写路径一致。
+3. **卡号不写入 `env.sh`**：`*_DEVICE_ID` 和 `*_REQUIRE_EXCLUSIVE_DEVICE` 属于单次运行/集群策略参数，由 `--device-id` 或 `~/.config/agent-gates/config.toml` 解析后注入，绝不写入 `env.sh`。
+4. **不要将 `*_BUILD_SUBDIR=` 或 `*_NINJA_JOBS=` 留成空赋值行**：若使用默认值（如 `build` 或 `$(nproc)`），应保留默认值（如 `=build`）或整行 `#` 注释掉。
 
 ---
 
-## 二、tilelang-hivm / tilelang-hivm-npu（共用一个文件）
+## 一、`tilefoundry-npu`（TileFoundry）
 
-```bash
-TILELANG_HIVM_CONTAINER_NAME=s00653124-tilelang-hivm
-TILELANG_HIVM_CONTAINER_USER=s00653124
-TILELANG_HIVM_CONTAINER_HOME=/home/s00653124
+模板文件：[`env.example.sh`](../../agent_gates/adapters/tilefoundry-npu/env.example.sh)
 
-TILELANG_HIVM_CANN_SETUP=/data/pri/cann-9.1.0/set_env.sh
-TILELANG_HIVM_CONDA_SH=/data/miniconda3/etc/profile.d/conda.sh
-TILELANG_HIVM_CONDA_ENV=s00653124_tilelang
-TILELANG_HIVM_CONDA_ENVS_PATH=/home/s00653124/.conda/envs
-
-TILELANG_HIVM_HIVM_COMPILER=/home/s00653124/workspace/AscendNPU-IR-1/build/bin/bishengir-compile
-TILELANG_HIVM_HIVM_TARGET=Ascend950PR_9579
-
-# 可选：构建目录与并行度
-TILELANG_HIVM_BUILD_SUBDIR=build
-TILELANG_HIVM_NINJA_JOBS=64
-
-# 可选：容器内源码路径（仅当容器看到的路径与 bind-mount 推导值不同时才写）
-# 它只能确认路径、不能凭空指定：挂载映射仍会推导并比对，不一致即拒绝。
-# TILELANG_HIVM_CONTAINER_SOURCE=/workspace/tilelang
-```
-
-以上键全部是**文件键**，两个 TileLang Adapter 共用同一份 `env.sh`。启动 shell 里的
-`export` 不是取值来源：只 export 不写文件会明确报错，值与文件冲突同样拒绝。
-仍从环境读取的只有 `TILELANG_HIVM_ENV_FILE`（选文件）。
-
-`TILELANG_HIVM_DEVICE_ID` **不写在这里**：设备由 AgentGates 本地配置解析后注入，
-工具调用不能指定。
+| 字段 | 必填 | 格式与默认值 | 作用与注意事项 |
+| --- | --- | --- | --- |
+| `TILEFOUNDRY_NPU_CANN_SETUP` | 是 | 宿主机绝对路径 | CANN `set_env.sh`；仅 `tilefoundry-npu-device` 会 `source` 它，`tilefoundry-npu-cpu` 刻意跳过以避免 `ortools` 与 CANN 原生库冲突 |
+| `TILEFOUNDRY_NPU_CONDA_SH` | 是 | 宿主机绝对路径 | Conda `conda.sh` |
+| `TILEFOUNDRY_NPU_CONDA_ENV` | 是 | 环境名 | 装有 `torch (+cpu)`、`torch_npu`、`pytest`、`z3` 的 Conda 环境名（如 `tilefoundry-npu`） |
+| `TILEFOUNDRY_NPU_CONDA_ENVS_PATH` | 可选 | 宿主机绝对路径 | 环境位于自定义用户 `.conda/envs` 目录时填写 |
+| `TILEFOUNDRY_NPU_PYTHON` | 可选 | 宿主机绝对路径 | 目标 Conda 环境的 `python3`；留空则由上述 Conda 路径自动拼接 |
+| `TILEFOUNDRY_NPU_CPU_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的 `pytest` 测试文件或目录（禁止 `/` 开头和 `..`）。留空默认运行 5 个目录：`tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators` |
+| `TILEFOUNDRY_NPU_DEVICE_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的额外 NPU `pytest` 路径（禁止 `/` 开头和 `..`）。**默认留空**：只跑内置窗口期 NPU 探针（`import tilefoundry`、FP32 向量加、BF16 Cube `matmul`、显存分配 > 0、`torch.npu.synchronize()`）；填写后会在同一设备窗口内追加执行 `pytest` 并要求至少通过 1 个用例且零失败 |
+| `TILEFOUNDRY_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | 引擎加 `build:<dir>` 锁使用；模板默认填 `build`，请勿改为 `=` 空值 |
 
 ---
 
-## 三、校验与常见错误
+## 二、`tilelang-npu`（TileLang Ascend 宿主机版）
 
-配置是**数据**，不是脚本：只接受 `NAME=value`、注释和空行，不执行命令替换。
-未知键、重复键、不平衡引号都会明确报错。
+模板文件：[`env.example.sh`](../../agent_gates/adapters/tilelang-npu/env.example.sh)
 
-| 报错 | 原因 | 处理 |
-|---|---|---|
-| `does not define ASCENDNPU_CONTAINER_NAME` | 文件缺容器身份 | 补齐三行 |
-| `is exported as ..., but machine values are read only from ...` | shell 有冲突 export | `unset` 后改文件 |
-| `sets unknown key` | 键名拼错 | 按本文更正 |
-| `container ... is not running` | 容器未启动 | `docker start <name>` |
-| `does not match the bind mount` | 源码未挂进容器 | 检查容器挂载 |
+| 字段 | 必填 | 格式与默认值 | 作用与注意事项 |
+| --- | --- | --- | --- |
+| `TILELANG_NPU_CANN_SETUP` | 是 | 宿主机绝对路径 | CANN `set_env.sh`（先于 Conda 加载） |
+| `TILELANG_NPU_CONDA_SH` | 是 | 宿主机绝对路径 | Conda `conda.sh` |
+| `TILELANG_NPU_CONDA_ENV` | 是 | 环境名 | 装有 `torch`/`torch_npu`/编译依赖的 Conda 环境 |
+| `TILELANG_NPU_CONDA_ENVS_PATH` | 是 | 宿主机绝对路径 | 自定义 `.conda/envs` 根目录 |
+| `TILELANG_NPU_PYTHON` | 是 | 宿主机绝对路径 | 目标 Conda 环境内的 `python3`（传入 CMake） |
+| `TILELANG_NPU_CMAKE_BIN` | 可选 | 宿主机绝对路径 | 指定 `cmake`；留空使用激活环境中的 `cmake` |
+| `TILELANG_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | **注意**：模板文件为满足打包契约该行为空；拷贝成真实 `env.sh` 时请设为 `build` 或注释掉该行 |
+| `TILELANG_NPU_NINJA_JOBS` | 可选 | 正整数 | 拷贝成真实 `env.sh` 时请按主机内存填写正整数（如 `32`）或注释掉该行，不可留空赋值 |
+| `TILELANG_NPU_EXAMPLE_TESTS` | 可选 | 逗号分隔的**相对** `.py` 文件列表 | 指定 `tilelang-npu-examples` 要运行的示例；留空默认运行 3 个经审查的 Ascend 示例：`examples/ascend/test_vecadd.py,examples/ascend/test_rmsnorm.py,examples/ascend/test_per_token_cast_to_fp8.py` |
 
-手动执行 NPU 脚本仍需自备 `TILELANG_HIVM_DEVICE_ID`；通过 AgentGates 提交时由本地配置解析。
+---
+
+## 三、`tla-npu`（triton-ascend TLA 接口 E2E）
+
+模板文件：[`env.example.sh`](../../agent_gates/adapters/tla-npu/env.example.sh)
+
+- 宿主机直跑路径：只需填写宿主机路径；`TLA_NPU_CONTAINER_*` 系列键留空（仅保留解析兼容，Host 模式忽略）。
+- 关键测试与缓存字段：
+  - `TLA_NPU_CANN_SETUP`、`TLA_NPU_CONDA_SH`、`TLA_NPU_CONDA_ENV`、`TLA_NPU_CONDA_ENVS_PATH`：宿主机 CANN 与 Conda 环境（需安装含 `@tla.jit` 支持的 `triton-ascend`）。
+  - `TLA_NPU_TEST_DIR`（**必填**）：宿主机绝对路径，存放外部独立 `test_tla.py` 的目录；**必须独立于 `--source` 传入的 `triton-ascend` 仓库和 `TLA_NPU_CACHE_DIR`**。
+  - `TLA_NPU_CACHE_DIR`（**必填**）：宿主机绝对路径，必须位于 `--source` 与 `TLA_NPU_TEST_DIR` 之外；每次运行都在其下新建独立临时子目录作为 `TRITON_CACHE_DIR`。
+  - `TLA_NPU_BUILD_SUBDIR`：不写源码内构建树，保持 `#` 注释即使用租约名 `build`。
+
+---
+
+## 四、`bska-npu`（cannbot-ops / CANNBench）
+
+模板文件：[`env.example.sh`](../../agent_gates/adapters/bska-npu/env.example.sh)
+
+- 必填键：
+  - `BSKA_NPU_CANN_SETUP`：宿主机 CANN `set_env.sh`（支持 Ascend950PR）。
+  - `BSKA_NPU_CONDA_ENV` & `BSKA_NPU_CONDA_ENVS_PATH`：直接调用 `<CONDA_ENVS_PATH>/<CONDA_ENV>/bin/python`。
+  - `BSKA_NPU_CANNBENCH_REPO`：CANNBench 仓库绝对路径（包含 `tools/run_cannbench.py`、`operators/`、`.cannbench-build/cann_bench_utils`）。
+  - `BSKA_NPU_CANNBENCH_TASK`：`bska-npu-cannbench` 门禁评测的算子任务标识，格式为 `levelN/name`（例如 `level1/swi_glu`）。
+  - `BSKA_NPU_TRITON_ASCEND_VERSION`：**必填**，必须精确等于环境中 `importlib.metadata.version("triton-ascend")` 的版本字符串（如 `3.6.0.post...`），留空或不匹配会被拒绝。
+- 可选键：`BSKA_NPU_CANNBENCH_ARCH`（默认 `ascend950`，可选 `ascend910b` / `ascend910_93`）、`BSKA_NPU_BUILD_SUBDIR`（保持注释或设为 `build`）、`BSKA_NPU_NODE_BIN`、`BSKA_NPU_CLAUDE_BIN`。
+
+---
+
+## 五、`forgekernel-ascend-npu`（ForgeKernel）
+
+模板文件：[`env.example.sh`](../../agent_gates/adapters/forgekernel-ascend-npu/env.example.sh)
+
+- 固定探针：无自定义测试列表字段——`smoke` 执行固定 `fk_device_probe.py`（FP32/BF16/Reduce），`build` 在隔离 venv 内安装并做版本/入口探测。
+- 关键路径与策略键：
+  - `FK_ASCEND_CANN_SETUP`、`FK_ASCEND_PYTHON`（宿主机基础 Python，用于创建 `--system-site-packages` venv）。
+  - `FK_ASCEND_TILELANG_SOURCE` & `FK_ASCEND_TILELANG_BUILD`（**必填**，复用既有 TileLang 源码和 `build/libtilelang*.so`，只读校验哈希从不重编 TileLang）。
+  - `FK_ASCEND_WORK_ROOT` & `FK_ASCEND_VENV`（**必填**，位于 `--source` 之外的运行期工作目录，保存 `build-src/<commit>/` 源码拷贝及 venv）。
+  - `FK_ASCEND_DEPENDENCY_POLICY`：`frozen`（推荐）或 `online`；Agent 键 `FK_ASCEND_CLAUDE_BIN` / `_PROVIDER_*` 中 API Key 通过 `FK_ASCEND_PROVIDER_KEY_VARIABLE` 指定环境变量名，严禁把真实秘钥写入 `env.sh`。
+
+---
+
+## 六、`ascendnpu-ir`（宿主机路由 `ascend-build-host` / `ascend-regression-host`）
+
+模板文件：[`env.example.sh`](../../agent_gates/adapters/ascendnpu-ir/env.example.sh)
+
+- Ninja 目标固化在 `manifest.json`（构建：`bishengir-opt bishengir-compile install-bishengir-publish-products`；回归：`check-bishengir`）。
+- 宿主机运行留空 `ASCENDNPU_CONTAINER_*`，仅配置宿主机路径：`ASCENDNPU_CANN_SETUP`、`ASCENDNPU_CONDA_SH` / `_CONDA_ENV`（若用系统 Python 可留空）、`ASCENDNPU_CCEC_BIN`（仅从零构建需要）、`ASCENDNPU_BUILD_SUBDIR`（默认 `build`）、`ASCENDNPU_NINJA_JOBS`（正整数并行度）。
+- 宿主机体检还会验证有效 `PATH` 上的工具与版本：`ninja >= 1.12`、`cmake >= 3.28`、`clang`、`clang++`、`g++`、`ld.lld`、`git` 等。
+
+---
+
+## 七、配置自检与常见报错排查
+
+在正式提交任务前，务必使用 `doctor` 验证对应 Adapter（不触发编译或上卡任务）：
+
+```bash
+.venv/bin/agent-gates doctor \
+  --adapter <adapter-id> \
+  --source /abs/path/to/repo \
+  [--gate <gate-id>] \
+  [--device-id <npu-id>] \
+  --json
+```
+
+| 报错特征 | 原因 | 处理方式 |
+| --- | --- | --- |
+| `set but empty` | 在真实 `env.sh` 中写了空的 `*_BUILD_SUBDIR=` 或 `*_NINJA_JOBS=` | 填入具体值（如 `build` / `32`）或整行 `#` 注释 |
+| `is exported as ..., but machine values are read only from ...` | 外部 shell `export` 与 `env.sh` 冲突 | `unset` 外部冲突变量或同步更新 `env.sh` |
+| `test path must be relative inside source root` | `TILEFOUNDRY_NPU_*_TESTS` 或 `TILELANG_NPU_EXAMPLE_TESTS` 写了绝对路径或 `..` | 改为相对 `--source` 的路径 |
+| `DOCKER_MODE_DISABLED` | 调用了容器 Adapter 或 `ascend-build` 等容器 Gate | 改用宿主机 Adapter 或 `ascend-build-host` / `ascend-regression-host` |
+| `npu <id> is busy`（exit 75） | 开启独占模式且目标 NPU 正被其他进程占用 | 等待卡空闲或调整卡号/独占策略 |

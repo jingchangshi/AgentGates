@@ -45,8 +45,8 @@ for a reader, and are deliberately NOT gated: the echo is a value this Gate itse
 exported, and both cards report the same UUID on this host, so gating on either
 would be true by construction. What the Gate proves is that a compiled TLA kernel
 ran on the single card the operator named - not that it independently re-identified
-that board. Board serials are host-side facts here; the container's `npu-smi`
-cannot load `libc_sec.so`.
+that board. Host-side `npu-smi info` is queried directly to resolve physical/NPU
+ID mappings and exclusivity checks.
 
 Missing data is false, never assumed. A run that produces no output, an
 unavailable device, an all-skipped suite and a failed synchronization cannot
@@ -55,46 +55,36 @@ pass.
 ## Device selection
 
 The Gate requires an explicitly assigned `TLA_NPU_DEVICE_ID` or CLI
-`--device-id`; it never discovers, chooses or substitutes a device. Root
-execution inside the container preserves the upstream `uda_occupy_dev_by_ns`
-driver workaround — root does not authorize a device.
+`--device-id`; it never discovers, chooses or substitutes a device. The Gate runs
+directly on the host as the invoking user under `/bin/bash -c` (`set +u` around
+CANN + Conda activation).
 
 Occupancy is reported, not enforced: on this class of machine a card is shared,
 and refusing because someone else is on it would block work for a reason
 unrelated to the code under test. `TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE=1`
-(forwarded from `devices.require_exclusive_device`) turns a held card into
+(forwarded from `devices.require_exclusive`) turns a held card into
 `BLOCKED_ENV`, which is honest because the test never ran.
 
 ## Configuration
 
-One strict `NAME=value` file, `env.sh`, beside `env.example.sh`. It holds
-CANN, Conda, the container identity and the provisioning values. Pass an
-absolute path with `--env-file` (mapped to `TLA_NPU_ENV_FILE`), or keep the
-git-ignored `env.sh` in place. The Gate parses the file as data and never
-executes it. Unknown keys, duplicate keys and malformed lines fail.
+One strict `NAME=value` file, `env.sh`, beside `env.example.sh`. It holds host
+CANN, host Conda, `TLA_NPU_TEST_DIR`, and `TLA_NPU_CACHE_DIR` values (the Gate
+allocates a fresh per-run subdirectory underneath `TLA_NPU_CACHE_DIR` for
+`TRITON_CACHE_DIR` so concurrent or stale runs never collide). Legacy
+`TLA_NPU_CONTAINER_*` keys remain accepted for parser compatibility and are
+ignored on the host route. Pass an absolute path with `--env-file` (mapped to
+`TLA_NPU_ENV_FILE`), or keep the git-ignored `env.sh` in place.
 
 `TLA_NPU_DEVICE_ID` is deliberately not in that file: it authorizes one run,
 not a machine.
 
-## Container
+## Container (Quarantined)
 
-`docker/` supplies the deployment files. Build and create the container with:
-
-    cd docker
-    docker build -t tla-npu-dev:24.04 .
-    cp config.example.env config.env   # set identity, mounts, devices
-    ./create-container.sh --config ./config.env --dry-run
-    ./create-container.sh --config ./config.env
-
-The image provides the base toolchain only (Ubuntu 24.04, GCC, Python, git). It
-deliberately does not contain CANN, Conda, the Python environment or any wheel:
-CANN and Conda are bind-mounted from the host, and the environment is built by
-`scripts/setup-python-env.sh`. Unlike the TileLang image it installs no
-LLVM/clang, cmake or ninja, because the vendor Triton build ships its own prebuilt
-LLVM and BishengIR binaries and nothing here compiles C++.
-
-The Gate never calls `create-container.sh` or `setup-python-env.sh`; they are
-deliberate operator actions, not gate steps.
+> [!WARNING]
+> Container execution (`docker/create-container.sh` container creation) is
+> **QUARANTINED (`DOCKER_MODE_DISABLED`)**; see
+> [`docs/docker-mode-quarantine.md`](../../../docs/docker-mode-quarantine.md).
+> Active runs execute directly on the host via `scripts/tla_gate.py`.
 
 ## Provisioning
 
@@ -149,9 +139,8 @@ over the tracked files.
 `TLA_NPU_TEST_DIR` is the **directory holding `test_tla.py`**. It is not part of
 the source tree, and the Gate will not accept it as one.
 
-Both are mapped into the container through the bind mounts and both sides are
-proven to be the same directory by comparing device/inode pairs before anything
-runs, so the bytes tested are the bytes on disk. Neither directory is entered as
+Both run directly on the host as the invoking user so the bytes tested are the
+bytes on disk (no bind-mount mapping is involved). Neither directory is entered as
 a working directory: the runner executes from its own scratch directory, because
 CANN deposits crash dumps into the process working directory.
 
