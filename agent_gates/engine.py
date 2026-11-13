@@ -4,7 +4,9 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import sys
 from .evaluator import evaluate
+from .docker_quarantine import is_quarantined_recipe, quarantine_reason
 from .evidence import EvidenceStore, aggregate
 from .executor import execute, executable_identity, file_reference, now
 from . import machine_env
@@ -16,7 +18,8 @@ from .source_identity import snapshot, source_root
 ENV_KEYS = {"ascendnpu-ir": "ASCENDNPU_ENV_FILE", "tilelang-hivm": "TILELANG_HIVM_ENV_FILE",
             "tilelang-hivm-npu": "TILELANG_HIVM_ENV_FILE", "tla-npu": "TLA_NPU_ENV_FILE",
             "forgekernel-ascend-npu": "FK_ASCEND_ENV_FILE", "bska-npu": "BSKA_NPU_ENV_FILE",
-            "tilelang-npu": "TILELANG_NPU_ENV_FILE"}
+            "tilelang-npu": "TILELANG_NPU_ENV_FILE",
+            "tilefoundry-npu": "TILEFOUNDRY_NPU_ENV_FILE"}
 
 # The environment prefix each Adapter owns. An Adapter reads only its own prefix,
 # so a stray export for one Adapter cannot steer another; this map is the single
@@ -24,7 +27,8 @@ ENV_KEYS = {"ascendnpu-ir": "ASCENDNPU_ENV_FILE", "tilelang-hivm": "TILELANG_HIV
 OWN_PREFIX = {"ascendnpu-ir": "ASCENDNPU_", "tilelang-hivm": "TILELANG_HIVM_",
               "tilelang-hivm-npu": "TILELANG_HIVM_", "tla-npu": "TLA_NPU_",
               "forgekernel-ascend-npu": "FK_ASCEND_", "bska-npu": "BSKA_NPU_",
-              "tilelang-npu": "TILELANG_NPU_"}
+              "tilelang-npu": "TILELANG_NPU_",
+              "tilefoundry-npu": "TILEFOUNDRY_NPU_"}
 
 # The Adapters that require an explicitly authorized NPU device. Each names its
 # own device variable and leases an npu:<id> on it, so two AgentGates runs cannot
@@ -34,7 +38,8 @@ DEVICE_ADAPTERS = {"tilelang-hivm-npu": "TILELANG_HIVM_DEVICE_ID",
                    "tilelang-npu": "TILELANG_NPU_DEVICE_ID",
                    "tla-npu": "TLA_NPU_DEVICE_ID",
                    "forgekernel-ascend-npu": "FK_ASCEND_DEVICE_ID",
-                   "bska-npu": "BSKA_NPU_DEVICE_ID"}
+                   "bska-npu": "BSKA_NPU_DEVICE_ID",
+                   "tilefoundry-npu": "TILEFOUNDRY_NPU_DEVICE_ID"}
 
 # The variables a windowed Recipe reads to open the device lease itself. The
 # engine writes them only for a recipe that declares `deviceWindow`; every other
@@ -57,7 +62,8 @@ EXCLUSIVE_VARIABLE = {"tilelang-hivm-npu": "TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVI
                       "tilelang-npu": "TILELANG_NPU_REQUIRE_EXCLUSIVE_DEVICE",
                       "tla-npu": "TLA_NPU_REQUIRE_EXCLUSIVE_DEVICE",
                       "forgekernel-ascend-npu": "FK_ASCEND_REQUIRE_EXCLUSIVE_DEVICE",
-                      "bska-npu": "BSKA_NPU_REQUIRE_EXCLUSIVE_DEVICE"}
+                      "bska-npu": "BSKA_NPU_REQUIRE_EXCLUSIVE_DEVICE",
+                      "tilefoundry-npu": "TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE"}
 
 # A configuration check explains itself on stderr. Only the last line is kept,
 # bounded, and it is the Adapter's own message: no environment values, no
@@ -96,9 +102,13 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     own = OWN_PREFIX.get(manifest.id, "")
     for name in [name for name in env
                  if name.startswith(("ASCENDNPU_", "TILELANG_HIVM_", "TILELANG_NPU_", "TLA_NPU_",
-                                     "FK_ASCEND_", "BSKA_NPU_"))
+                                     "FK_ASCEND_", "BSKA_NPU_", "TILEFOUNDRY_NPU_"))
                  and not name.startswith(own)]:
         del env[name]
+    py_bin = os.path.dirname(os.path.abspath(sys.executable))
+    path_parts = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+    if py_bin not in path_parts:
+        env["PATH"] = os.pathsep.join([py_bin, *path_parts]) if path_parts else py_bin
     if env_file is not None:
         if not Path(env_file).is_absolute():
             raise ValueError("--env-file must be an absolute path")
@@ -191,7 +201,7 @@ def build_directory(source: Path, manifest: Manifest, env) -> Path:
 def artifact_inputs(source, manifest, env):
     """Known existing compiler products, before an observation-only regression."""
     paths = []
-    if manifest.id.startswith("tilelang-hivm"):
+    if manifest.id.startswith("tilelang-hivm") or manifest.id == "tilelang-npu":
         paths.append(source / "tilelang/__init__.py")
         # Native search paths may point outside the default build directory.
         # Snapshot all shared products under this checkout before testing.
@@ -361,6 +371,18 @@ class Engine:
         checks, failures, checked, deduplicated = [], [], [], {}
         for recipe_id in self._doctor_recipes(manifest, gates, source, deduplicated):
             recipe = manifest.resolve_recipe(recipe_id, source)
+            if is_quarantined_recipe(manifest.id, recipe_id, recipe.argv):
+                msg = quarantine_reason(f"recipe {recipe_id!r}")
+                checks.append({
+                    "recipeId": recipe_id,
+                    "exitCode": 75,
+                    "timedOut": False,
+                    "interrupted": False,
+                    "reason": msg,
+                })
+                checked.append(recipe_id)
+                failures.append(msg)
+                continue
             try:
                 manifest.validate_files()
                 executable_identity(recipe.argv, recipe.cwd, env)
@@ -477,6 +499,12 @@ class Engine:
                     prior = {item["gateId"]: item["status"] for item in receipt["gates"][:-1]}
                     if any(prior.get(dependency) != "PASS" for dependency in definition.get("dependsOn", [])):
                         gate["failures"] = ["DEPENDENCY_NOT_PASSED"]
+                        continue
+                    if is_quarantined_recipe(manifest.id, recipe.id, recipe.argv):
+                        gate.update(
+                            status="BLOCKED_ENV",
+                            failures=[quarantine_reason(f"gate {gate_id!r} ({recipe.id})")],
+                        )
                         continue
                     try:
                         self._gate(manifest, source, recipe, gate, receipt, env, directory, lease_fds,

@@ -164,6 +164,21 @@ TILELANG_NPU_KEYS = (
     'TILELANG_NPU_NINJA_JOBS',
     'TILELANG_NPU_EXAMPLE_TESTS',
 )
+
+# TileFoundry host adapter: CANN 9.3.0 + conda tilefoundry-npu env; CPU tests
+# run without CANN sourced (to avoid ortools/CANN native library collision)
+# and device tests run windowed on the card under CANN + torch_npu.
+TILEFOUNDRY_NPU_KEYS = (
+    'TILEFOUNDRY_NPU_CANN_SETUP',
+    'TILEFOUNDRY_NPU_CONDA_SH',
+    'TILEFOUNDRY_NPU_CONDA_ENV',
+    'TILEFOUNDRY_NPU_CONDA_ENVS_PATH',
+    'TILEFOUNDRY_NPU_PYTHON',
+    'TILEFOUNDRY_NPU_CPU_TESTS',
+    'TILEFOUNDRY_NPU_DEVICE_TESTS',
+    'TILEFOUNDRY_NPU_BUILD_SUBDIR',
+)
+
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
 ADAPTERS = {
@@ -211,6 +226,12 @@ ADAPTERS = {
         'selector': 'TILELANG_NPU_ENV_FILE',
         'directory': 'tilelang-npu',
         'keys': TILELANG_NPU_KEYS,
+    },
+    'tilefoundry-npu': {
+        'prefix': 'TILEFOUNDRY_NPU_',
+        'selector': 'TILEFOUNDRY_NPU_ENV_FILE',
+        'directory': 'tilefoundry-npu',
+        'keys': TILEFOUNDRY_NPU_KEYS,
     },
 }
 

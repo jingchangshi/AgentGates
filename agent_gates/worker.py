@@ -77,7 +77,7 @@ def run_execution(execution_id: str, *, store: ExecutionStore, config, engine=No
                      **{"startedAt": time.time(), "workerPid": os.getpid()})
     try:
         _config_for_execution(request, config)
-    except ConfigError as exc:
+    except (ConfigError, WorkerError) as exc:
         store.transition(execution_id, api.ExecutionState.INTERRUPTED,
                          event="config_mismatch",
                          **{"exitReason": "CONFIG_IDENTITY_CHANGED: " + str(exc),
@@ -99,6 +99,10 @@ def run_execution(execution_id: str, *, store: ExecutionStore, config, engine=No
 
     store.transition(execution_id, api.ExecutionState.RUNNING, event="running")
 
+    had_smi = "AGENT_GATES_SMI_COMMAND" in os.environ
+    prev_smi = os.environ.get("AGENT_GATES_SMI_COMMAND")
+    if config.devices.smi_command:
+        os.environ["AGENT_GATES_SMI_COMMAND"] = config.devices.smi_command
     try:
         receipt = engine.run(adapter, source, gates,
                              env_file=adapter_entry.env_file,
@@ -126,6 +130,11 @@ def run_execution(execution_id: str, *, store: ExecutionStore, config, engine=No
                          **{"exitReason": "EXECUTION_FAILED: " + str(exc)[:400],
                             "finishedAt": time.time()})
         return store.read_status(execution_id)
+    finally:
+        if had_smi:
+            os.environ["AGENT_GATES_SMI_COMMAND"] = prev_smi
+        else:
+            os.environ.pop("AGENT_GATES_SMI_COMMAND", None)
 
     # A cancel that arrived while the gate ran makes this execution CANCELLED.
     # The Engine still publishes a receipt (the interrupted gate is FAIL), but

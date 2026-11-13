@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import api_types as api
 from .config import ConfigError, load
+from .docker_quarantine import QUARANTINED_GATES, is_quarantined_recipe
 from .evidence import EvidenceStore
 from .execution import MAX_WAIT_SECONDS, ExecutionManager
 from .verify_requirements import verify_requirements
@@ -37,6 +38,21 @@ def _gate_info(gate_id, definition):
                         recipe_id=definition["recipeId"],
                         depends_on=list(definition.get("dependsOn") or []),
                         checks=dict(definition.get("observationChecks") or {}))
+
+
+def _allowed_manifest_gates(workspace, manifest):
+    blocked = QUARANTINED_GATES.get(manifest.id, ())
+    allowed = []
+    for gate_id, definition in manifest.gates.items():
+        if gate_id in blocked:
+            continue
+        if workspace.allowed_gates is not None and gate_id not in workspace.allowed_gates:
+            continue
+        recipe = manifest.resolve_recipe(definition["recipeId"], workspace.source_root)
+        if is_quarantined_recipe(manifest.id, recipe.id, recipe.argv):
+            continue
+        allowed.append((gate_id, definition))
+    return allowed
 
 
 def _status_enum(value):
@@ -215,7 +231,7 @@ def build_server():
                     id=manifest.id,
                     manifest_sha256=manifest.manifest_hash,
                     gates=[_gate_info(gate_id, definition)
-                           for gate_id, definition in manifest.gates.items()]))
+                           for gate_id, definition in _allowed_manifest_gates(workspace, manifest)]))
             infos.append(api.WorkspaceInfo(
                 id=workspace.id,
                 source_root=str(workspace.source_root),
@@ -236,7 +252,7 @@ def build_server():
         manifest = manager.registry.get(payload.adapter)
         return GateList(workspace=payload.workspace, adapter=payload.adapter,
                         gates=[_gate_info(gate_id, definition)
-                               for gate_id, definition in manifest.gates.items()])
+                               for gate_id, definition in _allowed_manifest_gates(workspace, manifest)])
 
     @server.tool(name="doctor",
                  description="Probe the machine configuration for one workspace and "
@@ -245,7 +261,7 @@ def build_server():
     async def doctor(workspace: str, adapter: str,
                      gates: list[str] | None = None) -> api.DoctorReport:
         payload = DoctorInput(workspace=workspace, adapter=adapter, gates=gates)
-        from .engine import Engine
+        from .engine import Engine, config_reason
         manager = _manager()
         workspace = manager.config.workspace(payload.workspace)
         if payload.adapter not in workspace.adapters:
@@ -255,14 +271,46 @@ def build_server():
                         store=EvidenceStore(manager.config.evidence_root),
                         lock_root=manager.config.lock_root)
         adapter = manager.config.adapter(payload.adapter)
-        result = engine.doctor(payload.adapter, workspace.source_root,
-                               selected=payload.gates, env_file=adapter.env_file)
-        checks = [api.DoctorCheck(
-            recipe_id=item.get("recipeId", ""),
-            ok=(item.get("exitCode") == 0 and not item.get("timedOut")
-                and not item.get("interrupted")),
-            exit_code=item.get("exitCode"))
-            for item in result.get("checks", [])]
+        manifest = manager.registry.get(payload.adapter)
+        selected_gates = payload.gates
+        if selected_gates is None:
+            allowed_pairs = _allowed_manifest_gates(workspace, manifest)
+            if allowed_pairs and len(allowed_pairs) < len(manifest.gates):
+                selected_gates = [gid for gid, _ in allowed_pairs]
+        elif workspace.allowed_gates is not None:
+            denied = [g for g in selected_gates if g not in workspace.allowed_gates]
+            if denied:
+                raise ValueError(
+                    "gate(s) not permitted for workspace " + repr(payload.workspace)
+                    + ": " + ", ".join(denied)
+                )
+        device_id = manager._device_for(payload.adapter, None)
+        import os
+        had_smi = "AGENT_GATES_SMI_COMMAND" in os.environ
+        prev_smi = os.environ.get("AGENT_GATES_SMI_COMMAND")
+        if manager.config.devices.smi_command:
+            os.environ["AGENT_GATES_SMI_COMMAND"] = manager.config.devices.smi_command
+        try:
+            result = engine.doctor(
+                payload.adapter, workspace.source_root,
+                selected=selected_gates, env_file=adapter.env_file,
+                device_id=device_id,
+                require_exclusive_device=manager.config.devices.require_exclusive)
+        finally:
+            if had_smi:
+                os.environ["AGENT_GATES_SMI_COMMAND"] = prev_smi
+            else:
+                os.environ.pop("AGENT_GATES_SMI_COMMAND", None)
+        checks = []
+        for item in result.get("checks", []):
+            ok = (item.get("exitCode") == 0 and not item.get("timedOut")
+                  and not item.get("interrupted"))
+            reason = None if ok else (config_reason(item) or None)
+            checks.append(api.DoctorCheck(
+                recipe_id=item.get("recipeId", ""),
+                ok=ok,
+                exit_code=item.get("exitCode"),
+                reason=reason))
         return api.DoctorReport(workspace=payload.workspace, adapter=payload.adapter,
                                 status=_status_enum(result.get("status")),
                                 checks=checks,

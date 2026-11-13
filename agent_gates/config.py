@@ -20,6 +20,12 @@ import re
 import sys
 import tomllib
 
+from .docker_quarantine import (
+    QUARANTINED_ADAPTERS,
+    QUARANTINED_GATES,
+    quarantine_reason,
+)
+
 CONFIG_SCHEMA_VERSION = 1
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config/agent-gates/config.toml"
@@ -43,6 +49,13 @@ class ConfigError(ValueError):
         self.field = field
         self.reason = reason
         super().__init__(f"{field}: {reason}")
+
+
+def _check_unknown_keys(mapping, allowed, prefix=""):
+    unknown = sorted(set(mapping) - set(allowed))
+    if unknown:
+        field = f"{prefix}.{unknown[0]}" if prefix else str(unknown[0])
+        raise ConfigError(field, "unknown field")
 
 
 def _require(mapping, key, field):
@@ -286,6 +299,11 @@ def from_mapping(raw, *, path=None):
     """
     if not isinstance(raw, dict):
         raise ConfigError("config", "top level must be a table")
+    _check_unknown_keys(
+        raw,
+        ("schema_version", "state_root", "evidence_root", "lock_root",
+         "workspaces", "adapters", "worker", "devices"),
+    )
     schema_version = _integer(raw, "schema_version", "schema_version", minimum=1)
     if schema_version != CONFIG_SCHEMA_VERSION:
         raise ConfigError("schema_version",
@@ -305,6 +323,7 @@ def from_mapping(raw, *, path=None):
             raise ConfigError(field, "workspace id must match [a-z][a-z0-9-]{0,63}")
         if not isinstance(body, dict):
             raise ConfigError(field, "must be a table")
+        _check_unknown_keys(body, ("source_root", "adapters", "allowed_gates"), field)
         source_root = _canonical_directory(_require(body, "source_root", f"{field}.source_root"),
                                            f"{field}.source_root")
         adapters_raw = _require(body, "adapters", f"{field}.adapters")
@@ -315,6 +334,8 @@ def from_mapping(raw, *, path=None):
             entry = f"{field}.adapters[{index}]"
             if not isinstance(adapter_id, str) or not ID.fullmatch(adapter_id):
                 raise ConfigError(entry, "must be an adapter id matching [a-z][a-z0-9-]{0,63}")
+            if adapter_id in QUARANTINED_ADAPTERS:
+                raise ConfigError(entry, quarantine_reason(f"adapter {adapter_id!r}"))
             if adapter_id in adapters:
                 raise ConfigError(entry, "duplicate adapter id")
             adapters.append(adapter_id)
@@ -328,6 +349,8 @@ def from_mapping(raw, *, path=None):
                 entry = f"{field}.allowed_gates[{index}]"
                 if not isinstance(gate_id, str) or not gate_id.strip():
                     raise ConfigError(entry, "must be a gate id")
+                if any(gate_id in QUARANTINED_GATES.get(aid, ()) for aid in adapters):
+                    raise ConfigError(entry, quarantine_reason(f"gate {gate_id!r}"))
                 if gate_id in allowed_gates:
                     raise ConfigError(entry, "duplicate gate id")
                 allowed_gates.add(gate_id)
@@ -341,8 +364,11 @@ def from_mapping(raw, *, path=None):
         field = f"adapters.{adapter_id}"
         if not ID.fullmatch(adapter_id):
             raise ConfigError(field, "adapter id must match [a-z][a-z0-9-]{0,63}")
+        if adapter_id in QUARANTINED_ADAPTERS:
+            raise ConfigError(field, quarantine_reason(f"adapter {adapter_id!r}"))
         if not isinstance(body, dict):
             raise ConfigError(field, "must be a table")
+        _check_unknown_keys(body, ("env_file",), field)
         env_file = None
         if body.get("env_file") is not None:
             env_file = _canonical_file(body["env_file"], f"{field}.env_file")
@@ -360,6 +386,7 @@ def from_mapping(raw, *, path=None):
     worker_raw = _require(raw, "worker", "worker")
     if not isinstance(worker_raw, dict):
         raise ConfigError("worker", "must be a table")
+    _check_unknown_keys(worker_raw, ("backend", "max_concurrent", "python", "start_timeout_seconds"), "worker")
     backend = _require(worker_raw, "backend", "worker.backend")
     if backend not in EXECUTION_BACKENDS:
         raise ConfigError("worker.backend", f"must be one of {', '.join(EXECUTION_BACKENDS)}")
@@ -380,6 +407,12 @@ def from_mapping(raw, *, path=None):
     devices_raw = raw.get("devices", {})
     if not isinstance(devices_raw, dict):
         raise ConfigError("devices", "must be a table")
+    _check_unknown_keys(
+        devices_raw,
+        ("allowed_npu_devices", "authorized_npu_devices", "default_npu_device",
+         "require_exclusive_device", "smi_command"),
+        "devices",
+    )
     # "allowed" is an optional RESTRICTION. Absent, empty, or explicitly null
     # all mean the same thing: every device the machine exposes is usable.
     # `authorized_npu_devices` is accepted as a legacy spelling of the same

@@ -210,6 +210,20 @@ if [ -n "$DEVICE_ID" ]; then
     COMMON+=(--device-id "$DEVICE_ID")
 fi
 
+if [ "${#GATES[@]}" -gt 0 ]; then
+    GATE_ARGS=()
+    for gate in "${GATES[@]}"; do
+        GATE_ARGS+=(--gate "$gate")
+    done
+else
+    GATE_ARGS=(--all)
+fi
+
+EVIDENCE_ARGS=()
+if [ -n "$EVIDENCE_ROOT" ]; then
+    EVIDENCE_ARGS=(--evidence-root "$EVIDENCE_ROOT")
+fi
+
 # --- 2. list ------------------------------------------------------------------
 
 step "Listing bundled adapters and gates"
@@ -219,7 +233,13 @@ step "Listing bundled adapters and gates"
 
 step "Checking the machine configuration for adapter $ADAPTER"
 doctor_status=0
-"$AG" doctor "${COMMON[@]}" || doctor_status=$?
+DOCTOR_GATE_ARGS=()
+if [ "${#GATES[@]}" -gt 0 ]; then
+    for gate in "${GATES[@]}"; do
+        DOCTOR_GATE_ARGS+=(--gate "$gate")
+    done
+fi
+"$AG" doctor "${COMMON[@]}" "${DOCTOR_GATE_ARGS[@]}" || doctor_status=$?
 if [ "$doctor_status" -ne 0 ]; then
     echo "bootstrap: doctor did not report ready (exit $doctor_status);" \
          "fix the machine configuration before running gates" >&2
@@ -227,15 +247,6 @@ if [ "$doctor_status" -ne 0 ]; then
 fi
 
 # --- 4. run -------------------------------------------------------------------
-
-if [ "${#GATES[@]}" -gt 0 ]; then
-    GATE_ARGS=()
-    for gate in "${GATES[@]}"; do
-        GATE_ARGS+=(--gate "$gate")
-    done
-else
-    GATE_ARGS=(--all)
-fi
 
 RUN_JSON="$(mktemp)" || fail "could not create a temporary file"
 trap 'rm -f "$RUN_JSON"' EXIT
@@ -261,11 +272,11 @@ fi
 
 step "Reporting run $RUN_ID"
 report_status=0
-"$AG" report --run-id "$RUN_ID" --json || report_status=$?
+"$AG" report --run-id "$RUN_ID" "${EVIDENCE_ARGS[@]}" --json || report_status=$?
 
 step "Verifying run $RUN_ID"
 verify_status=0
-"$AG" verify --run-id "$RUN_ID" --json || verify_status=$?
+"$AG" verify --run-id "$RUN_ID" "${EVIDENCE_ARGS[@]}" --json || verify_status=$?
 
 final_status=0
 if [ "$report_status" -ne 0 ]; then

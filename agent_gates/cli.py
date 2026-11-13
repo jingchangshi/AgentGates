@@ -8,6 +8,7 @@ from .evidence import EvidenceStore
 from .registry import Registry
 from .api_types import APIError, ExecutionRequest, VerificationRequirement, jsonable
 from .config import ConfigError
+from .docker_quarantine import QUARANTINED_ADAPTERS, QUARANTINED_GATES
 from .execution import ExecutionManager
 from .verify_requirements import verify_requirements
 
@@ -66,14 +67,32 @@ def main(argv=None):
         return _async_command(args)
     try:
         if args.command == "list":
-            result = {"adapters": [{"id": manifest.id, "manifestSha256": manifest.manifest_hash,
-                                     "gates": list(manifest.gates)} for manifest in registry.list()]}
+            result = {
+                "adapters": [
+                    {
+                        "id": manifest.id,
+                        "manifestSha256": manifest.manifest_hash,
+                        "gates": list(manifest.gates),
+                        "quarantined": manifest.id in QUARANTINED_ADAPTERS,
+                        "quarantinedGates": [
+                            g for g in manifest.gates
+                            if g in QUARANTINED_GATES.get(manifest.id, ())
+                        ],
+                    }
+                    for manifest in registry.list()
+                ]
+            }
         elif args.command in {"doctor", "run"}:
             options = {"env_file": args.env_file, "device_id": args.device_id}
             if args.command == "doctor":
                 result = engine.doctor(args.adapter, args.source, selected=args.gate, **options)
             else:
-                selected = list(registry.get(args.adapter).gates) if args.all else args.gate
+                all_gates = list(registry.get(args.adapter).gates)
+                host_only = [
+                    g for g in all_gates
+                    if g not in QUARANTINED_GATES.get(args.adapter, ())
+                ]
+                selected = (host_only if host_only else all_gates) if args.all else args.gate
                 result = engine.run(args.adapter, args.source, selected, **options)
         else:
             run_id = args.run_id or store.latest()

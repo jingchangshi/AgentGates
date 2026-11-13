@@ -64,7 +64,8 @@ def snapshot(root: Path, *, _nested=False) -> dict:
     own_git = top.returncode == 0 and Path(os.fsdecode(top.stdout.rstrip(b"\n"))).resolve() == root
     listing = git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
     head = git(root, "rev-parse", "HEAD")
-    if own_git and listing.returncode == 0:
+    use_git = own_git and listing.returncode == 0 and (not _nested or head.returncode == 0)
+    if use_git:
         if head.returncode:
             raise ValueError("Git source has no readable committed HEAD")
         revision = head.stdout.decode().strip()
@@ -103,7 +104,7 @@ def snapshot(root: Path, *, _nested=False) -> dict:
     if mode == "filesystem":
         for name in sorted(unreadable):
             digest.update(json.dumps(["unreadable", name]).encode() + b"\0")
-    if own_git:
+    if use_git:
         # Bind initialized or empty gitlink directories to their index object IDs.
         staged = git(root, "ls-files", "--stage", "-z")
         if staged.returncode:

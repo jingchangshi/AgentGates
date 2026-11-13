@@ -21,6 +21,9 @@ agent-gates = "agent_gates.cli:main"
 [tool.setuptools.packages.find]
 include = ["agent_gates*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.setuptools.package-data]
 # Deployment files (Dockerfile, entry.sh, create-container.sh and the
 # all-empty config.example.env) ship too: a reader of an installed wheel must

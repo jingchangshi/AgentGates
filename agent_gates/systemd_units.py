@@ -35,6 +35,7 @@ UNIT_TEMPLATE = """[Unit]\nDescription=AgentGates gate execution worker (%i)\nDo
 # The caller's environment still cannot leak in: systemd starts this unit from
 # the manager, not from the process that submitted the request.
 Environment=PYTHONPATH=__PACKAGE_ROOT__
+Environment="PATH=__PATH__"
 # The worker must read the SAME configuration the submitter resolved. The
 # path is baked in at install time; a caller cannot override it through the
 # environment because systemd starts this unit from the manager.
@@ -115,7 +116,7 @@ def available() -> tuple[bool, str]:
     """
     if shutil.which("systemctl") is None:
         return False, "systemctl is not installed"
-    runtime = Path(f"/run/user/{os.getuid()}")
+    runtime = Path(_user_env()["XDG_RUNTIME_DIR"])
     if not runtime.is_dir():
         return False, f"no user runtime directory {runtime}"
     result = run("is-system-running", check=False, timeout=15)
@@ -205,11 +206,20 @@ def install(python: str, *, timeout_seconds: int | None = None, workdir: str = "
         raise ValueError(
             f"timeout_seconds={int(timeout_seconds)} is shorter than the largest "
             f"installed recipe timeout plus margin; pass at least {minimum}")
+    py_bin = os.path.dirname(os.path.abspath(python))
+    raw_path = _user_env().get("PATH") or os.defpath
+    path_parts = [p for p in raw_path.split(os.pathsep) if p]
+    if py_bin not in path_parts:
+        path_parts.insert(0, py_bin)
+    path_value = os.pathsep.join(path_parts)
+    if chr(10) in path_value or chr(13) in path_value or chr(0) in path_value:
+        raise ValueError("PATH for the worker unit must be a single line")
     rendered = (UNIT_TEMPLATE
                 .replace("__PYTHON__", str(python))
                 .replace("__TIMEOUT__", str(int(timeout_seconds)))
                 .replace("__WORKDIR__", workdir)
                 .replace("__PACKAGE_ROOT__", package or package_root())
+                .replace("__PATH__", path_value.replace("%", "%%"))
                 .replace("__CONFIG_PATH__", str(resolved_config))
                 .replace("__ADAPTERS_ROOT__", str(resolved_adapters))
                 .replace("__EXTRA_ENV__", _render_env(extra_env or {})))
@@ -283,3 +293,32 @@ def journal_tail(execution_id: str, *, lines: int = 50) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return (completed.stdout or "")[-8000:]
+
+
+def main(argv=None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="python -m agent_gates.systemd_units",
+        description="Install the AgentGates user systemd worker unit.",
+    )
+    parser.add_argument("--python", default=sys.executable, help="Worker Python interpreter")
+    parser.add_argument("--workdir", default="/", help="Worker WorkingDirectory")
+    parser.add_argument("--config", default=None, help="AGENT_GATES_CONFIG path")
+    parser.add_argument("--adapters-root", default=None, help="AGENT_GATES_ADAPTERS_ROOT path")
+    parser.add_argument("--timeout", type=int, default=None, help="RuntimeMaxSec override")
+    args = parser.parse_args(argv)
+    path = install(
+        args.python,
+        timeout_seconds=args.timeout,
+        workdir=args.workdir,
+        config_path=args.config,
+        adapters_root=args.adapters_root,
+    )
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

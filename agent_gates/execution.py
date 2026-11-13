@@ -12,6 +12,8 @@ success it never observed.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import datetime
 import os
 from pathlib import Path
 import time
@@ -19,6 +21,7 @@ import time
 from . import api_types as api
 from . import systemd_units
 from .config import ConfigError, load
+from .docker_quarantine import is_quarantined_recipe, quarantine_reason
 from .evidence import EvidenceStore
 from .execution_store import AdmissionLock, EXECUTION_ID, ExecutionStore, new_execution_id
 from .manifest import ManifestError
@@ -32,6 +35,37 @@ MAX_WAIT_SECONDS = 60.0
 
 def _terminal(state) -> bool:
     return state in {item.value for item in api.TERMINAL_STATES}
+
+
+@contextmanager
+def _admission_lock(state_root, name: str = "admission", timeout: float = 2.0):
+    """Serialize request admission across concurrent CLI/MCP processes."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            lock = AdmissionLock(state_root, name)
+            lock.__enter__()
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise api.APIError(
+                    api.ErrorCode.CONFLICT,
+                    "another submission is in progress; please retry",
+                ) from None
+            time.sleep(0.01)
+    try:
+        yield lock
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _parse_iso_timestamp(value) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 class ExecutionManager:
@@ -87,6 +121,15 @@ class ExecutionManager:
         # execution, and the receipt records them, so verify_requirements can
         # check the declared dependency chain explicitly.
         ordered = manifest.order(gates)
+        for gate_id in ordered:
+            recipe = manifest.resolve_recipe(
+                manifest.gates[gate_id]["recipeId"], workspace.source_root
+            )
+            if is_quarantined_recipe(manifest.id, recipe.id, recipe.argv):
+                raise api.APIError(
+                    api.ErrorCode.GATE_NOT_ALLOWED,
+                    quarantine_reason(f"gate {gate_id!r}"),
+                )
         return workspace, manifest, ordered
 
     def _device_for(self, adapter_id: str, requested_device):
@@ -145,76 +188,79 @@ class ExecutionManager:
 
         # Idempotency (D1): the same request id must not create a second real
         # execution, and a different request under the same id is a conflict.
-        if request.request_id is not None:
-            existing = self._find_by_request_id(request.request_id)
-            if existing is not None:
-                bound = self.store.read_request(existing) or {}
-                same = (bound.get("workspace") == request.workspace
-                        and bound.get("adapter") == request.adapter
-                        and list(bound.get("requested_gates") or []) == list(request.gates))
-                if not same:
-                    raise api.APIError(
-                        api.ErrorCode.CONFLICT,
-                        'request id ' + repr(request.request_id) + ' was already used '
-                        "for a different request",
-                        details={"execution_id": existing})
-                # Same request, same id: return the original execution as-is.
-                return self.status(existing)
+        # Concurrent submissions also serialize admission so max_concurrent and
+        # request_id uniqueness hold across simultaneous callers.
+        with _admission_lock(self.config.state_root):
+            if request.request_id is not None:
+                existing = self._find_by_request_id(request.request_id)
+                if existing is not None:
+                    bound = self.store.read_request(existing) or {}
+                    same = (bound.get("workspace") == request.workspace
+                            and bound.get("adapter") == request.adapter
+                            and list(bound.get("requested_gates") or []) == list(request.gates))
+                    if not same:
+                        raise api.APIError(
+                            api.ErrorCode.CONFLICT,
+                            'request id ' + repr(request.request_id) + ' was already used '
+                            "for a different request",
+                            details={"execution_id": existing})
+                    # Same request, same id: return the original execution as-is.
+                    return self.status(existing)
 
-        available, reason = self.systemd.available()
-        if not available:
-            raise api.APIError(
-                api.ErrorCode.SYSTEMD_UNAVAILABLE,
-                "user systemd is not usable, so a persistent worker cannot be "
-                "started; refusing rather than running in-process: " + reason)
+            available, reason = self.systemd.available()
+            if not available:
+                raise api.APIError(
+                    api.ErrorCode.SYSTEMD_UNAVAILABLE,
+                    "user systemd is not usable, so a persistent worker cannot be "
+                    "started; refusing rather than running in-process: " + reason)
 
-        active = self._active_ids()
-        if len(active) >= self.config.worker.max_concurrent:
-            raise api.APIError(
-                api.ErrorCode.CONCURRENCY_LIMIT,
-                str(len(active)) + " executions are already running (limit "
-                + str(self.config.worker.max_concurrent) + ")",
-                details={"active": active})
+            active = self._active_ids()
+            if len(active) >= self.config.worker.max_concurrent:
+                raise api.APIError(
+                    api.ErrorCode.CONCURRENCY_LIMIT,
+                    str(len(active)) + " executions are already running (limit "
+                    + str(self.config.worker.max_concurrent) + ")",
+                    details={"active": active})
 
-        execution_id = new_execution_id()
-        record = {
-            "format": 1,
-            "execution_id": execution_id,
-            "workspace": request.workspace,
-            "adapter": request.adapter,
-            # The order the Engine will actually use, dependencies included, so
-            # the record describes the run rather than the wish.
-            "gates": ordered,
-            "requested_gates": list(request.gates),
-            "request_id": request.request_id,
-            "device_id": device_id,
-            "source_root": str(workspace.source_root),
-            "adapter_manifest_sha256": manifest.manifest_hash,
-            "config_digest": self.config.config_digest,
-            "submitted_at": time.time(),
-        }
-        status = {
-            "format": 1,
-            "executionId": execution_id,
-            "state": api.ExecutionState.SUBMITTED.value,
-            "workspace": request.workspace,
-            "adapter": request.adapter,
-            "gates": ordered,
-            "requestId": request.request_id,
-            "submittedAt": time.time(),
-            "startedAt": None,
-            "finishedAt": None,
-            "runId": None,
-            "currentGate": None,
-            "completedGates": [],
-            "gateStatus": None,
-            "exitReason": None,
-            "message": None,
-        }
-        try:
-            self.store.create(execution_id, record, status)
-        except FileExistsError as exc:
-            raise api.APIError(api.ErrorCode.CONFLICT, str(exc)) from None
+            execution_id = new_execution_id()
+            record = {
+                "format": 1,
+                "execution_id": execution_id,
+                "workspace": request.workspace,
+                "adapter": request.adapter,
+                # The order the Engine will actually use, dependencies included, so
+                # the record describes the run rather than the wish.
+                "gates": ordered,
+                "requested_gates": list(request.gates),
+                "request_id": request.request_id,
+                "device_id": device_id,
+                "source_root": str(workspace.source_root),
+                "adapter_manifest_sha256": manifest.manifest_hash,
+                "config_digest": self.config.config_digest,
+                "submitted_at": time.time(),
+            }
+            status = {
+                "format": 1,
+                "executionId": execution_id,
+                "state": api.ExecutionState.SUBMITTED.value,
+                "workspace": request.workspace,
+                "adapter": request.adapter,
+                "gates": ordered,
+                "requestId": request.request_id,
+                "submittedAt": time.time(),
+                "startedAt": None,
+                "finishedAt": None,
+                "runId": None,
+                "currentGate": None,
+                "completedGates": [],
+                "gateStatus": None,
+                "exitReason": None,
+                "message": None,
+            }
+            try:
+                self.store.create(execution_id, record, status)
+            except FileExistsError as exc:
+                raise api.APIError(api.ErrorCode.CONFLICT, str(exc)) from None
 
         try:
             self.systemd.start(execution_id)
@@ -467,12 +513,27 @@ class ExecutionManager:
         directory = self.evidence.root / "runs"
         if not directory.is_dir():
             return None
+        claimed_run_ids = set()
+        for other_id in self.store.list_ids():
+            if other_id == execution_id:
+                continue
+            other_status = self.store.read_status(other_id)
+            if isinstance(other_status, dict) and other_status.get("runId"):
+                claimed_run_ids.add(other_status["runId"])
+        submitted_at = record.get("submitted_at")
         entries = [entry for entry in directory.iterdir() if entry.is_dir()]
         entries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         for entry in entries:
             receipt = self.store._read(entry / "receipt.json")
             if not isinstance(receipt, dict):
                 continue
+            run_id = receipt.get("runId")
+            if not run_id or run_id in claimed_run_ids:
+                continue
+            if submitted_at is not None:
+                started_ts = _parse_iso_timestamp(receipt.get("startedAt"))
+                if started_ts is not None and started_ts < float(submitted_at) - 2.0:
+                    continue
             if receipt.get("adapter", {}).get("id") != record.get("adapter"):
                 continue
             if os.path.realpath(receipt.get("source", {}).get("root", "") or "") != os.path.realpath(
@@ -482,7 +543,7 @@ class ExecutionManager:
                      if isinstance(gate, dict)]
             if gates != list(record.get("gates") or []):
                 continue
-            return receipt.get("runId")
+            return run_id
         return None
 
 
