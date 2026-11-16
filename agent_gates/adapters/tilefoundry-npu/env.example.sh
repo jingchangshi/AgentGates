@@ -79,3 +79,36 @@ TILEFOUNDRY_NPU_DEVICE_TESTS=
 # `build:<dir>` resource lease. Keep `build` (or comment the line out to use the
 # default `build`; do not set an empty `TILEFOUNDRY_NPU_BUILD_SUBDIR=` value).
 TILEFOUNDRY_NPU_BUILD_SUBDIR=build
+
+# ---------------------------------------------------------------------------
+# CANNBench operator accuracy & performance gates (optional; required only for
+# `tilefoundry-npu-cannbench-prep` and `tilefoundry-npu-cannbench`)
+# ---------------------------------------------------------------------------
+# Required for CANNBench gates: absolute host path to the read-only CANNBench
+# checkout (e.g. `<user-home>/workspace/cannbot-ops`) containing
+# `tools/run_cannbench.py`, `vendor/cannbench/src/kernel_eval`,
+# `vendor/cannbench/src/cann_bench_utils`, and `operators/metadata`.
+TILEFOUNDRY_NPU_CANNBENCH_REPO=
+
+# Required for CANNBench gates: isolated host work root (e.g.
+# `<user-home>/workspace/tilefoundry-cannbench-work`) placed OUTSIDE both
+# `--source` and `TILEFOUNDRY_NPU_CANNBENCH_REPO`. Stores the ABI-isolated
+# `cann_bench_utils` build (`<work-root>/cannbench-utils/...`) and persisted
+# CANNBench reports (`<work-root>/reports/...`) without colliding with bska-npu.
+TILEFOUNDRY_NPU_WORK_ROOT=
+
+# Optional for CANNBench gates: NPU build arch for `cann_bench_utils`
+# (`ascend950`, `ascend910b`, or `ascend910_93`). Leave empty to use `ascend950`.
+TILEFOUNDRY_NPU_CANNBENCH_ARCH=
+
+# Optional for CANNBench gates: relative path inside `--source` (no leading `/`
+# or `..`) pointing to the JSON target declaration file. Leave empty to default to:
+#   examples/ascend950pr_ops/cannbench_targets.json
+# Expected JSON schema:
+#   {"targets": [{"task": "level4/attention_residual", "candidate": "examples/ascend950pr_ops/attention_residual/kernels.py"}]}
+TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE=
+
+# Optional fallback for CANNBench gates when the target JSON file in `--source`
+# does not exist: comma/whitespace-separated `levelN/op:relative/candidate.py` pairs, e.g.:
+#   TILEFOUNDRY_NPU_CANNBENCH_TARGETS=level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py
+TILEFOUNDRY_NPU_CANNBENCH_TARGETS=

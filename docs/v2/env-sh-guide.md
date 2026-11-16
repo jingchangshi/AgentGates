@@ -39,6 +39,11 @@
 | `TILEFOUNDRY_NPU_CPU_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的 `pytest` 测试文件或目录（禁止 `/` 开头和 `..`）。留空默认运行 5 个目录：`tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators` |
 | `TILEFOUNDRY_NPU_DEVICE_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的额外 NPU `pytest` 路径（禁止 `/` 开头和 `..`）。**默认留空**：只跑内置窗口期 NPU 探针（`import tilefoundry`、FP32 向量加、BF16 Cube `matmul`、显存分配 > 0、`torch.npu.synchronize()`）；填写后会在同一设备窗口内追加执行 `pytest` 并要求至少通过 1 个用例且零失败 |
 | `TILEFOUNDRY_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | 引擎加 `build:<dir>` 锁使用；模板默认填 `build`，请勿改为 `=` 空值 |
+| `TILEFOUNDRY_NPU_CANNBENCH_REPO` | CANNBench 必填 | 宿主机绝对路径 | 只读 CANNBench 仓库根路径（如 `cannbot-ops`）；门禁绝不写入该目录 |
+| `TILEFOUNDRY_NPU_WORK_ROOT` | CANNBench 必填 | 宿主机绝对路径 | 须位于 `--source` 与 `CANNBENCH_REPO` 之外，存放按 Python/Torch ABI 隔离构建的 `cann_bench_utils` 与 `reports/` |
+| `TILEFOUNDRY_NPU_CANNBENCH_ARCH` | CANNBench 可选 | 目标架构（默认 `ascend950`） | 可选 `ascend950`、`ascend910b`、`ascend910_93` |
+| `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` | CANNBench 可选 | 相对 `--source` 路径 | 默认 `examples/ascend950pr_ops/cannbench_targets.json`，优先从仓内读取待测 `(task, candidate)` |
+| `TILEFOUNDRY_NPU_CANNBENCH_TARGETS` | 兜底必填 | `task:rel_path` 列表 | 当仓内 targets 文件不存在时启用，如 `level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py` |
 
 ---
 

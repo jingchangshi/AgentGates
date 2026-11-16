@@ -16,6 +16,14 @@ The host-local TileFoundry-on-Ascend Adapter (`scripts/tilefoundry_host_gate.py`
 | --- | --- | --- | --- |
 | `tilefoundry-npu-cpu` | Conda CPU `pytest` suite (`TORCH_DEVICE_BACKEND_AUTOLOAD=0`, `TILELANG_DISABLE_CACHE=1`, `PYTHONPATH=src:targets/ascend:targets/apple:targets/nvidia`) with JUnit XML verification | **Not sourced** (avoids `ortools`/CANN native library collision) | None |
 | `tilefoundry-npu-device` | Depends on `tilefoundry-npu-cpu`; sources CANN `set_env.sh` + Conda `tilefoundry-npu`, runs in-process NPU probe (`import tilefoundry`, FP32 vector add, BF16 Cube `matmul`, memory > 0, `torch.npu.synchronize()`), and optionally runs `TILEFOUNDRY_NPU_DEVICE_TESTS` via `pytest` | Sourced (`TILEFOUNDRY_NPU_CANN_SETUP`) | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-cannbench-prep` | Verifies pure-Python CANNBench dependencies (`PyYAML`, `expecttest`, `ruamel.yaml`, `build`, `safetensors`), builds ABI-isolated `cann_bench_utils/_C.so` under `TILEFOUNDRY_NPU_WORK_ROOT`, and verifies `cann_bench_clone` on NPU | Sourced | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-cannbench` | Depends on `tilefoundry-npu-cannbench-prep`; injects `--source` TileFoundry `PYTHONPATH`, runs official `kernel_eval.staged_eval` on targets from `examples/ascend950pr_ops/cannbench_targets.json` (or `TILEFOUNDRY_NPU_CANNBENCH_TARGETS`), persists reports under `TILEFOUNDRY_NPU_WORK_ROOT/reports`, and records `score` / `avgSpeedup` | Sourced | Windowed (`deviceWindow`: 60 s) |
+
+One-time non-Torch dependency helper (run before first CANNBench gate if `expecttest`/`ruamel.yaml`/`build` are missing):
+
+```bash
+bash agent_gates/adapters/tilefoundry-npu/scripts/setup_cannbench_deps.sh
+```
 
 ## Machine configuration (`env.sh`)
 
@@ -48,6 +56,12 @@ conflicting exports in the launching environment):
   built-in runtime & compute probe.
 - `TILEFOUNDRY_NPU_BUILD_SUBDIR`: single relative directory name under `--source`
   used for AgentGates `build:<dir>` lease (default `build`; never set empty).
+- `TILEFOUNDRY_NPU_CANNBENCH_REPO` / `TILEFOUNDRY_NPU_WORK_ROOT` / `TILEFOUNDRY_NPU_CANNBENCH_ARCH`:
+  required by CANNBench gates (`cannbot-ops` read-only path, isolated host work root outside
+  both checkouts for ABI-isolated `cann_bench_utils` + `reports/`, and target arch defaulting to `ascend950`).
+- `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` / `TILEFOUNDRY_NPU_CANNBENCH_TARGETS`:
+  in-repo JSON target manifest (default `examples/ascend950pr_ops/cannbench_targets.json`) or
+  `env.sh` fallback list (`levelN/op:relative/candidate.py`).
 
 `TILEFOUNDRY_NPU_DEVICE_ID` and `TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE` are
 per-run launch/config parameters supplied via `--device-id` or
@@ -58,6 +72,7 @@ per-run launch/config parameters supplied via `--device-id` or
 ```bash
 agent-gates doctor --adapter tilefoundry-npu --source /abs/path/to/TileFoundry --device-id 1 --json
 agent-gates submit --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-device --json
+agent-gates submit --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-cannbench --json
 agent-gates wait --execution-id <EXECUTION_ID> --timeout 660 --json
-agent-gates verify-requirements --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-device --run-id <RUN_ID> --json
+agent-gates verify-requirements --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-cannbench --run-id <RUN_ID> --json
 ```
