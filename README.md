@@ -14,8 +14,8 @@ AI Agent（如 Claude Code / Antigravity / DSH）负责分析与修改编译器�
 | Adapter ID | 对应项目 | Gate IDs | 需要 NPU | 构建树策略 | `env.sh` 前缀 |
 | --- | --- | --- | --- | --- | --- |
 | `ascendnpu-ir` | AscendNPU-IR | `ascend-build-host`, `ascend-regression-host` | 否 | 增量 Ninja 或从零 `full-build.sh` | `ASCENDNPU_` |
-| `tilelang-npu` | TileLang (Ascend) | `tilelang-npu-build`, `tilelang-npu-examples` | `examples` 需要 | 每轮 CMake/Ninja（宿主 Conda Python） | `TILELANG_NPU_` |
-| `tilefoundry-npu` | TileFoundry | `tilefoundry-npu-cpu`, `tilefoundry-npu-device`, `tilefoundry-npu-cannbench-prep`, `tilefoundry-npu-cannbench` | `device` / `cannbench*` 需要（窗口租约） | 无源内构建树；`cpu` 不加载 CANN；CANNBench `_C.so` 构建于独立 `TILEFOUNDRY_NPU_WORK_ROOT` 避免与 `bska-npu` 互踩 | `TILEFOUNDRY_NPU_` |
+| `tilelang-npu` | TileLang (Ascend) | `tilelang-npu-build`, `tilelang-npu-examples` | `examples` 需要 | 每轮 CMake/Ninja（产出 `cp39-abi3` `.abi3.so` 供下游跨 Python 版本复用，并写 `.agent_gates_build_stamp.json`） | `TILELANG_NPU_` |
+| `tilefoundry-npu` | TileFoundry | `tilefoundry-npu-cpu`, `tilefoundry-npu-device`, `tilefoundry-npu-cannbench-prep`, `tilefoundry-npu-cannbench` | `device` / `cannbench*` 需要（窗口租约） | 无源内构建树；可复用 `tilelang-npu` 构建的 `TileLang` 源码+构建树（若原生/Cython 源码变化则 fail-closed 提示先跑 `tilelang-npu-build`）；CANNBench `_C.so` 构建于独立 `TILEFOUNDRY_NPU_WORK_ROOT` | `TILEFOUNDRY_NPU_` |
 | `tla-npu` | triton-ascend (TLA 接口) | `tla-npu-e2e` | 是 | 预编译 wheel + 独立 `TLA_NPU_TEST_DIR` 与隔离缓存 | `TLA_NPU_` |
 | `forgekernel-ascend-npu` | ForgeKernel | `forgekernel-ascend-npu-smoke`, `forgekernel-ascend-npu-build` | `smoke` 需要 | `FK_ASCEND_WORK_ROOT` 私有 `--system-site-packages` venv + `--no-deps` 安装 | `FK_ASCEND_` |
 | `bska-npu` | cannbot-ops / BSKA | `bska-npu-smoke`, `bska-npu-cannbench` | 是 | 宿主 Conda 直接驱动 CANNBench 原生评测 | `BSKA_NPU_` |

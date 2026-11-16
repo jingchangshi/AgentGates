@@ -36,6 +36,8 @@
 | `TILEFOUNDRY_NPU_CONDA_ENV` | 是 | 环境名 | 装有 `torch (+cpu)`、`torch_npu`、`pytest`、`z3` 的 Conda 环境名（如 `tilefoundry-npu`） |
 | `TILEFOUNDRY_NPU_CONDA_ENVS_PATH` | 可选 | 宿主机绝对路径 | 环境位于自定义用户 `.conda/envs` 目录时填写 |
 | `TILEFOUNDRY_NPU_PYTHON` | 可选 | 宿主机绝对路径 | 目标 Conda 环境的 `python3`；留空则由上述 Conda 路径自动拼接 |
+| `TILEFOUNDRY_NPU_TILELANG_SOURCE` | 可选 | 宿主机绝对路径 | 复用 `tilelang-npu` 编译管理的宿主 `tilelang` 源码仓；填后自动前置到 `PYTHONPATH`（`tilefoundry-npu` 只读复用、绝不自编译 `tilelang`） |
+| `TILEFOUNDRY_NPU_TILELANG_BUILD` | 可选 | 宿主机绝对路径 | 须等于 `<TILELANG_SOURCE>/build`（留空默认取 `<TILELANG_SOURCE>/build`）；自检与各门禁校验 `libtilelang.so`、全部 `*.abi3.so` 与 `.agent_gates_build_stamp.json`，若 `tilelang` C++/CMake/Cython 源码更新后未重编则返回 `BLOCKED_ENV` 提示先执行 `tilelang-npu-build` |
 | `TILEFOUNDRY_NPU_CPU_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的 `pytest` 测试文件或目录（禁止 `/` 开头和 `..`）。留空默认运行 5 个目录：`tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators` |
 | `TILEFOUNDRY_NPU_DEVICE_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的额外 NPU `pytest` 路径（禁止 `/` 开头和 `..`）。**默认留空**：只跑内置窗口期 NPU 探针（`import tilefoundry`、FP32 向量加、BF16 Cube `matmul`、显存分配 > 0、`torch.npu.synchronize()`）；填写后会在同一设备窗口内追加执行 `pytest` 并要求至少通过 1 个用例且零失败 |
 | `TILEFOUNDRY_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | 引擎加 `build:<dir>` 锁使用；模板默认填 `build`，请勿改为 `=` 空值 |
@@ -57,7 +59,7 @@
 | `TILELANG_NPU_CONDA_SH` | 是 | 宿主机绝对路径 | Conda `conda.sh` |
 | `TILELANG_NPU_CONDA_ENV` | 是 | 环境名 | 装有 `torch`/`torch_npu`/编译依赖的 Conda 环境 |
 | `TILELANG_NPU_CONDA_ENVS_PATH` | 是 | 宿主机绝对路径 | 自定义 `.conda/envs` 根目录 |
-| `TILELANG_NPU_PYTHON` | 是 | 宿主机绝对路径 | 目标 Conda 环境内的 `python3`（传入 CMake） |
+| `TILELANG_NPU_PYTHON` | 是 | 宿主机绝对路径 | 目标 Conda 环境内的 `python3`（传入 CMake；编译产物采用 `cp39-abi3` `.abi3.so` 并写入 `<build>/.agent_gates_build_stamp.json` 供下游复用） |
 | `TILELANG_NPU_CMAKE_BIN` | 可选 | 宿主机绝对路径 | 指定 `cmake`；留空使用激活环境中的 `cmake` |
 | `TILELANG_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | **注意**：模板文件为满足打包契约该行为空；拷贝成真实 `env.sh` 时请设为 `build` 或注释掉该行 |
 | `TILELANG_NPU_NINJA_JOBS` | 可选 | 正整数 | 拷贝成真实 `env.sh` 时请按主机内存填写正整数（如 `32`）或注释掉该行，不可留空赋值 |
