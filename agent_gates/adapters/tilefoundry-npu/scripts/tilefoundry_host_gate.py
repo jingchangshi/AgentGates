@@ -42,6 +42,38 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CANNBENCH_ARCH",
     "TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE",
     "TILEFOUNDRY_NPU_CANNBENCH_TARGETS",
+    "TILEFOUNDRY_NPU_LLM_BACKEND",
+    "TILEFOUNDRY_NPU_AGY_BIN",
+    "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+    "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+    "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
+    "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+    "TILEFOUNDRY_NPU_TILELANG_REPO",
+    "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
+    "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
+    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
+)
+
+OPTIONAL_FORWARDED_KEYS = (
+    "TILEFOUNDRY_NPU_PYTHON",
+    "TILEFOUNDRY_NPU_LLM_BACKEND",
+    "TILEFOUNDRY_NPU_AGY_BIN",
+    "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+    "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+    "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
+    "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+    "TILEFOUNDRY_NPU_TILELANG_REPO",
+    "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
+    "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
+    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
+)
+
+OPTIONAL_ABS_PATH_KEYS = (
+    "TILEFOUNDRY_NPU_AGY_BIN",
+    "TILEFOUNDRY_NPU_TILELANG_REPO",
+    "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
+    "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
+    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
 
 NOT_MACHINE_KEYS = frozenset({
@@ -985,12 +1017,32 @@ def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
     return info
 
 
+def _forward_optional_env(run_env: dict[str, str], values: dict[str, str]) -> None:
+    for key in OPTIONAL_FORWARDED_KEYS:
+        val = (values.get(key) or "").strip()
+        if val:
+            run_env[key] = val
+
+
+def _validate_optional_agent_keys(values: dict[str, str]) -> None:
+    conc = (values.get("TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY") or "").strip()
+    if conc and (not conc.isdigit() or int(conc) < 1):
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY must be a positive integer: {conc!r}"
+        )
+    for key in OPTIONAL_ABS_PATH_KEYS:
+        val = (values.get(key) or "").strip()
+        if val and not Path(val).is_absolute():
+            raise BridgeError(f"{key} must be an absolute path when set: {val!r}")
+
+
 def check_config(*, check_device: bool = False, check_cannbench: bool = False) -> int:
     try:
         values = machine_values()
         for name in REQUIRED:
             _required(values, name)
         build_subdir(values)
+        _validate_optional_agent_keys(values)
         cann = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
         if not cann.is_file():
             raise BridgeError(f"TILEFOUNDRY_NPU_CANN_SETUP does not exist: {cann}")
@@ -1040,6 +1092,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
         if envs_path:
             run_env["CONDA_ENVS_PATH"] = envs_path
+        _forward_optional_env(run_env, values)
         run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
         run_env["PYTHONDONTWRITEBYTECODE"] = "1"
         run_env["TILELANG_DISABLE_CACHE"] = "1"
@@ -1120,6 +1173,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
             if envs_path:
                 run_env["CONDA_ENVS_PATH"] = envs_path
+            _forward_optional_env(run_env, values)
             run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
             run_env["PYTHONDONTWRITEBYTECODE"] = "1"
             run_env["TILELANG_DISABLE_CACHE"] = "1"

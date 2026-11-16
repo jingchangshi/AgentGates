@@ -46,6 +46,12 @@
 | `TILEFOUNDRY_NPU_CANNBENCH_ARCH` | CANNBench 可选 | 目标架构（默认 `ascend950`） | 可选 `ascend950`、`ascend910b`、`ascend910_93` |
 | `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` | CANNBench 可选 | 相对 `--source` 路径 | 默认 `examples/ascend950pr_ops/cannbench_targets.json`，优先从仓内读取待测 `(task, candidate)` |
 | `TILEFOUNDRY_NPU_CANNBENCH_TARGETS` | 兜底必填 | `task:rel_path` 列表 | 当仓内 targets 文件不存在时启用，如 `level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py` |
+| `TILEFOUNDRY_NPU_LLM_BACKEND` | 可选 | `agy_cli` 或 `mock` | 神经符号 Agent 后端选择（非空时透传到门禁子进程） |
+| `TILEFOUNDRY_NPU_AGY_BIN` | 可选 | 宿主机绝对路径 | `agy` CLI 可执行文件路径 |
+| `TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL` / `_EXPLORE_MODEL` | 可选 | 模型名 | 内层规则分支与受保护创造分支使用的 `agy` 模型标识 |
+| `TILEFOUNDRY_NPU_AGY_COMMON_ARGS` | 可选 | CLI 参数串 | 无状态沙盒 `agy` 子进程公共参数 |
+| `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY` | 可选 | 正整数 | `agy` 并发子进程上限 |
+| `TILEFOUNDRY_NPU_{TILELANG,CANNBOT_DSL,OPS_TRANSFORMER,ASC_DEVKIT}_REPO` | 可选 | 宿主机绝对路径 | 本地只读 Ascend 950 参考仓路径（非空时透传；运行时隔离沙盒严禁直接访问） |
 
 ---
 

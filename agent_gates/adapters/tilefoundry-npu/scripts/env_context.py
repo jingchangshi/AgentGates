@@ -155,6 +155,30 @@ def python_path_entries() -> list[str]:
 ALLOW_SOURCE_TREE_ENV = "TFNU_ALLOW_SOURCE_TREE"
 SOURCE_TREE_PREPENDED_ENV = "TFNU_SOURCE_TREE_PREPENDED"
 
+OPTIONAL_FORWARDED_KEYS = (
+    "TILEFOUNDRY_NPU_PYTHON",
+    "TILEFOUNDRY_NPU_LLM_BACKEND",
+    "TILEFOUNDRY_NPU_AGY_BIN",
+    "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+    "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+    "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
+    "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+    "TILEFOUNDRY_NPU_TILELANG_REPO",
+    "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
+    "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
+    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
+)
+
+
+def forward_optional_machine_env(env: dict, source: dict | None = None) -> dict:
+    """Forward non-empty optional TILEFOUNDRY_NPU_* agent/repo keys into *env*."""
+    src = env if source is None else source
+    for key in OPTIONAL_FORWARDED_KEYS:
+        val = (src.get(key) or "").strip()
+        if val:
+            env[key] = val
+    return env
+
 
 def source_tree_allowed(explicit: "bool | None" = None) -> bool:
     """Whether the tilelang TREE may be prepended. Off unless explicitly enabled."""
@@ -207,7 +231,7 @@ def runtime_env(base: dict | None = None, *, with_cann: bool = True,
     env.pop("LD_LIBRARY_PATH_FOR_TILELANG", None)
     if with_cann:
         env["TFNU_SOURCE_CANN"] = CANN_SET_ENV
-    return env
+    return forward_optional_machine_env(env)
 
 
 #: The verify probe. Runs INSIDE the target interpreter and prints one JSON object.
@@ -762,9 +786,11 @@ __all__ = [
     "probe_toolchain",
     "ROLLBACK_PREFIX",
     "ALLOW_SOURCE_TREE_ENV",
+    "OPTIONAL_FORWARDED_KEYS",
     "SOURCE_TREE_PREPENDED_ENV",
     "ResolutionError",
     "assert_tilelang_from_prefix",
+    "forward_optional_machine_env",
     "import_path",
     "source_tree_allowed",
     "prefix_is_rollback",

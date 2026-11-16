@@ -130,3 +130,30 @@ TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE=
 # does not exist: comma/whitespace-separated `levelN/op:relative/candidate.py` pairs, e.g.:
 #   TILEFOUNDRY_NPU_CANNBENCH_TARGETS=level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py
 TILEFOUNDRY_NPU_CANNBENCH_TARGETS=
+
+# ---------------------------------------------------------------------------
+# Optional neuro-symbolic agent LLM & reference repo configuration
+# ---------------------------------------------------------------------------
+# Optional LLM backend selector (`agy_cli` or `mock`).
+TILEFOUNDRY_NPU_LLM_BACKEND=
+
+# Optional absolute host path to the `agy` CLI binary (e.g. `<user-home>/.local/bin/agy`).
+TILEFOUNDRY_NPU_AGY_BIN=
+
+# Optional model IDs for rule-guided exploit/repair vs rule-blind creative search.
+TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL=
+TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL=
+
+# Optional common CLI flags forwarded to headless `agy` worker subprocesses.
+# Quote the full string when passing multiple space-separated flags, e.g. "--print --mode plan".
+TILEFOUNDRY_NPU_AGY_COMMON_ARGS=
+
+# Optional positive integer concurrency cap for parallel `agy` worker subprocesses.
+TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY=
+
+# Optional absolute host paths to local read-only Ascend 950 reference repositories
+# used for offline inspection and Two-Snapshot IR Diff (never passed to runtime `agy`).
+TILEFOUNDRY_NPU_TILELANG_REPO=
+TILEFOUNDRY_NPU_CANNBOT_DSL_REPO=
+TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO=
+TILEFOUNDRY_NPU_ASC_DEVKIT_REPO=

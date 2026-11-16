@@ -587,5 +587,92 @@ class TilelangReuseCase(unittest.TestCase):
             os.chdir(old_cwd)
 
 
+class OptionalAgentKeysCase(unittest.TestCase):
+    """Optional agy LLM and reference repo keys are validated and forwarded when non-empty."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.src = self.root / "tf-repo"
+        for sub in (
+            "src/tilefoundry",
+            "tests/tilefoundry",
+            "tests/ascend/target",
+            "tests/ascend/ir",
+            "tests/ascend/passes",
+            "tests/ascend/operators",
+        ):
+            (self.src / sub).mkdir(parents=True)
+        self.cann = self.root / "set_env.sh"
+        self.cann.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.conda_sh = self.root / "conda.sh"
+        self.conda_sh.write_text("conda() { :; }\n", encoding="utf-8")
+        self.py = self.root / "python3"
+        self.py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.py.chmod(0o755)
+        self.env_file = self.root / "machine.env"
+
+    def write_env(self, **overrides):
+        data = {
+            "TILEFOUNDRY_NPU_CANN_SETUP": str(self.cann),
+            "TILEFOUNDRY_NPU_CONDA_SH": str(self.conda_sh),
+            "TILEFOUNDRY_NPU_CONDA_ENV": "tilefoundry-npu",
+            "TILEFOUNDRY_NPU_PYTHON": str(self.py),
+            "TILEFOUNDRY_NPU_BUILD_SUBDIR": "build",
+        }
+        data.update(overrides)
+        self.env_file.write_text("".join(f"{k}={v}\n" for k, v in data.items()), encoding="utf-8")
+
+    def test_optional_agent_and_repo_keys_forward_and_validate(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            self.write_env(
+                TILEFOUNDRY_NPU_LLM_BACKEND="agy_cli",
+                TILEFOUNDRY_NPU_AGY_BIN="/opt/agy/bin/agy",
+                TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL="gemini-4-hydrogen-medium",
+                TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL="gemini-4-hydrogen-high",
+                TILEFOUNDRY_NPU_AGY_COMMON_ARGS='"--print --mode plan"',
+                TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY="3",
+                TILEFOUNDRY_NPU_TILELANG_REPO="/refs/tilelang",
+                TILEFOUNDRY_NPU_CANNBOT_DSL_REPO="/refs/cannbot-dsl",
+                TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO="/refs/ops-transformer",
+                TILEFOUNDRY_NPU_ASC_DEVKIT_REPO="",
+            )
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                captured_env = {}
+
+                def fake_cpu(cmd, *, cwd, env, **kwargs):
+                    captured_env.update(env)
+                    junit = Path(cmd.split("--junit-xml=")[1].split()[0])
+                    junit.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"/>', encoding="utf-8")
+                    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_cpu):
+                    rc, _obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+                self.assertEqual(rc, 0)
+                self.assertEqual(captured_env["TILEFOUNDRY_NPU_LLM_BACKEND"], "agy_cli")
+                self.assertEqual(captured_env["TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL"], "gemini-4-hydrogen-medium")
+                self.assertEqual(captured_env["TILEFOUNDRY_NPU_AGY_COMMON_ARGS"], "--print --mode plan")
+                self.assertEqual(captured_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
+                self.assertNotIn("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", captured_env)
+
+            self.write_env(TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY="0")
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    GATE.main(["--check-config"])
+                self.assertEqual(caught.exception.code, 75)
+
+            self.write_env(TILEFOUNDRY_NPU_TILELANG_REPO="relative/tilelang")
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                with self.assertRaises(SystemExit) as caught2:
+                    GATE.main(["--check-config"])
+                self.assertEqual(caught2.exception.code, 75)
+        finally:
+            os.chdir(old_cwd)
+
+
 if __name__ == "__main__":
     unittest.main()

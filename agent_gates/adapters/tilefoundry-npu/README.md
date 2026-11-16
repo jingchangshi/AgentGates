@@ -62,6 +62,13 @@ conflicting exports in the launching environment):
 - `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` / `TILEFOUNDRY_NPU_CANNBENCH_TARGETS`:
   in-repo JSON target manifest (default `examples/ascend950pr_ops/cannbench_targets.json`) or
   `env.sh` fallback list (`levelN/op:relative/candidate.py`).
+- `TILEFOUNDRY_NPU_LLM_BACKEND` / `TILEFOUNDRY_NPU_AGY_BIN` /
+  `TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL` / `TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL` /
+  `TILEFOUNDRY_NPU_AGY_COMMON_ARGS` / `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY`:
+  optional headless `agy` LLM backend configuration forwarded when non-empty.
+- `TILEFOUNDRY_NPU_TILELANG_REPO` / `TILEFOUNDRY_NPU_CANNBOT_DSL_REPO` /
+  `TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO` / `TILEFOUNDRY_NPU_ASC_DEVKIT_REPO`:
+  optional absolute host paths to read-only Ascend 950 reference checkouts forwarded when non-empty.
 
 `TILEFOUNDRY_NPU_DEVICE_ID` and `TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE` are
 per-run launch/config parameters supplied via `--device-id` or
