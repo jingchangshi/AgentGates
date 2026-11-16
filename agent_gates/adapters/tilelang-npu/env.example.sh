@@ -28,8 +28,10 @@ TILELANG_NPU_CONDA_ENV=
 TILELANG_NPU_CONDA_ENVS_PATH=
 
 # Required: absolute path to the python3 interpreter inside TILELANG_NPU_CONDA_ENV.
-# The CMake configure step records it, and a mismatch produces extension modules
-# for the wrong Python.
+# The CMake configure step records it, and `tilelang-npu-build` compiles Cython
+# extensions with Python Stable ABI (`cp39-abi3`, `.abi3.so`) + records
+# `.agent_gates_build_stamp.json` so downstream adapters (`forgekernel-ascend-npu`,
+# `tilefoundry-npu`) across Python >= 3.10 can reuse `<checkout>/build` directly.
 TILELANG_NPU_PYTHON=
 
 # Optional: explicit absolute path to the CMake binary that regenerates the build

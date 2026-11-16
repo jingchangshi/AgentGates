@@ -15,7 +15,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilelang_npu_gate.py": "3a9d50360b3ec5519a12664191684987cc614ecf7a6b639de71bcd86400d05ee"
+    "scripts/tilelang_npu_gate.py": "acee2958dc175b4e12f6255365a23bb8cb1095404e24523025fc5e4ece97dbb4"
   },
   "recipes": [
     {

@@ -924,5 +924,70 @@ class DeviceWiringCase(unittest.TestCase):
                          "TILELANG_NPU_REQUIRE_EXCLUSIVE_DEVICE")
 
 
+class StableAbiAndBuildStampCase(unittest.TestCase):
+    """CMake builds cp39-abi3 extensions, drops stale .cpython-*.so, and writes a stamp."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.saved_cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.saved_cwd)
+        self.addCleanup(self.temp.cleanup)
+        os.chdir(str(self.root))
+        (self.root / "CMakeLists.txt").write_text("# tilelang\n", encoding="utf-8")
+        (self.root / "src").mkdir()
+        (self.root / "src" / "stub.cc").write_text("// native\n", encoding="utf-8")
+        (self.root / "tilelang").mkdir()
+        (self.root / "tilelang" / "w.pyx").write_text("# cython\n", encoding="utf-8")
+
+    def test_cmake_options_enable_cp39_stable_abi(self):
+        self.assertIn("-DSKBUILD_SABI_COMPONENT=Development.SABIModule", GATE.CMAKE_OPTIONS)
+        self.assertIn("-DSKBUILD_SABI_VERSION=3.9", GATE.CMAKE_OPTIONS)
+
+    def test_build_removes_stale_cpython_so_and_writes_build_stamp(self):
+        lib_dir = self.root / "build" / "lib"
+        lib_dir.mkdir(parents=True)
+        stale_so = lib_dir / "tilelang_cython_wrapper.cpython-311-x86_64-linux-gnu.so"
+        stale_so.write_bytes(b"stale")
+        libtilelang = lib_dir / "libtilelang.so"
+        libtilelang.write_bytes(b"0" * ((1 << 20) + 16))
+        for ext in GATE.SABI_EXTENSIONS:
+            (lib_dir / f"{ext}.abi3.so").write_bytes(b"abi3")
+
+        answers = iter([(0, 0.2), (0, 1.0)])
+        values = {"TILELANG_NPU_PYTHON": sys.executable}
+        with patch.object(GATE, "_run_shell", side_effect=lambda *a, **k: next(answers)), \
+                patch.object(GATE, "_probe_observations", return_value=(True, True)):
+            rc, obs = GATE.build(values, 60.0)
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(obs["nativeLibraryPresent"])
+        self.assertFalse(stale_so.exists())
+        stamp_path = self.root / "build" / GATE.BUILD_STAMP_FILE
+        self.assertTrue(stamp_path.is_file())
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        self.assertEqual(stamp["adapter"], "tilelang-npu")
+        self.assertEqual(stamp["sabi"], "cp39")
+        self.assertEqual(stamp["nativeInputsSha256"],
+                         GATE._tilelang_native_inputs_sha256(self.root))
+        self.assertEqual(stamp["libtilelangSha256"], GATE._sha256_file(libtilelang))
+
+    def test_probe_requires_all_sabi_extensions(self):
+        lib_dir = self.root / "build" / "lib"
+        lib_dir.mkdir(parents=True)
+        libtilelang = lib_dir / "libtilelang.so"
+        libtilelang.write_bytes(b"0" * ((1 << 20) + 16))
+        # Missing one .abi3.so -> nativeLibraryPresent is False without running shell.
+        for ext in GATE.SABI_EXTENSIONS[:-1]:
+            (lib_dir / f"{ext}.abi3.so").write_bytes(b"abi3")
+        with patch.object(GATE, "_run_shell") as shell_mock:
+            present, compiled = GATE._probe_observations(
+                {"TILELANG_NPU_PYTHON": sys.executable}, libtilelang, self.root
+            )
+        self.assertFalse(present)
+        self.assertFalse(compiled)
+        shell_mock.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

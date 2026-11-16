@@ -49,6 +49,8 @@ as a failed test.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -122,7 +124,20 @@ CMAKE_OPTIONS = (
     '-DUSE_Z3=ON',
     '-DUSE_PYPI_Z3=ON',
     '-DUSE_CUSTOM_LOGGING=ON',
+    '-DSKBUILD_SABI_COMPONENT=Development.SABIModule',
+    '-DSKBUILD_SABI_VERSION=3.9',
 )
+
+# Cython extension modules compiled by CMake under build/lib as Python Stable
+# ABI (.abi3.so) shared objects so both Python 3.11 (tilelang-npu) and
+# downstream Python >= 3.10 consumers (tilefoundry-npu) can load the same build.
+SABI_EXTENSIONS = (
+    'tilelang_cython_wrapper',
+    'tilelang_pto_wrapper',
+    'tilelang_ascend_npu_exchange',
+    'tilelang_deepgemm_heuristics',
+)
+BUILD_STAMP_FILE = '.agent_gates_build_stamp.json'
 
 _ASSIGN = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
 
@@ -314,11 +329,119 @@ def _source_root():
     return Path.cwd()
 
 
+def _sha256_file(path):
+    """Streaming SHA-256 digest of a regular file."""
+    h = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _git_head_pure(root):
+    """Resolve Git HEAD commit without spawning a subprocess; 'NO_GIT' if unavailable."""
+    dot_git = Path(root) / '.git'
+    if dot_git.is_file():
+        try:
+            text = dot_git.read_text(encoding='utf-8').strip()
+        except (OSError, UnicodeDecodeError):
+            return 'NO_GIT'
+        if not text.startswith('gitdir:'):
+            return 'NO_GIT'
+        raw_dir = text[len('gitdir:'):].strip()
+        git_dir = Path(raw_dir) if Path(raw_dir).is_absolute() else (Path(root) / raw_dir)
+    elif dot_git.is_dir():
+        git_dir = dot_git
+    else:
+        return 'NO_GIT'
+
+    head_file = git_dir / 'HEAD'
+    if not head_file.is_file():
+        return 'NO_GIT'
+    try:
+        head_text = head_file.read_text(encoding='utf-8').strip()
+    except (OSError, UnicodeDecodeError):
+        return 'NO_GIT'
+    if not head_text.startswith('ref:'):
+        return head_text if re.fullmatch(r'[0-9a-fA-F]{40,64}', head_text) else 'NO_GIT'
+
+    ref_name = head_text[len('ref:'):].strip()
+    search_dirs = [git_dir]
+    commondir_file = git_dir / 'commondir'
+    if commondir_file.is_file():
+        try:
+            raw_common = commondir_file.read_text(encoding='utf-8').strip()
+            common_dir = Path(raw_common) if Path(raw_common).is_absolute() else (git_dir / raw_common)
+            if common_dir.is_dir():
+                search_dirs.append(common_dir)
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    for candidate_dir in search_dirs:
+        ref_file = candidate_dir / ref_name
+        if ref_file.is_file():
+            try:
+                commit = ref_file.read_text(encoding='utf-8').strip()
+                if commit:
+                    return commit
+            except (OSError, UnicodeDecodeError):
+                pass
+        packed = candidate_dir / 'packed-refs'
+        if packed.is_file():
+            try:
+                for line in packed.read_text(encoding='utf-8').splitlines():
+                    if not line or line.startswith(('#', '^')):
+                        continue
+                    parts = line.split(' ', 1)
+                    if len(parts) == 2 and parts[1].strip() == ref_name:
+                        return parts[0].strip()
+            except (OSError, UnicodeDecodeError):
+                pass
+    return 'NO_GIT'
+
+
+def _tilelang_native_inputs_sha256(source):
+    """Deterministic digest over TileLang native/CMake/Cython build inputs."""
+    src_root = Path(source).resolve()
+    candidates = []
+    for rel_file in ('CMakeLists.txt', 'examples/ascend/deepgemm/_heuristics.pyx'):
+        p = src_root / rel_file
+        if p.is_file():
+            candidates.append(p)
+    for rel_dir in ('cmake', 'src'):
+        d = src_root / rel_dir
+        if d.is_dir():
+            candidates.extend(p for p in d.rglob('*') if p.is_file() and '__pycache__' not in p.parts)
+    tl_pkg = src_root / 'tilelang'
+    if tl_pkg.is_dir():
+        for ext in ('*.pyx', '*.pxd', '*.pxi'):
+            candidates.extend(p for p in tl_pkg.rglob(ext) if p.is_file() and '__pycache__' not in p.parts)
+
+    by_rel = {}
+    for p in candidates:
+        rel = p.relative_to(src_root).as_posix()
+        by_rel[rel] = p
+
+    h = hashlib.sha256()
+    for rel in sorted(by_rel):
+        p = by_rel[rel]
+        h.update(rel.encode('utf-8') + b'\0')
+        with p.open('rb') as stream:
+            for block in iter(lambda: stream.read(1 << 20), b''):
+                h.update(block)
+        h.update(b'\0')
+    tvm_head = _git_head_pure(src_root / '3rdparty' / 'tvm')
+    h.update(b'submodule:3rdparty/tvm\0' + tvm_head.encode('utf-8') + b'\0')
+    return h.hexdigest()
+
+
 PROBE = (
     'import json, sys' + os.linesep
     + 'import tilelang' + os.linesep
     + 'import tilelang.testing as tt' + os.linesep
+    + 'import tilelang_cython_wrapper, tilelang_ascend_npu_exchange' + os.linesep
     + 'print(json.dumps({"file": tilelang.__file__,' + os.linesep
+    + '                  "wrapper": getattr(tilelang_cython_wrapper, "__file__", ""),' + os.linesep
     + '                  "ascend": bool(tt.ascend_backend_compiled())}))' + os.linesep
 )
 
@@ -328,30 +451,45 @@ def _probe_observations(values, lib, source):
 
     Both facts are measured, never assumed. nativeLibraryPresent requires a real
     shared object of plausible size - a zero-byte file named libtilelang.so is
-    not a build product. ascendBackendCompiled asks the interpreter that will run
-    the examples whether its tilelang reports an Ascend-enabled build, and
-    requires that answer to come from the tree under test: a green flag from a
-    different installed copy would describe code this Gate never built.
+    not a build product - together with all four cp39-abi3 Cython extensions
+    (.abi3.so). ascendBackendCompiled asks the interpreter that will run the
+    examples whether its tilelang reports an Ascend-enabled build, and requires
+    that answer to come from the tree under test (and load its extension from
+    build/lib): a green flag from a different installed copy would describe
+    code this Gate never built.
     """
-    present = lib.is_file() and lib.stat().st_size > (1 << 20)
+    lib_dir = lib.parent
+    sabi_present = all((lib_dir / f'{ext}.abi3.so').is_file() for ext in SABI_EXTENSIONS)
+    present = lib.is_file() and lib.stat().st_size > (1 << 20) and sabi_present
     compiled = False
     if present:
         # The probe runs inside the SAME activated environment as the build.
         # Importing tilelang preloads torch, which loads torch_npu, which needs
         # the CANN libraries on the loader path. A probe started with the plain
         # host environment fails on a missing libhccl.so and would report "no
-        # Ascend backend" for a perfectly good build.
+        # Ascend backend" for a perfectly good build. Prepending source on
+        # PYTHONPATH ensures the live checkout is tested even if site-packages
+        # carries another install.
         try:
             with tempfile.TemporaryDirectory(prefix='tilelang-npu-probe-') as tmp:
                 log_path = Path(tmp) / 'probe.log'
-                script = shlex.quote(_python(values)) + ' -c ' + shlex.quote(PROBE)
+                script = (
+                    'export PYTHONPATH=' + shlex.quote(str(source)) + ':"${PYTHONPATH:-}"' + os.linesep
+                    + shlex.quote(_python(values)) + ' -c ' + shlex.quote(PROBE)
+                )
                 with log_path.open('w') as log:
                     rc, _ = _run_shell(values, script, cwd=source, timeout=300, log=log)
                 if rc == 0:
                     text = log_path.read_text(errors='replace').strip().splitlines()
                     payload = json.loads(text[-1])
                     resolved = Path(str(payload.get('file', ''))).resolve()
-                    if resolved.is_relative_to(source.resolve()):
+                    wrapper_raw = str(payload.get('wrapper', '')).strip()
+                    wrapper_resolved = Path(wrapper_raw).resolve() if wrapper_raw else None
+                    if (
+                        resolved.is_relative_to(source.resolve())
+                        and wrapper_resolved is not None
+                        and wrapper_resolved.is_relative_to(lib_dir.resolve())
+                    ):
                         compiled = payload.get('ascend') is True
         except (BridgeError, OSError, ValueError, IndexError):
             compiled = False
@@ -428,6 +566,13 @@ def build(values, timeout):
                 print(PROG + f': configure failed rc={configure_rc}', file=sys.stderr)
                 sys.stderr.write(log_path.read_text(errors='replace')[-4000:])
             else:
+                # Drop any stale Python-version-specific extension modules so
+                # only the freshly built cp39-abi3 (.abi3.so) modules remain in
+                # build/lib and downstream Python 3.11 / 3.12+ runtimes agree.
+                lib_dir = build_dir / 'lib'
+                if lib_dir.is_dir():
+                    for stale in lib_dir.glob('tilelang_*.cpython-*.so'):
+                        stale.unlink(missing_ok=True)
                 # The default target, not the narrower tilelang phony target: the
                 # phony target builds only lib/libtilelang.so, while the Python
                 # extension modules that make "import tilelang" work are produced
@@ -446,7 +591,21 @@ def build(values, timeout):
     # would be a receipt a reader could not trust on its own.
     succeeded = configure_rc == 0 and build_rc == 0
 
-    present, compiled = _probe_observations(values, build_dir / 'lib' / 'libtilelang.so', source)
+    lib_path = build_dir / 'lib' / 'libtilelang.so'
+    present, compiled = _probe_observations(values, lib_path, source)
+    if succeeded and present and compiled and lib_path.is_file():
+        stamp = {
+            'adapter': 'tilelang-npu',
+            'sabi': 'cp39',
+            'gitHead': _git_head_pure(source),
+            'nativeInputsSha256': _tilelang_native_inputs_sha256(source),
+            'libtilelangSha256': _sha256_file(lib_path),
+            'builtAt': datetime.now(timezone.utc).isoformat(),
+        }
+        (build_dir / BUILD_STAMP_FILE).write_text(
+            json.dumps(stamp, indent=2, sort_keys=True) + os.linesep,
+            encoding='utf-8',
+        )
     observations = {
         'exitCodeZero': bool(succeeded),
         'nativeLibraryPresent': bool(present),
@@ -603,6 +762,7 @@ def examples(values, timeout):
         # checkout: that is where the shared conftest and the installed package
         # live.
         directories = sorted({str((source / name).parent) for name in tests})
+        pp_dirs = [str(source)] + [d for d in directories if d != str(source)]
         # Only the leased card is visible. Without this the examples would see
         # every card on the host and could initialize one this run never leased,
         # which is exactly the collision the engine lease exists to prevent.
@@ -612,7 +772,7 @@ def examples(values, timeout):
         # ever ran - a gate that reported "nothing collected" for a reason that
         # had nothing to do with the code under test.
         statements = [
-            'export PYTHONPATH=' + shlex.quote(os.pathsep.join(directories)) + ':"$PYTHONPATH"',
+            'export PYTHONPATH=' + shlex.quote(os.pathsep.join(pp_dirs)) + ':"${PYTHONPATH:-}"',
             'export TMPDIR=' + shlex.quote(str(tmp_dir)),
             'export TEMP=' + shlex.quote(str(tmp_dir)),
             'export TMP=' + shlex.quote(str(tmp_dir)),
