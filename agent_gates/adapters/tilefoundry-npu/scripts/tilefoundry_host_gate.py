@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Host-local TileFoundry CPU and Ascend NPU verification gate."""
+"""Host-local TileFoundry CPU, Ascend NPU, and CANNBench verification gates."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +35,11 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CPU_TESTS",
     "TILEFOUNDRY_NPU_DEVICE_TESTS",
     "TILEFOUNDRY_NPU_BUILD_SUBDIR",
+    "TILEFOUNDRY_NPU_CANNBENCH_REPO",
+    "TILEFOUNDRY_NPU_WORK_ROOT",
+    "TILEFOUNDRY_NPU_CANNBENCH_ARCH",
+    "TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE",
+    "TILEFOUNDRY_NPU_CANNBENCH_TARGETS",
 )
 
 NOT_MACHINE_KEYS = frozenset({
@@ -54,9 +62,17 @@ DEFAULT_CPU_TESTS = (
     "tests/ascend/operators",
 )
 
-DEFAULT_PYTHONPATH = "src:targets/ascend:targets/apple:targets/nvidia"
+DEFAULT_PYTHONPATH_PARTS = ("src", "targets/ascend", "targets/apple", "targets/nvidia")
+DEFAULT_PYTHONPATH = ":".join(DEFAULT_PYTHONPATH_PARTS)
+DEFAULT_TARGETS_FILE = "examples/ascend950pr_ops/cannbench_targets.json"
+DEFAULT_CANNBENCH_ARCH = "ascend950"
+TASK_RE = re.compile(r"level[1-9][0-9]*/[a-z][a-z0-9_]*")
+ARCH_RE = re.compile(r"ascend[0-9a-z_]+")
+
 DEFAULT_CPU_TIMEOUT = 600.0
 DEFAULT_DEVICE_TIMEOUT = 600.0
+DEFAULT_PREP_TIMEOUT = 840.0
+DEFAULT_CANNBENCH_TIMEOUT = 3300.0
 
 DEVICE_PROBE = r"""
 import json, sys, torch, torch_npu
@@ -107,6 +123,211 @@ except Exception as exc:
 
 print(json.dumps(facts, sort_keys=True))
 sys.exit(0 if all(facts.values()) else 1)
+"""
+
+CANNBENCH_ENV_INSPECT = r"""
+import importlib, importlib.metadata as md, json, pathlib, sys
+missing = []
+for mod in ("yaml", "ruamel.yaml", "expecttest", "build", "safetensors"):
+    try:
+        importlib.import_module(mod)
+    except Exception:
+        missing.append(mod)
+try:
+    import torch
+    torch_cmake = torch.utils.cmake_prefix_path + "/Torch"
+    torch_ver = getattr(torch, "__version__", "")
+except Exception as exc:
+    torch_cmake = ""
+    torch_ver = ""
+    missing.append(f"torch({exc})")
+try:
+    torch_npu_ver = md.version("torch-npu")
+except Exception:
+    torch_npu_ver = ""
+try:
+    spec = importlib.util.find_spec("torch_npu")
+    torch_npu_dir = str(pathlib.Path(spec.origin).parent) if spec and spec.origin else ""
+except Exception:
+    torch_npu_dir = ""
+if not torch_npu_dir:
+    missing.append("torch_npu")
+print(json.dumps({
+    "missing": missing,
+    "pythonVersion": sys.version.split()[0],
+    "torchVersion": torch_ver,
+    "torchNpuVersion": torch_npu_ver,
+    "torchCmakeDir": torch_cmake,
+    "torchNpuDir": torch_npu_dir,
+}, sort_keys=True))
+"""
+
+CANNBENCH_ABI_PROBE = r"""
+import json, sys, torch, torch_npu
+ok = False
+try:
+    import cann_bench_utils
+    torch.npu.set_device(0)
+    probe = torch.arange(4096, dtype=torch.float16, device="npu:0")
+    copied = cann_bench_utils.cann_bench_clone(probe)
+    torch.npu.synchronize()
+    ok = bool(torch.equal(copied.cpu(), probe.cpu()))
+except Exception as exc:
+    print(f"cann_bench_utils probe failed: {exc}", file=sys.stderr)
+print(json.dumps({"cannBenchUtilsCallable": ok}, sort_keys=True))
+sys.exit(0 if ok else 1)
+"""
+
+CANNBENCH_RUNNER = r"""
+import datetime as _dt, json, math, os, pathlib, shutil, subprocess, sys, tempfile, yaml
+
+cfg = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+repo = pathlib.Path(cfg["repo"])
+source = pathlib.Path(cfg["source"])
+utils_dir = pathlib.Path(cfg["utils_dir"])
+reports_root = pathlib.Path(cfg["reports_root"])
+vendor = repo / "vendor" / "cannbench"
+per_op_timeout = max(60, int(cfg.get("per_op_timeout", 3300)))
+tf_paths = [str((source / p).resolve()) for p in cfg["pythonpath_parts"] if (source / p).exists()]
+
+reports_root.mkdir(parents=True, exist_ok=True)
+stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+results = []
+all_valid = True
+all_passed = True
+all_timed = True
+total_cases = 0
+total_passed = 0
+total_timed = 0
+
+for index, item in enumerate(cfg["targets"]):
+    task = item["task"]
+    candidate_rel = item["candidate"]
+    task_dir = repo / "operators" / task
+    candidate = (source / candidate_rel).resolve()
+
+    suffix = f"{stamp}_{task.replace('/', '__')}"
+    if index > 0:
+        suffix = f"{suffix}_{index}"
+    report_dir = reports_root / suffix
+    dedup = 1
+    while report_dir.exists():
+        report_dir = reports_root / f"{suffix}_{dedup}"
+        dedup += 1
+    report_dir.mkdir(parents=True, exist_ok=False)
+
+    schema = yaml.safe_load((task_dir / "proto.yaml").read_text(encoding="utf-8"))["operator"]
+    function = schema["schema"].split("(")[0].strip()
+    expected_ids = {
+        f"{task}_{case['case_id']}"
+        for case in yaml.safe_load((task_dir / "cases.yaml").read_text(encoding="utf-8"))["cases"]
+    }
+
+    with tempfile.TemporaryDirectory(prefix="cannbench-tf-") as temp:
+        stage = pathlib.Path(temp)
+        staged_task = stage / "tasks" / task
+        staged_task.mkdir(parents=True)
+        for fname in ("golden.py", "cases.yaml", "proto.yaml"):
+            shutil.copy2(task_dir / fname, staged_task / fname)
+        shutil.copytree(repo / "operators" / "metadata", stage / "tasks" / "metadata")
+        pkg = stage / "submission" / "cann_bench"
+        pkg.mkdir(parents=True)
+        shutil.copy2(candidate, pkg / "candidate.py")
+        (pkg / "__init__.py").write_text(f"from .candidate import {function}\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["ASCEND_RT_VISIBLE_DEVICES"] = str(cfg["device"])
+        env["TILELANG_DISABLE_CACHE"] = "1"
+        pp_entries = [str(stage / "submission"), str(utils_dir), str(vendor / "src"), *tf_paths]
+        if env.get("PYTHONPATH"):
+            pp_entries.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pp_entries)
+
+        cmd = [
+            sys.executable, "-m", "kernel_eval.staged_eval",
+            "--task-dir", str(staged_task),
+            "--operator", schema["name"],
+            "--device-id", "0",
+            "--processes-per-card", "1",
+            "--eval-seed", "0",
+            "--input-dist", "uniform",
+            "--warmup", "3",
+            "--repeat", "5",
+            "--timeout-per-operator", str(per_op_timeout),
+            "--reports-dir", str(report_dir),
+            "--eval-code", "official",
+        ]
+        print(f"=== CANNBench running {task} ({candidate_rel}) -> {report_dir} ===", file=sys.stderr, flush=True)
+        rc = subprocess.call(cmd, cwd=str(vendor), env=env, stdout=sys.stderr, stderr=sys.stderr)
+
+    final_path = report_dir / "official_final.json"
+    count = passed = timed = 0
+    score = 0.0
+    avg_speedup = 0.0
+    valid = False
+    if final_path.is_file():
+        try:
+            report = json.loads(final_path.read_text(encoding="utf-8"))
+            op = report["operators"][0]
+            cases = op["cases"]
+            count = len(cases)
+            passed = sum(
+                1 for c in cases
+                if c.get("status") == "success" and (c.get("accuracy") or {}).get("passed") is True
+            )
+            timed = sum(
+                1 for c in cases
+                if isinstance(c.get("elapsed_us"), (int, float))
+                and math.isfinite(c["elapsed_us"])
+                and c["elapsed_us"] > 0
+                and not c.get("perf_collection_failed")
+            )
+            score = float(op.get("score") or 0.0)
+            avg_speedup = float(op.get("avg_speedup") or 0.0)
+            valid = (
+                rc == 0
+                and count == len(expected_ids)
+                and {c.get("case_id") for c in cases} == expected_ids
+                and passed == count
+                and timed == count
+            )
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            valid = False
+
+    total_cases += count
+    total_passed += passed
+    total_timed += timed
+    all_valid = all_valid and valid
+    all_passed = all_passed and (count > 0 and passed == count)
+    all_timed = all_timed and (count > 0 and timed == count)
+    results.append({
+        "task": task,
+        "candidate": candidate_rel,
+        "reportValid": valid,
+        "reportDir": str(report_dir),
+        "caseCount": count,
+        "passedCases": passed,
+        "timedCases": timed,
+        "score": round(score, 6),
+        "avgSpeedup": round(avg_speedup, 6),
+    })
+
+mean_score = round(sum(r["score"] for r in results) / len(results), 6) if results else 0.0
+mean_speedup = round(sum(r["avgSpeedup"] for r in results) / len(results), 6) if results else 0.0
+print(json.dumps({
+    "officialReportValid": bool(results) and all_valid,
+    "allCasesPassed": bool(results) and all_passed,
+    "allTimingsValid": bool(results) and all_timed,
+    "targetCount": len(results),
+    "caseCount": total_cases,
+    "passedCases": total_passed,
+    "timedCases": total_timed,
+    "score": mean_score,
+    "avgSpeedup": mean_speedup,
+    "results": results,
+}, sort_keys=True))
+sys.exit(0 if (bool(results) and all_valid and all_passed and all_timed) else 1)
 """
 
 
@@ -222,6 +443,129 @@ def device_tests(values: dict[str, str]) -> tuple[str, ...]:
     return _parse_test_list(values.get("TILEFOUNDRY_NPU_DEVICE_TESTS"), ())
 
 
+def cannbench_repo(values: dict[str, str]) -> Path:
+    raw = _required(values, "TILEFOUNDRY_NPU_CANNBENCH_REPO")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_REPO must be an absolute path: {raw!r}")
+    resolved = path.resolve()
+    required_paths = (
+        resolved / "tools" / "run_cannbench.py",
+        resolved / "vendor" / "cannbench" / "src" / "kernel_eval",
+        resolved / "vendor" / "cannbench" / "src" / "cann_bench_utils" / "CMakeLists.txt",
+        resolved / "operators" / "metadata",
+    )
+    for req in required_paths:
+        if not req.exists():
+            raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_REPO missing expected path {req}")
+    return resolved
+
+
+def work_root(values: dict[str, str], source: Path, repo: Path) -> Path:
+    raw = _required(values, "TILEFOUNDRY_NPU_WORK_ROOT")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise BridgeError(f"TILEFOUNDRY_NPU_WORK_ROOT must be an absolute path: {raw!r}")
+    resolved = path.resolve()
+    src_resolved = source.resolve()
+    repo_resolved = repo.resolve()
+    if resolved == src_resolved or resolved.is_relative_to(src_resolved):
+        raise BridgeError(f"TILEFOUNDRY_NPU_WORK_ROOT must be outside TileFoundry source root: {resolved}")
+    if resolved == repo_resolved or resolved.is_relative_to(repo_resolved):
+        raise BridgeError(f"TILEFOUNDRY_NPU_WORK_ROOT must be outside CANNBench repo: {resolved}")
+    return resolved
+
+
+def cannbench_arch(values: dict[str, str]) -> str:
+    raw = (values.get("TILEFOUNDRY_NPU_CANNBENCH_ARCH") or "").strip() or DEFAULT_CANNBENCH_ARCH
+    if not ARCH_RE.fullmatch(raw):
+        raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_ARCH is not a valid build target: {raw!r}")
+    return raw
+
+
+def cannbench_targets_file_rel(values: dict[str, str]) -> str:
+    raw = (values.get("TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE") or "").strip() or DEFAULT_TARGETS_FILE
+    p = Path(raw)
+    if p.is_absolute() or ".." in p.parts:
+        raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE must be relative inside source: {raw!r}")
+    return raw
+
+
+def _validate_target_pair(task: str, candidate_rel: str, source: Path, repo: Path) -> tuple[str, str]:
+    task = task.strip()
+    candidate_rel = candidate_rel.strip()
+    if not TASK_RE.fullmatch(task):
+        raise BridgeError(f"invalid CANNBench task {task!r}; expected levelN/operator_name")
+    task_dir = repo / "operators" / task
+    for fname in ("proto.yaml", "cases.yaml", "golden.py"):
+        if not (task_dir / fname).is_file():
+            raise BridgeError(f"CANNBench operator {task!r} missing {fname} in {repo}")
+    cand_path = Path(candidate_rel)
+    if not candidate_rel or cand_path.is_absolute() or ".." in cand_path.parts:
+        raise BridgeError(f"CANNBench candidate path must be relative inside source: {candidate_rel!r}")
+    resolved = (source / cand_path).resolve()
+    src_resolved = source.resolve()
+    if not resolved.is_relative_to(src_resolved) or not resolved.is_file() or resolved.suffix != ".py":
+        raise BridgeError(f"CANNBench candidate .py file missing under source: {candidate_rel!r}")
+    return task, cand_path.as_posix()
+
+
+def resolve_cannbench_targets(
+    values: dict[str, str], source: Path, repo: Path
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    rel_file = cannbench_targets_file_rel(values)
+    repo_manifest = (source / rel_file).resolve()
+    if not repo_manifest.is_relative_to(source.resolve()):
+        raise BridgeError(f"CANNBench targets file escapes source root: {rel_file!r}")
+
+    pairs: list[tuple[str, str]] = []
+    origin = ""
+    if repo_manifest.exists():
+        if not repo_manifest.is_file():
+            raise BridgeError(f"CANNBench targets path is not a regular file: {repo_manifest}")
+        try:
+            payload = json.loads(repo_manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BridgeError(f"cannot parse {repo_manifest}: {exc}") from exc
+        raw_items = payload.get("targets") if isinstance(payload, dict) else payload
+        if not isinstance(raw_items, list) or not raw_items:
+            raise BridgeError(f"{repo_manifest} must define a non-empty 'targets' list")
+        for idx, item in enumerate(raw_items):
+            if not isinstance(item, dict) or not isinstance(item.get("task"), str) or not isinstance(item.get("candidate"), str):
+                raise BridgeError(f"{repo_manifest} target #{idx + 1} must be {{'task': str, 'candidate': str}}")
+            pairs.append(_validate_target_pair(item["task"], item["candidate"], source, repo))
+        origin = "repo-file"
+    else:
+        raw_env = (values.get("TILEFOUNDRY_NPU_CANNBENCH_TARGETS") or "").strip()
+        if not raw_env:
+            raise BridgeError(
+                f"no CANNBench targets configured: create {rel_file} in source or set TILEFOUNDRY_NPU_CANNBENCH_TARGETS in env.sh"
+            )
+        entries = [e.strip() for e in re.split(r"[\s,;]+", raw_env) if e.strip()]
+        if not entries:
+            raise BridgeError("TILEFOUNDRY_NPU_CANNBENCH_TARGETS is empty")
+        for entry in entries:
+            if ":" not in entry:
+                raise BridgeError(
+                    f"TILEFOUNDRY_NPU_CANNBENCH_TARGETS entry {entry!r} must be formatted as levelN/op:relative/candidate.py"
+                )
+            task, cand = entry.split(":", 1)
+            pairs.append(_validate_target_pair(task, cand, source, repo))
+        origin = "env-file"
+    return origin, tuple(pairs)
+
+
+def _utils_source_digest(repo: Path) -> str:
+    src_root = (repo / "vendor" / "cannbench" / "src" / "cann_bench_utils").resolve()
+    h = hashlib.sha256()
+    files = sorted(p for p in src_root.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    for path in files:
+        rel = path.relative_to(src_root).as_posix()
+        h.update(rel.encode("utf-8") + b"\0")
+        h.update(path.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
 def device_id() -> str | None:
     raw = os.environ.get("TILEFOUNDRY_NPU_DEVICE_ID")
     if raw is None:
@@ -287,7 +631,135 @@ def _cpu_observations(succeeded: bool, collected: int, passed: int, failed: int,
     }
 
 
-def check_config(*, check_device: bool = False) -> int:
+def _device_occupancy(device: str) -> str:
+    try:
+        processes, _ = adapter_runtime.processes_on(int(device))
+    except adapter_runtime.BlockedEnv as exc:
+        if exclusive_requested():
+            raise BridgeError(str(exc)) from exc
+        return "unknown"
+    return "free" if not processes else f"shared({len(processes)})"
+
+
+@contextmanager
+def _open_device_window(device: str, *, warmup_seconds: float | None = None):
+    lease_path = os.environ.get("AGENT_GATES_DEVICE_LEASE_PATH", "").strip()
+    lease_resource = os.environ.get("AGENT_GATES_DEVICE_LEASE_RESOURCE", f"npu:{device}").strip()
+    if not lease_path:
+        raise BridgeError("AGENT_GATES_DEVICE_LEASE_PATH is required for windowed device runs")
+    try:
+        wait_seconds = float(os.environ.get("AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS", "60"))
+    except ValueError as exc:
+        raise BridgeError("invalid AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS") from exc
+
+    Path(lease_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    started = time.monotonic()
+    deadline = started + max(0.0, wait_seconds)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BridgeError(
+                        f"device lease {lease_resource} did not open within {wait_seconds}s"
+                    ) from exc
+                time.sleep(min(0.05, remaining))
+
+        opened = time.monotonic()
+        window_started = _timestamp()
+        occ = _device_occupancy(device)
+        probe_seconds = round(time.monotonic() - opened, 3)
+        if exclusive_requested() and occ.startswith("shared("):
+            raise BridgeError(
+                f"device {lease_resource} is {occ} and TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE is set"
+            )
+        work_started = time.monotonic()
+
+        def finalize_window() -> tuple[str, dict]:
+            win = {
+                "resource": lease_resource,
+                "path": lease_path,
+                "startedAt": window_started,
+                "releasedAt": _timestamp(),
+                "waited": round(opened - started, 3),
+                "heldSeconds": round(time.monotonic() - work_started, 3),
+                "probeSeconds": probe_seconds,
+                "occupancy": occ,
+            }
+            if warmup_seconds is not None:
+                win["warmupSeconds"] = round(float(warmup_seconds), 3)
+            return occ, win
+
+        yield finalize_window
+    finally:
+        os.close(fd)
+
+
+def _extract_last_json(stdout: str, marker_key: str) -> dict:
+    for line in reversed((stdout or "").splitlines()):
+        cleaned = line.strip()
+        if cleaned.startswith("{"):
+            try:
+                parsed = json.loads(cleaned)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict) and marker_key in parsed:
+                return parsed
+    return {}
+
+
+def _abi_slot(
+    values: dict[str, str], source: Path, repo: Path, wroot: Path, info: dict[str, str]
+) -> tuple[str, Path, Path]:
+    arch = cannbench_arch(values)
+    cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP")).resolve()
+    python = python_path(values).resolve()
+    key_material = "\0".join([
+        arch,
+        str(python),
+        str(cann_setup),
+        str(info.get("pythonVersion", "")),
+        str(info.get("torchVersion", "")),
+        str(info.get("torchNpuVersion", "")),
+        _utils_source_digest(repo),
+    ])
+    digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:12]
+    slot_dir = wroot / "cannbench-utils" / f"{arch}-{digest}"
+    return f"{arch}-{digest}", slot_dir, slot_dir / "cann_bench_utils"
+
+
+def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
+    conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
+    conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
+    python = python_path(values)
+    run_env = dict(os.environ)
+    envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+    if envs_path:
+        run_env["CONDA_ENVS_PATH"] = envs_path
+    run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = adapter_runtime.run_host_bash(
+        f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ENV_INSPECT)}",
+        cwd=source,
+        env=run_env,
+        cann_setup=None,
+        conda_sh=conda_sh,
+        conda_env=conda_env,
+        timeout=60.0,
+        isolate_temp=True,
+    )
+    info = _extract_last_json(completed.stdout, "missing")
+    if completed.returncode != 0 or not info:
+        sys.stderr.write((completed.stderr or completed.stdout)[-4000:])
+        raise BridgeError("failed to inspect TileFoundry Conda Python dependencies")
+    return info
+
+
+def check_config(*, check_device: bool = False, check_cannbench: bool = False) -> int:
     try:
         values = machine_values()
         for name in REQUIRED:
@@ -309,6 +781,11 @@ def check_config(*, check_device: bool = False) -> int:
         for rel in device_tests(values):
             if not (source / rel).exists():
                 raise BridgeError(f"device test path missing in {source}: {rel}")
+        if check_cannbench:
+            repo = cannbench_repo(values)
+            work_root(values, source, repo)
+            cannbench_arch(values)
+            resolve_cannbench_targets(values, source, repo)
         if check_device:
             dev = device_id()
             if dev is not None:
@@ -387,61 +864,16 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         return (0 if succeeded else 1), obs
 
 
-def _device_occupancy(device: str) -> str:
-    try:
-        processes, _ = adapter_runtime.processes_on(int(device))
-    except adapter_runtime.BlockedEnv as exc:
-        if exclusive_requested():
-            raise BridgeError(str(exc)) from exc
-        return "unknown"
-    return "free" if not processes else f"shared({len(processes)})"
-
-
 def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
     device = require_device()
-    lease_path = os.environ.get("AGENT_GATES_DEVICE_LEASE_PATH", "").strip()
-    lease_resource = os.environ.get("AGENT_GATES_DEVICE_LEASE_RESOURCE", f"npu:{device}").strip()
-    if not lease_path:
-        raise BridgeError("AGENT_GATES_DEVICE_LEASE_PATH is required for windowed device runs")
-    try:
-        wait_seconds = float(os.environ.get("AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS", "60"))
-    except ValueError as exc:
-        raise BridgeError("invalid AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS") from exc
-
     cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
     extra_tests = device_tests(values)
 
-    Path(lease_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    started = time.monotonic()
-    deadline = started + max(0.0, wait_seconds)
-    try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError as exc:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise BridgeError(
-                        f"device lease {lease_resource} did not open within {wait_seconds}s"
-                    ) from exc
-                time.sleep(min(0.05, remaining))
-
-        opened = time.monotonic()
-        window_started = _timestamp()
-        occ = _device_occupancy(device)
-        probe_seconds = round(time.monotonic() - opened, 3)
-        if exclusive_requested() and occ.startswith("shared("):
-            raise BridgeError(
-                f"device {lease_resource} is {occ} and TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE is set"
-            )
-
-        work_started = time.monotonic()
+    with _open_device_window(device) as finalize_window:
         with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
             probe_path = Path(tmp) / "probe.py"
             probe_path.write_text(DEVICE_PROBE, encoding="utf-8")
@@ -472,8 +904,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                     isolate_temp=True,
                 )
             except subprocess.TimeoutExpired as exc:
-                held = round(time.monotonic() - work_started, 3)
-                released = _timestamp()
+                occ, win = finalize_window()
                 if exc.stderr:
                     sys.stderr.write(str(exc.stderr)[-4000:])
                 print(f"{PROG}: device probe timed out after {timeout}s", file=sys.stderr)
@@ -491,35 +922,14 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                     "windowOpened": True,
                     "windowReleased": True,
                     "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-                    "deviceWindow": {
-                        "resource": lease_resource,
-                        "path": lease_path,
-                        "startedAt": window_started,
-                        "releasedAt": released,
-                        "waited": round(opened - started, 3),
-                        "heldSeconds": held,
-                        "probeSeconds": probe_seconds,
-                        "occupancy": occ,
-                    },
+                    "deviceWindow": win,
                 }
 
-        held = round(time.monotonic() - work_started, 3)
-        released = _timestamp()
+        occ, win = finalize_window()
         if completed.stderr.strip():
             sys.stderr.write(completed.stderr[-4000:])
 
-        parsed: dict = {}
-        for line in reversed(completed.stdout.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    candidate = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(candidate, dict) and "npuAvailable" in candidate:
-                    parsed = candidate
-                    break
-
+        parsed = _extract_last_json(completed.stdout, "npuAvailable")
         ok = completed.returncode == 0 and bool(parsed) and all(
             parsed.get(k) is True
             for k in (
@@ -551,20 +961,289 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             "windowOpened": True,
             "windowReleased": True,
             "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-            "deviceWindow": {
-                "resource": lease_resource,
-                "path": lease_path,
-                "startedAt": window_started,
-                "releasedAt": released,
-                "waited": round(opened - started, 3),
-                "heldSeconds": held,
-                "probeSeconds": probe_seconds,
-                "occupancy": occ,
-            },
+            "deviceWindow": win,
         }
         return (0 if ok else (completed.returncode or 1)), obs
-    finally:
-        os.close(fd)
+
+
+def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+    source = _source_root()
+    device = require_device()
+    repo = cannbench_repo(values)
+    wroot = work_root(values, source, repo)
+    arch = cannbench_arch(values)
+    cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
+    conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
+    conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
+    python = python_path(values)
+
+    warmup_started = time.monotonic()
+    info = _inspect_conda_cannbench_env(values, source)
+    missing = info.get("missing") or []
+    if missing:
+        raise BridgeError(
+            "missing CANNBench Python packages in TileFoundry env "
+            f"({', '.join(missing)}); run {ADAPTER_DIR / 'scripts' / 'setup_cannbench_deps.sh'}"
+        )
+
+    abi_tag, slot_dir, utils_dir = _abi_slot(values, source, repo, wroot, info)
+    ext_so = utils_dir / "cann_bench_utils" / "_C.so"
+    meta_file = slot_dir / "build_meta.json"
+
+    utils_built = False
+    utils_reused = False
+    if ext_so.is_file() and meta_file.is_file():
+        utils_reused = True
+    else:
+        build_parent = wroot / "cannbench-utils"
+        build_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f".tmp-{abi_tag}-", dir=str(build_parent)) as stage_tmp:
+            stage_slot = Path(stage_tmp) / "slot"
+            stage_utils = stage_slot / "cann_bench_utils"
+            stage_slot.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(repo / "vendor" / "cannbench" / "src" / "cann_bench_utils", stage_utils)
+            build_cmd = " && ".join([
+                " ".join([
+                    "cmake", "-S", shlex.quote(str(stage_utils)),
+                    "-B", shlex.quote(str(stage_utils / "build")),
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    f"-DPython3_EXECUTABLE={shlex.quote(str(python))}",
+                    f"-DTorch_DIR={shlex.quote(info['torchCmakeDir'])}",
+                    f"-DTORCH_NPU_PATH={shlex.quote(info['torchNpuDir'])}",
+                    f"-DNPU_ARCH={shlex.quote(arch)}",
+                ]),
+                " ".join(["cmake", "--build", shlex.quote(str(stage_utils / "build")), "--parallel", "4"]),
+            ])
+            build_env = dict(os.environ)
+            envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+            if envs_path:
+                build_env["CONDA_ENVS_PATH"] = envs_path
+            build_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            try:
+                built = adapter_runtime.run_host_bash(
+                    build_cmd,
+                    cwd=repo,
+                    env=build_env,
+                    cann_setup=cann_setup,
+                    conda_sh=conda_sh,
+                    conda_env=conda_env,
+                    timeout=min(timeout, 600.0),
+                    isolate_temp=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                if exc.stderr:
+                    sys.stderr.write(str(exc.stderr)[-4000:])
+                raise BridgeError("cann_bench_utils CMake build timed out") from exc
+            if built.stderr.strip():
+                sys.stderr.write(built.stderr[-4000:])
+            if built.returncode != 0 or not (stage_utils / "cann_bench_utils" / "_C.so").is_file():
+                sys.stderr.write((built.stdout or "")[-4000:])
+                raise BridgeError(f"cann_bench_utils CMake build failed (exit {built.returncode})")
+            (stage_slot / "build_meta.json").write_text(
+                json.dumps({
+                    "abiTag": abi_tag,
+                    "arch": arch,
+                    "python": str(python.resolve()),
+                    "cannSetup": str(cann_setup.resolve()),
+                    "pythonVersion": info["pythonVersion"],
+                    "torchVersion": info["torchVersion"],
+                    "torchNpuVersion": info["torchNpuVersion"],
+                    "builtAt": _timestamp(),
+                }, indent=2),
+                encoding="utf-8",
+            )
+            if slot_dir.exists():
+                shutil.rmtree(slot_dir)
+            shutil.move(str(stage_slot), str(slot_dir))
+        utils_built = True
+
+    warmup_seconds = round(time.monotonic() - warmup_started, 3)
+
+    with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
+        run_env = dict(os.environ)
+        envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+        if envs_path:
+            run_env["CONDA_ENVS_PATH"] = envs_path
+        run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
+        run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        run_env["PYTHONPATH"] = str(utils_dir)
+        probe_cmd = f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ABI_PROBE)}"
+        try:
+            probed = adapter_runtime.run_host_bash(
+                probe_cmd,
+                cwd=source,
+                env=run_env,
+                cann_setup=cann_setup,
+                conda_sh=conda_sh,
+                conda_env=conda_env,
+                timeout=max(60.0, timeout - warmup_seconds),
+                isolate_temp=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            occ, win = finalize_window()
+            if exc.stderr:
+                sys.stderr.write(str(exc.stderr)[-4000:])
+            return 1, {
+                "exitCodeZero": False,
+                "depsReady": True,
+                "cannBenchUtilsPresent": ext_so.is_file(),
+                "cannBenchUtilsCallable": False,
+                "utilsBuilt": utils_built,
+                "utilsReused": utils_reused,
+                "utilsRoot": str(utils_dir),
+                "arch": arch,
+                "pythonVersion": info["pythonVersion"],
+                "torchVersion": info["torchVersion"],
+                "torchNpuVersion": info["torchNpuVersion"],
+                "windowOpened": True,
+                "windowReleased": True,
+                "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
+                "deviceWindow": win,
+            }
+
+        occ, win = finalize_window()
+        if probed.stderr.strip():
+            sys.stderr.write(probed.stderr[-4000:])
+        parsed = _extract_last_json(probed.stdout, "cannBenchUtilsCallable")
+        callable_ok = bool(parsed.get("cannBenchUtilsCallable", False))
+        ok = probed.returncode == 0 and ext_so.is_file() and callable_ok
+        if not ok:
+            sys.stderr.write((probed.stdout or "")[-4000:])
+        return (0 if ok else (probed.returncode or 1)), {
+            "exitCodeZero": ok,
+            "depsReady": True,
+            "cannBenchUtilsPresent": ext_so.is_file(),
+            "cannBenchUtilsCallable": callable_ok,
+            "utilsBuilt": utils_built,
+            "utilsReused": utils_reused,
+            "utilsRoot": str(utils_dir),
+            "arch": arch,
+            "pythonVersion": info["pythonVersion"],
+            "torchVersion": info["torchVersion"],
+            "torchNpuVersion": info["torchNpuVersion"],
+            "windowOpened": True,
+            "windowReleased": True,
+            "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
+            "deviceWindow": win,
+        }
+
+
+def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+    source = _source_root()
+    device = require_device()
+    repo = cannbench_repo(values)
+    wroot = work_root(values, source, repo)
+    targets_source, targets = resolve_cannbench_targets(values, source, repo)
+    cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
+    conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
+    conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
+    python = python_path(values)
+
+    warmup_started = time.monotonic()
+    info = _inspect_conda_cannbench_env(values, source)
+    if info.get("missing"):
+        raise BridgeError(
+            "missing CANNBench Python packages in TileFoundry env "
+            f"({', '.join(info['missing'])}); run tilefoundry-npu-cannbench-prep first"
+        )
+    _, _, utils_dir = _abi_slot(values, source, repo, wroot, info)
+    if not (utils_dir / "cann_bench_utils" / "_C.so").is_file():
+        raise BridgeError(
+            f"isolated cann_bench_utils _C.so missing under {utils_dir}; run tilefoundry-npu-cannbench-prep first"
+        )
+    warmup_seconds = round(time.monotonic() - warmup_started, 3)
+
+    reports_root = wroot / "reports"
+    runner_cfg = {
+        "repo": str(repo),
+        "source": str(source),
+        "utils_dir": str(utils_dir),
+        "reports_root": str(reports_root),
+        "device": device,
+        "per_op_timeout": int(max(60.0, timeout - warmup_seconds - 60.0)),
+        "pythonpath_parts": list(DEFAULT_PYTHONPATH_PARTS),
+        "targets": [{"task": t, "candidate": c} for t, c in targets],
+    }
+
+    with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
+        with tempfile.TemporaryDirectory(prefix="tilefoundry-cannbench-") as tmp:
+            tmp_dir = Path(tmp)
+            runner_py = tmp_dir / "runner.py"
+            cfg_json = tmp_dir / "runner_cfg.json"
+            runner_py.write_text(CANNBENCH_RUNNER, encoding="utf-8")
+            cfg_json.write_text(json.dumps(runner_cfg), encoding="utf-8")
+
+            run_env = dict(os.environ)
+            run_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+            envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+            if envs_path:
+                run_env["CONDA_ENVS_PATH"] = envs_path
+            run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            cmd = f"{shlex.quote(str(python))} {shlex.quote(str(runner_py))} {shlex.quote(str(cfg_json))}"
+            try:
+                completed = adapter_runtime.run_host_bash(
+                    cmd,
+                    cwd=source,
+                    env=run_env,
+                    cann_setup=cann_setup,
+                    conda_sh=conda_sh,
+                    conda_env=conda_env,
+                    timeout=max(60.0, timeout - warmup_seconds),
+                    isolate_temp=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                occ, win = finalize_window()
+                if exc.stderr:
+                    sys.stderr.write(str(exc.stderr)[-4000:])
+                return 1, {
+                    "exitCodeZero": False,
+                    "officialReportValid": False,
+                    "allCasesPassed": False,
+                    "allTimingsValid": False,
+                    "targetCount": len(targets),
+                    "targetsSource": targets_source,
+                    "caseCount": 0,
+                    "passedCases": 0,
+                    "timedCases": 0,
+                    "score": 0.0,
+                    "avgSpeedup": 0.0,
+                    "results": [],
+                    "windowOpened": True,
+                    "windowReleased": True,
+                    "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
+                    "deviceWindow": win,
+                }
+
+        occ, win = finalize_window()
+        if completed.stderr.strip():
+            sys.stderr.write(completed.stderr[-4000:])
+        parsed = _extract_last_json(completed.stdout, "officialReportValid")
+        report_valid = bool(parsed.get("officialReportValid", False))
+        cases_passed = bool(parsed.get("allCasesPassed", False))
+        timings_valid = bool(parsed.get("allTimingsValid", False))
+        ok = completed.returncode == 0 and report_valid and cases_passed and timings_valid
+        if not ok:
+            sys.stderr.write((completed.stdout or "")[-4000:])
+
+        obs = {
+            "exitCodeZero": ok,
+            "officialReportValid": report_valid,
+            "allCasesPassed": cases_passed,
+            "allTimingsValid": timings_valid,
+            "targetCount": int(parsed.get("targetCount", len(targets))),
+            "targetsSource": targets_source,
+            "caseCount": int(parsed.get("caseCount", 0)),
+            "passedCases": int(parsed.get("passedCases", 0)),
+            "timedCases": int(parsed.get("timedCases", 0)),
+            "score": float(parsed.get("score", 0.0)),
+            "avgSpeedup": float(parsed.get("avgSpeedup", 0.0)),
+            "results": list(parsed.get("results") or []),
+            "windowOpened": True,
+            "windowReleased": True,
+            "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
+            "deviceWindow": win,
+        }
+        return (0 if ok else (completed.returncode or 1)), obs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -582,6 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
         return check_config(check_device=False)
     if args == ["--check-config-device"]:
         return check_config(check_device=True)
+    if args == ["--check-config-cannbench"]:
+        return check_config(check_device=True, check_cannbench=True)
 
     try:
         values = machine_values()
@@ -599,10 +1280,25 @@ def main(argv: list[str] | None = None) -> int:
             _die(75, str(exc))
         print(json.dumps(obs, sort_keys=True))
         return rc
+    if args == ["--cannbench-prep"]:
+        try:
+            rc, obs = run_cannbench_prep(values, DEFAULT_PREP_TIMEOUT if timeout is None else timeout)
+        except BridgeError as exc:
+            _die(75, str(exc))
+        print(json.dumps(obs, sort_keys=True))
+        return rc
+    if args == ["--cannbench"]:
+        try:
+            rc, obs = run_cannbench(values, DEFAULT_CANNBENCH_TIMEOUT if timeout is None else timeout)
+        except BridgeError as exc:
+            _die(75, str(exc))
+        print(json.dumps(obs, sort_keys=True))
+        return rc
 
     _die(
         2,
-        f"usage: {PROG} (--cpu | --device | --check-config | --check-config-device) [--timeout SECONDS]",
+        f"usage: {PROG} (--cpu | --device | --cannbench-prep | --cannbench | "
+        "--check-config | --check-config-device | --check-config-cannbench) [--timeout SECONDS]",
     )
     return 2
 

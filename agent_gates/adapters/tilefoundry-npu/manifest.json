@@ -4,7 +4,8 @@
   "version": "1.0.0",
   "capabilities": [
     "cpu-regression",
-    "device-regression"
+    "device-regression",
+    "cannbench-eval"
   ],
   "skills": [],
   "permissions": {
@@ -15,7 +16,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_host_gate.py": "c7df1fd6a7de292e1e2d5d2a09717a8209cf8d33f2cd4d1b647c82bf9515b9a5"
+    "scripts/tilefoundry_host_gate.py": "401e5a605aa3310258ee986661588e9e40fee9a8fc15cfef89f1fd9842e4d3e3"
   },
   "recipes": [
     {
@@ -65,6 +66,56 @@
       "blockedExitCodes": [
         75
       ]
+    },
+    {
+      "id": "tilefoundry-npu.cannbench-prep",
+      "cwd": "source",
+      "timeout": 900,
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--cannbench-prep",
+        "--timeout",
+        "840"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--check-config-cannbench"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "tilefoundry-npu.cannbench",
+      "cwd": "source",
+      "timeout": 3600,
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--cannbench",
+        "--timeout",
+        "3300"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--check-config-cannbench"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
     }
   ],
   "gates": [
@@ -100,6 +151,37 @@
       },
       "dependsOn": [
         "tilefoundry-npu-cpu"
+      ]
+    },
+    {
+      "id": "tilefoundry-npu-cannbench-prep",
+      "recipeId": "tilefoundry-npu.cannbench-prep",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "depsReady": true,
+        "cannBenchUtilsPresent": true,
+        "cannBenchUtilsCallable": true,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true
+      }
+    },
+    {
+      "id": "tilefoundry-npu-cannbench",
+      "recipeId": "tilefoundry-npu.cannbench",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "officialReportValid": true,
+        "allCasesPassed": true,
+        "allTimingsValid": true,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true
+      },
+      "dependsOn": [
+        "tilefoundry-npu-cannbench-prep"
       ]
     }
   ]
