@@ -158,11 +158,11 @@ class EvidenceStore:
                     result = evaluate(gate["process"], definition["observationChecks"])
                     if result["status"] != "PASS" or not equal(result["observations"], gate["observations"]):
                         raise ValueError("gate no longer passes its recorded machine output")
-                    from .engine import collect_artifacts
+                    from .engine import collect_artifacts, is_observation_only_recipe
                     observed_artifacts = collect_artifacts(result["observations"], Path(receipt["source"]["root"]))
                     if observed_artifacts and observed_artifacts != gate["artifacts"]:
                         raise ValueError("receipt artifacts differ from machine observations")
-                    if "regression" in recipe.id or manifest.id.endswith("-npu") or "loadedNativeSha256MatchesHost" in gate["checks"]:
+                    if is_observation_only_recipe(manifest.id, recipe.id, gate["checks"]):
                         before = {item["path"]: item for item in gate.get("artifactInputs", [])}
                         if any(item["path"] in before and item != before[item["path"]] for item in gate["artifacts"]):
                             raise ValueError("artifact changed during observation-only test")

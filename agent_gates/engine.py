@@ -249,6 +249,18 @@ def collect_artifacts(observed, source):
     return references
 
 
+def is_observation_only_recipe(manifest_id: str, recipe_id: str, checks) -> bool:
+    """True for test/regression recipes whose pre-existing .so inputs must not change during execution."""
+    step = recipe_id.rpartition(".")[2] or recipe_id
+    if step == "build" or step.endswith("-build"):
+        return False
+    return (
+        "regression" in recipe_id
+        or manifest_id.endswith("-npu")
+        or "loadedNativeSha256MatchesHost" in checks
+    )
+
+
 def device_lease_plan(manifest, order, source):
     """How this run holds its device card: whole-recipe, per-window, or not at all.
 
@@ -665,7 +677,7 @@ class Engine:
             # Exit-code build gates still bind the actual products they created.
             if not gate["artifacts"]:
                 gate["artifacts"] = list(artifact_inputs(source, manifest, env).values())
-            if "regression" in recipe.id or manifest.id.endswith("-npu") or "loadedNativeSha256MatchesHost" in gate["checks"]:
+            if is_observation_only_recipe(manifest.id, recipe.id, gate["checks"]):
                 for artifact in gate["artifacts"]:
                     if artifact["path"] in inputs and artifact != inputs[artifact["path"]]:
                         gate.update(status="STALE", failures=gate["failures"] + ["ARTIFACT_CHANGED_DURING_TEST"])

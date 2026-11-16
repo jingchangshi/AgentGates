@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from agent_gates.cli import main
-from agent_gates.engine import Engine, environment
+from agent_gates.engine import Engine, environment, is_observation_only_recipe
 from agent_gates.evaluator import equal, evaluate
 from agent_gates.evidence import EvidenceStore
 from agent_gates.executor import execute
@@ -585,6 +585,116 @@ class SnapshotTests(CoreFixture):
         link.unlink()
         link.symlink_to(self.root / "missing-fixture")
         self.assertNotEqual(before["hash"], snapshot(self.source)["hash"])
+
+
+class NpuBuildArtifactInvarianceTests(CoreFixture):
+    def _init_git_source(self):
+        subprocess.run(["git", "init", "-q", str(self.source)], check=True)
+        (self.source / ".gitignore").write_text("build/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.source), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+             "commit", "-qm", "fixture"],
+            check=True,
+        )
+
+    def test_is_observation_only_recipe_exempts_build_steps(self):
+        self.assertFalse(is_observation_only_recipe("tilelang-npu", "tilelang-npu.build", {}))
+        self.assertFalse(is_observation_only_recipe("ascendnpu-ir", "ascendnpu-ir.host-build", {}))
+        self.assertTrue(is_observation_only_recipe("tilelang-npu", "tilelang-npu.examples", {}))
+        self.assertTrue(is_observation_only_recipe("tilelang-hivm-npu", "tilelang-hivm-npu.sanity", {}))
+        self.assertTrue(is_observation_only_recipe("ascendnpu-ir", "ascendnpu-ir.host-regression", {}))
+
+    def test_npu_build_recipe_can_update_and_create_so_while_examples_cannot(self):
+        self._init_git_source()
+        pack = self.root / "adapters/tilelang-npu"
+        (pack / "scripts").mkdir(parents=True)
+        script = pack / "scripts/gate.py"
+        script.write_text(
+            'import hashlib, json, sys\n'
+            'from pathlib import Path\n'
+            'if "--check-config" in sys.argv:\n'
+            '    sys.exit(0)\n'
+            'lib = Path("build/lib").resolve()\n'
+            'lib.mkdir(parents=True, exist_ok=True)\n'
+            'if "--build" in sys.argv:\n'
+            '    (lib / "libtilelang.so").write_bytes(b"new-lib")\n'
+            '    (lib / "ext.abi3.so").write_bytes(b"new-abi3")\n'
+            'elif "--examples-mutate" in sys.argv:\n'
+            '    (lib / "libtilelang.so").write_bytes(b"mutated-in-test")\n'
+            'arts = [{"path": str(p.resolve()), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}\n'
+            '        for p in sorted(lib.glob("*.so"))]\n'
+            'print(json.dumps({"ok": True, "artifacts": arts}))\n',
+            encoding="utf-8",
+        )
+        manifest = {
+            "schemaVersion": 1,
+            "id": "tilelang-npu",
+            "version": "1",
+            "files": {"scripts/gate.py": digest(script)},
+            "permissions": {"sourceWrite": False, "hostExecution": True},
+            "recipes": [
+                {
+                    "id": "tilelang-npu.build",
+                    "cwd": "source",
+                    "timeout": 5,
+                    "device": "none",
+                    "argv": [sys.executable, "-I", "{pack}/scripts/gate.py", "--build"],
+                    "configCheck": [sys.executable, "-I", "{pack}/scripts/gate.py", "--check-config"],
+                },
+                {
+                    "id": "tilelang-npu.examples",
+                    "cwd": "source",
+                    "timeout": 5,
+                    "device": "none",
+                    "argv": [sys.executable, "-I", "{pack}/scripts/gate.py", "--examples"],
+                    "configCheck": [sys.executable, "-I", "{pack}/scripts/gate.py", "--check-config"],
+                },
+                {
+                    "id": "tilelang-npu.examples-mutate",
+                    "cwd": "source",
+                    "timeout": 5,
+                    "device": "none",
+                    "argv": [sys.executable, "-I", "{pack}/scripts/gate.py", "--examples-mutate"],
+                    "configCheck": [sys.executable, "-I", "{pack}/scripts/gate.py", "--check-config"],
+                },
+            ],
+            "gates": [
+                {
+                    "id": "tilelang-npu-build",
+                    "recipeId": "tilelang-npu.build",
+                    "gateType": "deterministic-test",
+                    "observationChecks": {"ok": True},
+                },
+                {
+                    "id": "tilelang-npu-examples",
+                    "recipeId": "tilelang-npu.examples",
+                    "gateType": "deterministic-test",
+                    "dependsOn": ["tilelang-npu-build"],
+                    "observationChecks": {"ok": True},
+                },
+                {
+                    "id": "tilelang-npu-examples-mutate",
+                    "recipeId": "tilelang-npu.examples-mutate",
+                    "gateType": "deterministic-test",
+                    "observationChecks": {"ok": True},
+                },
+            ],
+        }
+        (pack / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        # Seed a prior native build so the build gate updates libtilelang.so and creates ext.abi3.so.
+        (self.source / "build/lib").mkdir(parents=True)
+        (self.source / "build/lib/libtilelang.so").write_bytes(b"old-lib")
+
+        run = self.engine.run("tilelang-npu", self.source, ["tilelang-npu-examples"])
+        self.assertEqual(run["status"], "PASS", run)
+        verified = self.store.verify(run["runId"], registry=self.registry)
+        self.assertEqual(verified["status"], "PASS", verified)
+
+        bad_run = self.engine.run("tilelang-npu", self.source, ["tilelang-npu-examples-mutate"])
+        self.assertEqual(bad_run["status"], "STALE", bad_run)
+        self.assertIn("ARTIFACT_CHANGED_DURING_TEST", bad_run["gates"][0]["failures"])
 
 
 if __name__ == "__main__":
