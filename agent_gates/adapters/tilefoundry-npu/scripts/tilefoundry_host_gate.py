@@ -32,6 +32,8 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CONDA_ENV",
     "TILEFOUNDRY_NPU_CONDA_ENVS_PATH",
     "TILEFOUNDRY_NPU_PYTHON",
+    "TILEFOUNDRY_NPU_TILELANG_SOURCE",
+    "TILEFOUNDRY_NPU_TILELANG_BUILD",
     "TILEFOUNDRY_NPU_CPU_TESTS",
     "TILEFOUNDRY_NPU_DEVICE_TESTS",
     "TILEFOUNDRY_NPU_BUILD_SUBDIR",
@@ -64,6 +66,13 @@ DEFAULT_CPU_TESTS = (
 
 DEFAULT_PYTHONPATH_PARTS = ("src", "targets/ascend", "targets/apple", "targets/nvidia")
 DEFAULT_PYTHONPATH = ":".join(DEFAULT_PYTHONPATH_PARTS)
+TILELANG_SABI_EXTENSIONS = (
+    "tilelang_cython_wrapper",
+    "tilelang_pto_wrapper",
+    "tilelang_ascend_npu_exchange",
+    "tilelang_deepgemm_heuristics",
+)
+TILELANG_BUILD_STAMP_FILE = ".agent_gates_build_stamp.json"
 DEFAULT_TARGETS_FILE = "examples/ascend950pr_ops/cannbench_targets.json"
 DEFAULT_CANNBENCH_ARCH = "ascend950"
 TASK_RE = re.compile(r"level[1-9][0-9]*/[a-z][a-z0-9_]*")
@@ -75,7 +84,7 @@ DEFAULT_PREP_TIMEOUT = 840.0
 DEFAULT_CANNBENCH_TIMEOUT = 3300.0
 
 DEVICE_PROBE = r"""
-import json, sys, torch, torch_npu
+import json, os, pathlib, sys, torch, torch_npu
 facts = {
     "tilefoundryImported": False,
     "npuAvailable": False,
@@ -92,6 +101,25 @@ try:
     facts["tilefoundryImported"] = True
 except Exception as exc:
     print(f"tilefoundry import failed: {exc}", file=sys.stderr)
+
+expected_tl = os.environ.get("TILEFOUNDRY_EXPECTED_TILELANG_SOURCE", "").strip()
+if expected_tl:
+    facts["tilelangReused"] = False
+    try:
+        import tilelang, tilelang_cython_wrapper  # noqa: F401
+        tl_file = pathlib.Path(tilelang.__file__).resolve()
+        wrapper_file = pathlib.Path(getattr(tilelang_cython_wrapper, "__file__", "")).resolve()
+        exp_root = pathlib.Path(expected_tl).resolve()
+        ok_tl = tl_file.is_relative_to(exp_root) and wrapper_file.is_relative_to(exp_root / "build" / "lib")
+        if not ok_tl:
+            print(
+                f"tilelang imported from ({tl_file}, {wrapper_file}), expected under {exp_root}",
+                file=sys.stderr,
+            )
+        facts["tilelangReused"] = ok_tl
+        facts["tilelangVersion"] = getattr(tilelang, "__version__", "")
+    except Exception as exc:
+        print(f"tilelang reuse import failed: {exc}", file=sys.stderr)
 
 try:
     avail = bool(torch.npu.is_available())
@@ -122,7 +150,7 @@ except Exception as exc:
     print(f"npu probe failed: {exc}", file=sys.stderr)
 
 print(json.dumps(facts, sort_keys=True))
-sys.exit(0 if all(facts.values()) else 1)
+sys.exit(0 if all(v for v in facts.values() if isinstance(v, bool)) else 1)
 """
 
 CANNBENCH_ENV_INSPECT = r"""
@@ -239,7 +267,13 @@ for index, item in enumerate(cfg["targets"]):
         env = os.environ.copy()
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(cfg["device"])
         env["TILELANG_DISABLE_CACHE"] = "1"
-        pp_entries = [str(stage / "submission"), str(utils_dir), str(vendor / "src"), *tf_paths]
+        tl_src = (cfg.get("tilelang_source") or "").strip()
+        if tl_src:
+            env.setdefault("USE_CUDA", "0")
+        pp_entries = [str(stage / "submission"), str(utils_dir), str(vendor / "src")]
+        if tl_src:
+            pp_entries.append(tl_src)
+        pp_entries.extend(tf_paths)
         if env.get("PYTHONPATH"):
             pp_entries.append(env["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(pp_entries)
@@ -566,6 +600,198 @@ def _utils_source_digest(repo: Path) -> str:
     return h.hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _git_head_pure(root: Path) -> str:
+    dot_git = Path(root) / ".git"
+    if dot_git.is_file():
+        try:
+            text = dot_git.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return "NO_GIT"
+        if not text.startswith("gitdir:"):
+            return "NO_GIT"
+        raw_dir = text[len("gitdir:"):].strip()
+        git_dir = Path(raw_dir) if Path(raw_dir).is_absolute() else (Path(root) / raw_dir)
+    elif dot_git.is_dir():
+        git_dir = dot_git
+    else:
+        return "NO_GIT"
+
+    head_file = git_dir / "HEAD"
+    if not head_file.is_file():
+        return "NO_GIT"
+    try:
+        head_text = head_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return "NO_GIT"
+    if not head_text.startswith("ref:"):
+        return head_text if re.fullmatch(r"[0-9a-fA-F]{40,64}", head_text) else "NO_GIT"
+
+    ref_name = head_text[len("ref:"):].strip()
+    search_dirs = [git_dir]
+    commondir_file = git_dir / "commondir"
+    if commondir_file.is_file():
+        try:
+            raw_common = commondir_file.read_text(encoding="utf-8").strip()
+            common_dir = Path(raw_common) if Path(raw_common).is_absolute() else (git_dir / raw_common)
+            if common_dir.is_dir():
+                search_dirs.append(common_dir)
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    for candidate_dir in search_dirs:
+        ref_file = candidate_dir / ref_name
+        if ref_file.is_file():
+            try:
+                commit = ref_file.read_text(encoding="utf-8").strip()
+                if commit:
+                    return commit
+            except (OSError, UnicodeDecodeError):
+                pass
+        packed = candidate_dir / "packed-refs"
+        if packed.is_file():
+            try:
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    if not line or line.startswith(("#", "^")):
+                        continue
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2 and parts[1].strip() == ref_name:
+                        return parts[0].strip()
+            except (OSError, UnicodeDecodeError):
+                pass
+    return "NO_GIT"
+
+
+def _tilelang_native_inputs_sha256(source: Path) -> str:
+    """Deterministic digest matching tilelang-npu's native/CMake/Cython inputs."""
+    src_root = Path(source).resolve()
+    candidates: list[Path] = []
+    for rel_file in ("CMakeLists.txt", "examples/ascend/deepgemm/_heuristics.pyx"):
+        p = src_root / rel_file
+        if p.is_file():
+            candidates.append(p)
+    for rel_dir in ("cmake", "src"):
+        d = src_root / rel_dir
+        if d.is_dir():
+            candidates.extend(p for p in d.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    tl_pkg = src_root / "tilelang"
+    if tl_pkg.is_dir():
+        for ext in ("*.pyx", "*.pxd", "*.pxi"):
+            candidates.extend(p for p in tl_pkg.rglob(ext) if p.is_file() and "__pycache__" not in p.parts)
+
+    by_rel = {p.relative_to(src_root).as_posix(): p for p in candidates}
+    h = hashlib.sha256()
+    for rel in sorted(by_rel):
+        p = by_rel[rel]
+        h.update(rel.encode("utf-8") + b"\0")
+        with p.open("rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                h.update(block)
+        h.update(b"\0")
+    tvm_head = _git_head_pure(src_root / "3rdparty" / "tvm")
+    h.update(b"submodule:3rdparty/tvm\0" + tvm_head.encode("utf-8") + b"\0")
+    return h.hexdigest()
+
+
+def tilelang_reuse_identity(values: dict[str, str]) -> dict[str, str] | None:
+    """Validate and bind the reused TileLang checkout built by tilelang-npu."""
+    raw_src = (values.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or "").strip()
+    raw_bld = (values.get("TILEFOUNDRY_NPU_TILELANG_BUILD") or "").strip()
+    if not raw_src and not raw_bld:
+        return None
+    if raw_bld and not raw_src:
+        raise BridgeError("TILEFOUNDRY_NPU_TILELANG_BUILD requires TILEFOUNDRY_NPU_TILELANG_SOURCE")
+    src_path = Path(raw_src)
+    if not src_path.is_absolute():
+        raise BridgeError(f"TILEFOUNDRY_NPU_TILELANG_SOURCE must be an absolute path: {raw_src!r}")
+    if not src_path.is_dir():
+        raise BridgeError(f"TILEFOUNDRY_NPU_TILELANG_SOURCE does not exist: {src_path}")
+    src = src_path.resolve()
+
+    if raw_bld:
+        bld_path = Path(raw_bld)
+        if not bld_path.is_absolute():
+            raise BridgeError(f"TILEFOUNDRY_NPU_TILELANG_BUILD must be an absolute path: {raw_bld!r}")
+        bld = bld_path.resolve()
+    else:
+        bld = (src / "build").resolve()
+
+    expected_bld = (src / "build").resolve()
+    if bld != expected_bld:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_TILELANG_BUILD must match {expected_bld} (got {bld}) because "
+            "TileLang DEV imports always load native artifacts from <source>/build"
+        )
+    if not bld.is_dir():
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_TILELANG_BUILD does not exist: {bld}; "
+            "run tilelang-npu (gate tilelang-npu-build) first — tilefoundry-npu reuses TileLang and never rebuilds it"
+        )
+
+    tl_init = src / "tilelang" / "__init__.py"
+    tvm_init = src / "3rdparty" / "tvm" / "python" / "tvm" / "__init__.py"
+    if not tl_init.is_file():
+        raise BridgeError(f"TILEFOUNDRY_NPU_TILELANG_SOURCE missing tilelang/__init__.py: {src}")
+    if not tvm_init.is_file():
+        raise BridgeError(f"TILEFOUNDRY_NPU_TILELANG_SOURCE missing 3rdparty/tvm/python/tvm/__init__.py: {src}")
+
+    lib_path = bld / "lib" / "libtilelang.so"
+    if not lib_path.is_file() or lib_path.stat().st_size <= (1 << 20) or not (bld / "tvm").is_dir():
+        raise BridgeError(
+            f"reused TileLang build at {bld} is missing libtilelang.so or tvm/; "
+            "run tilelang-npu (gate tilelang-npu-build) first — tilefoundry-npu reuses TileLang and never rebuilds it"
+        )
+    missing_sabi = [
+        f"{ext}.abi3.so"
+        for ext in TILELANG_SABI_EXTENSIONS
+        if not (bld / "lib" / f"{ext}.abi3.so").is_file()
+    ]
+    if missing_sabi:
+        raise BridgeError(
+            f"reused TileLang build at {bld} is missing cp39-abi3 extension(s) ({', '.join(missing_sabi)}); "
+            "run tilelang-npu (gate tilelang-npu-build) first — tilefoundry-npu reuses TileLang and never rebuilds it"
+        )
+
+    native_sha = _tilelang_native_inputs_sha256(src)
+    stamp_file = bld / TILELANG_BUILD_STAMP_FILE
+    if not stamp_file.is_file():
+        raise BridgeError(
+            f"reused TileLang build at {bld} is missing {TILELANG_BUILD_STAMP_FILE}; "
+            "run tilelang-npu (gate tilelang-npu-build) first — tilefoundry-npu reuses TileLang and never rebuilds it"
+        )
+    try:
+        stamp = json.loads(stamp_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BridgeError(f"cannot read {stamp_file}: {exc}") from exc
+    if not isinstance(stamp, dict) or stamp.get("nativeInputsSha256") != native_sha:
+        raise BridgeError(
+            f"TileLang native/Cython sources in {src} changed since {bld} was built; "
+            "run tilelang-npu (gate tilelang-npu-build) first — tilefoundry-npu reuses TileLang and never rebuilds it"
+        )
+
+    return {
+        "source": str(src),
+        "build": str(bld),
+        "gitHead": _git_head_pure(src),
+        "moduleSha256": _sha256_file(tl_init),
+        "libtilelangSha256": _sha256_file(lib_path),
+        "nativeInputsSha256": native_sha,
+    }
+
+
+def _effective_pythonpath(tl_identity: dict[str, str] | None) -> str:
+    if tl_identity is None:
+        return DEFAULT_PYTHONPATH
+    return f"{tl_identity['source']}:{DEFAULT_PYTHONPATH}"
+
+
 def device_id() -> str | None:
     raw = os.environ.get("TILEFOUNDRY_NPU_DEVICE_ID")
     if raw is None:
@@ -781,6 +1007,7 @@ def check_config(*, check_device: bool = False, check_cannbench: bool = False) -
         for rel in device_tests(values):
             if not (source / rel).exists():
                 raise BridgeError(f"device test path missing in {source}: {rel}")
+        tilelang_reuse_identity(values)
         if check_cannbench:
             repo = cannbench_repo(values)
             work_root(values, source, repo)
@@ -801,6 +1028,7 @@ def check_config(*, check_device: bool = False, check_cannbench: bool = False) -
 
 def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
+    tl_identity = tilelang_reuse_identity(values)
     tests = cpu_tests(values)
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
@@ -815,7 +1043,9 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
         run_env["PYTHONDONTWRITEBYTECODE"] = "1"
         run_env["TILELANG_DISABLE_CACHE"] = "1"
-        run_env["PYTHONPATH"] = DEFAULT_PYTHONPATH
+        run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
+        if tl_identity is not None:
+            run_env.setdefault("USE_CUDA", "0")
         # CPU suite deliberately does NOT source CANN set_env.sh because
         # CANN's native libraries collide with ortools CP-SAT in this env.
         cmd = " ".join(
@@ -838,13 +1068,19 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             if exc.stderr:
                 sys.stderr.write(str(exc.stderr)[-4000:])
             print(f"{PROG}: CPU pytest timed out after {timeout}s", file=sys.stderr)
-            return 1, _cpu_observations(False, 0, 0, 0, 0)
+            timeout_obs = _cpu_observations(False, 0, 0, 0, 0)
+            if tl_identity is not None:
+                timeout_obs["tilelang"] = tl_identity
+            return 1, timeout_obs
 
         counts = _junit_counts(report)
         if counts is None:
             sys.stderr.write((completed.stderr or completed.stdout)[-4000:])
             print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
-            return 1, _cpu_observations(False, 0, 0, 0, 0)
+            missing_obs = _cpu_observations(False, 0, 0, 0, 0)
+            if tl_identity is not None:
+                missing_obs["tilelang"] = tl_identity
+            return 1, missing_obs
 
         succeeded = (
             completed.returncode == 0
@@ -859,6 +1095,8 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             counts["failed"],
             counts["skipped"],
         )
+        if tl_identity is not None:
+            obs["tilelang"] = tl_identity
         if not succeeded:
             sys.stderr.write((completed.stdout + "\n" + completed.stderr)[-4000:])
         return (0 if succeeded else 1), obs
@@ -866,6 +1104,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
 
 def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
+    tl_identity = tilelang_reuse_identity(values)
     device = require_device()
     cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
@@ -884,7 +1123,10 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
             run_env["PYTHONDONTWRITEBYTECODE"] = "1"
             run_env["TILELANG_DISABLE_CACHE"] = "1"
-            run_env["PYTHONPATH"] = DEFAULT_PYTHONPATH
+            run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
+            if tl_identity is not None:
+                run_env.setdefault("USE_CUDA", "0")
+                run_env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
 
             cmd = f"{shlex.quote(str(python))} {shlex.quote(str(probe_path))}"
             if extra_tests:
@@ -908,7 +1150,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                 if exc.stderr:
                     sys.stderr.write(str(exc.stderr)[-4000:])
                 print(f"{PROG}: device probe timed out after {timeout}s", file=sys.stderr)
-                return 1, {
+                timeout_obs = {
                     "exitCodeZero": False,
                     "tilefoundryImported": False,
                     "npuAvailable": False,
@@ -924,13 +1166,18 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                     "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
                     "deviceWindow": win,
                 }
+                if tl_identity is not None:
+                    timeout_obs["tilelangReused"] = False
+                    timeout_obs["tilelang"] = tl_identity
+                return 1, timeout_obs
 
         occ, win = finalize_window()
         if completed.stderr.strip():
             sys.stderr.write(completed.stderr[-4000:])
 
         parsed = _extract_last_json(completed.stdout, "npuAvailable")
-        ok = completed.returncode == 0 and bool(parsed) and all(
+        tilelang_reused_ok = True if tl_identity is None else (parsed.get("tilelangReused") is True)
+        ok = completed.returncode == 0 and bool(parsed) and tilelang_reused_ok and all(
             parsed.get(k) is True
             for k in (
                 "tilefoundryImported",
@@ -963,11 +1210,16 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
             "deviceWindow": win,
         }
+        if tl_identity is not None:
+            obs["tilelangReused"] = bool(parsed.get("tilelangReused", False))
+            obs["tilelangVersion"] = str(parsed.get("tilelangVersion", ""))
+            obs["tilelang"] = tl_identity
         return (0 if ok else (completed.returncode or 1)), obs
 
 
 def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
+    tl_identity = tilelang_reuse_identity(values)
     device = require_device()
     repo = cannbench_repo(values)
     wroot = work_root(values, source, repo)
@@ -1109,7 +1361,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
         ok = probed.returncode == 0 and ext_so.is_file() and callable_ok
         if not ok:
             sys.stderr.write((probed.stdout or "")[-4000:])
-        return (0 if ok else (probed.returncode or 1)), {
+        obs = {
             "exitCodeZero": ok,
             "depsReady": True,
             "cannBenchUtilsPresent": ext_so.is_file(),
@@ -1126,10 +1378,14 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
             "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
             "deviceWindow": win,
         }
+        if tl_identity is not None:
+            obs["tilelang"] = tl_identity
+        return (0 if ok else (probed.returncode or 1)), obs
 
 
 def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
+    tl_identity = tilelang_reuse_identity(values)
     device = require_device()
     repo = cannbench_repo(values)
     wroot = work_root(values, source, repo)
@@ -1162,6 +1418,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         "device": device,
         "per_op_timeout": int(max(60.0, timeout - warmup_seconds - 60.0)),
         "pythonpath_parts": list(DEFAULT_PYTHONPATH_PARTS),
+        "tilelang_source": tl_identity["source"] if tl_identity else "",
         "targets": [{"task": t, "candidate": c} for t, c in targets],
     }
 
@@ -1195,7 +1452,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                 occ, win = finalize_window()
                 if exc.stderr:
                     sys.stderr.write(str(exc.stderr)[-4000:])
-                return 1, {
+                timeout_obs = {
                     "exitCodeZero": False,
                     "officialReportValid": False,
                     "allCasesPassed": False,
@@ -1213,6 +1470,9 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                     "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
                     "deviceWindow": win,
                 }
+                if tl_identity is not None:
+                    timeout_obs["tilelang"] = tl_identity
+                return 1, timeout_obs
 
         occ, win = finalize_window()
         if completed.stderr.strip():
@@ -1243,6 +1503,8 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
             "deviceWindow": win,
         }
+        if tl_identity is not None:
+            obs["tilelang"] = tl_identity
         return (0 if ok else (completed.returncode or 1)), obs
 
 

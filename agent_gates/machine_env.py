@@ -167,13 +167,17 @@ TILELANG_NPU_KEYS = (
 
 # TileFoundry host adapter: CANN 9.3.0 + conda tilefoundry-npu env; CPU tests
 # run without CANN sourced (to avoid ortools/CANN native library collision)
-# and device tests run windowed on the card under CANN + torch_npu.
+# and device tests run windowed on the card under CANN + torch_npu. Optional
+# TILEFOUNDRY_NPU_TILELANG_{SOURCE,BUILD} keys reuse a tilelang-npu checkout
+# build (never rebuilding TileLang locally).
 TILEFOUNDRY_NPU_KEYS = (
     'TILEFOUNDRY_NPU_CANN_SETUP',
     'TILEFOUNDRY_NPU_CONDA_SH',
     'TILEFOUNDRY_NPU_CONDA_ENV',
     'TILEFOUNDRY_NPU_CONDA_ENVS_PATH',
     'TILEFOUNDRY_NPU_PYTHON',
+    'TILEFOUNDRY_NPU_TILELANG_SOURCE',
+    'TILEFOUNDRY_NPU_TILELANG_BUILD',
     'TILEFOUNDRY_NPU_CPU_TESTS',
     'TILEFOUNDRY_NPU_DEVICE_TESTS',
     'TILEFOUNDRY_NPU_BUILD_SUBDIR',

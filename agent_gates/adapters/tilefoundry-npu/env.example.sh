@@ -46,6 +46,24 @@ TILEFOUNDRY_NPU_CONDA_ENVS_PATH=
 TILEFOUNDRY_NPU_PYTHON=
 
 # ---------------------------------------------------------------------------
+# Reused TileLang checkout build (built by `tilelang-npu`, never rebuilt here)
+# ---------------------------------------------------------------------------
+# Optional: absolute host paths to the shared TileLang checkout and its `build`
+# directory compiled by `tilelang-npu` (`tilelang-npu-build` produces cp39-abi3
+# `.abi3.so` extensions and `.agent_gates_build_stamp.json`).
+# When set:
+#   * `TILEFOUNDRY_NPU_TILELANG_SOURCE` is prepended to `PYTHONPATH` ahead of
+#     `site-packages` so TileFoundry runs against the live built checkout.
+#   * `TILEFOUNDRY_NPU_TILELANG_BUILD` must resolve to `<TILELANG_SOURCE>/build`
+#     (leave empty to default to `<TILELANG_SOURCE>/build`).
+#   * `--check-config` / `doctor` and all gates verify `libtilelang.so`, all four
+#     `*.abi3.so` extensions, and `.agent_gates_build_stamp.json`; if upstream
+#     native/Cython sources changed after build, this adapter fails closed with
+#     `BLOCKED_ENV` (exit 75) instead of rebuilding TileLang itself.
+TILEFOUNDRY_NPU_TILELANG_SOURCE=
+TILEFOUNDRY_NPU_TILELANG_BUILD=
+
+# ---------------------------------------------------------------------------
 # Test selection — CPU and NPU pytest targets
 # ---------------------------------------------------------------------------
 # Optional: comma- or whitespace-separated list of RELATIVE pytest file or directory
