@@ -2,6 +2,8 @@
 """Host-local TileFoundry CPU, Ascend NPU, and CANNBench verification gates."""
 from __future__ import annotations
 
+import ast
+import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -16,7 +18,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
@@ -42,6 +47,13 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CANNBENCH_ARCH",
     "TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE",
     "TILEFOUNDRY_NPU_CANNBENCH_TARGETS",
+    "TILEFOUNDRY_NPU_CANNBENCH_MCP_URL",
+    "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN",
+    "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE",
+    "TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION",
+    "TILEFOUNDRY_NPU_CANNBENCH_POOL_ID",
+    "TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN",
+    "TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT",
     "TILEFOUNDRY_NPU_LLM_BACKEND",
     "TILEFOUNDRY_NPU_AGY_BIN",
     "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
@@ -69,6 +81,7 @@ OPTIONAL_FORWARDED_KEYS = (
 )
 
 OPTIONAL_ABS_PATH_KEYS = (
+    "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE",
     "TILEFOUNDRY_NPU_AGY_BIN",
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
@@ -114,6 +127,9 @@ DEFAULT_CPU_TIMEOUT = 600.0
 DEFAULT_DEVICE_TIMEOUT = 600.0
 DEFAULT_PREP_TIMEOUT = 840.0
 DEFAULT_CANNBENCH_TIMEOUT = 3300.0
+DEFAULT_REMOTE_TIMEOUT = 840.0
+DEFAULT_CANNBENCH_MCP_URL = "https://cannbench.com/mcp"
+MCP_CONSENT_VERSION_RE = re.compile(r"v[1-9][0-9]*")
 
 DEVICE_PROBE = r"""
 import json, os, pathlib, sys, torch, torch_npu
@@ -246,7 +262,7 @@ repo = pathlib.Path(cfg["repo"])
 source = pathlib.Path(cfg["source"])
 utils_dir = pathlib.Path(cfg["utils_dir"])
 reports_root = pathlib.Path(cfg["reports_root"])
-vendor = repo / "vendor" / "cannbench"
+bench_src = repo / "src"
 per_op_timeout = max(60, int(cfg.get("per_op_timeout", 3300)))
 tf_paths = [str((source / p).resolve()) for p in cfg["pythonpath_parts"] if (source / p).exists()]
 
@@ -264,7 +280,7 @@ total_timed = 0
 for index, item in enumerate(cfg["targets"]):
     task = item["task"]
     candidate_rel = item["candidate"]
-    task_dir = repo / "operators" / task
+    task_dir = repo / "tasks" / task
     candidate = (source / candidate_rel).resolve()
 
     suffix = f"{stamp}_{task.replace('/', '__')}"
@@ -290,7 +306,7 @@ for index, item in enumerate(cfg["targets"]):
         staged_task.mkdir(parents=True)
         for fname in ("golden.py", "cases.yaml", "proto.yaml"):
             shutil.copy2(task_dir / fname, staged_task / fname)
-        shutil.copytree(repo / "operators" / "metadata", stage / "tasks" / "metadata")
+        shutil.copytree(repo / "tasks" / "metadata", stage / "tasks" / "metadata")
         pkg = stage / "submission" / "cann_bench"
         pkg.mkdir(parents=True)
         shutil.copy2(candidate, pkg / "candidate.py")
@@ -302,7 +318,7 @@ for index, item in enumerate(cfg["targets"]):
         tl_src = (cfg.get("tilelang_source") or "").strip()
         if tl_src:
             env.setdefault("USE_CUDA", "0")
-        pp_entries = [str(stage / "submission"), str(utils_dir), str(vendor / "src")]
+        pp_entries = [str(stage / "submission"), str(utils_dir), str(bench_src)]
         if tl_src:
             pp_entries.append(tl_src)
         pp_entries.extend(tf_paths)
@@ -312,6 +328,7 @@ for index, item in enumerate(cfg["targets"]):
 
         cmd = [
             sys.executable, "-m", "kernel_eval.staged_eval",
+            "--bench-name", "cann",
             "--task-dir", str(staged_task),
             "--operator", schema["name"],
             "--device-id", "0",
@@ -325,7 +342,7 @@ for index, item in enumerate(cfg["targets"]):
             "--eval-code", "official",
         ]
         print(f"=== CANNBench running {task} ({candidate_rel}) -> {report_dir} ===", file=sys.stderr, flush=True)
-        rc = subprocess.call(cmd, cwd=str(vendor), env=env, stdout=sys.stderr, stderr=sys.stderr)
+        rc = subprocess.call(cmd, cwd=str(repo), env=env, stdout=sys.stderr, stderr=sys.stderr)
 
     final_path = report_dir / "official_final.json"
     count = passed = timed = 0
@@ -516,10 +533,10 @@ def cannbench_repo(values: dict[str, str]) -> Path:
         raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_REPO must be an absolute path: {raw!r}")
     resolved = path.resolve()
     required_paths = (
-        resolved / "tools" / "run_cannbench.py",
-        resolved / "vendor" / "cannbench" / "src" / "kernel_eval",
-        resolved / "vendor" / "cannbench" / "src" / "cann_bench_utils" / "CMakeLists.txt",
-        resolved / "operators" / "metadata",
+        resolved / "scripts" / "run_evaluation.sh",
+        resolved / "src" / "kernel_eval",
+        resolved / "src" / "cann_bench_utils" / "CMakeLists.txt",
+        resolved / "tasks" / "metadata",
     )
     for req in required_paths:
         if not req.exists():
@@ -562,7 +579,7 @@ def _validate_target_pair(task: str, candidate_rel: str, source: Path, repo: Pat
     candidate_rel = candidate_rel.strip()
     if not TASK_RE.fullmatch(task):
         raise BridgeError(f"invalid CANNBench task {task!r}; expected levelN/operator_name")
-    task_dir = repo / "operators" / task
+    task_dir = repo / "tasks" / task
     for fname in ("proto.yaml", "cases.yaml", "golden.py"):
         if not (task_dir / fname).is_file():
             raise BridgeError(f"CANNBench operator {task!r} missing {fname} in {repo}")
@@ -622,7 +639,7 @@ def resolve_cannbench_targets(
 
 
 def _utils_source_digest(repo: Path) -> str:
-    src_root = (repo / "vendor" / "cannbench" / "src" / "cann_bench_utils").resolve()
+    src_root = (repo / "src" / "cann_bench_utils").resolve()
     h = hashlib.sha256()
     files = sorted(p for p in src_root.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
     for path in files:
@@ -1036,7 +1053,12 @@ def _validate_optional_agent_keys(values: dict[str, str]) -> None:
             raise BridgeError(f"{key} must be an absolute path when set: {val!r}")
 
 
-def check_config(*, check_device: bool = False, check_cannbench: bool = False) -> int:
+def check_config(
+    *,
+    check_device: bool = False,
+    check_cannbench: bool = False,
+    check_cannbench_remote: bool = False,
+) -> int:
     try:
         values = machine_values()
         for name in REQUIRED:
@@ -1060,11 +1082,14 @@ def check_config(*, check_device: bool = False, check_cannbench: bool = False) -
             if not (source / rel).exists():
                 raise BridgeError(f"device test path missing in {source}: {rel}")
         tilelang_reuse_identity(values)
-        if check_cannbench:
+        if check_cannbench or check_cannbench_remote:
             repo = cannbench_repo(values)
             work_root(values, source, repo)
-            cannbench_arch(values)
+            if check_cannbench:
+                cannbench_arch(values)
             resolve_cannbench_targets(values, source, repo)
+        if check_cannbench_remote:
+            _resolve_mcp_config(values)
         if check_device:
             dev = device_id()
             if dev is not None:
@@ -1307,7 +1332,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
             stage_slot = Path(stage_tmp) / "slot"
             stage_utils = stage_slot / "cann_bench_utils"
             stage_slot.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(repo / "vendor" / "cannbench" / "src" / "cann_bench_utils", stage_utils)
+            shutil.copytree(repo / "src" / "cann_bench_utils", stage_utils)
             build_cmd = " && ".join([
                 " ".join([
                     "cmake", "-S", shlex.quote(str(stage_utils)),
@@ -1562,6 +1587,360 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         return (0 if ok else (completed.returncode or 1)), obs
 
 
+_BANNED_TORCH_DELEGATES = frozenset({
+    "matmul", "mm", "bmm", "conv2d", "conv3d", "linear", "softmax",
+    "layer_norm", "rms_norm", "scaled_dot_product_attention", "silu", "gelu",
+})
+
+
+def _resolve_mcp_config(values: dict[str, str]) -> dict[str, str]:
+    mcp_url = (values.get("TILEFOUNDRY_NPU_CANNBENCH_MCP_URL") or "").strip() or DEFAULT_CANNBENCH_MCP_URL
+    if not (mcp_url.startswith("https://") or mcp_url.startswith("http://")):
+        raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_MCP_URL must start with https:// or http://: {mcp_url!r}")
+
+    token = (values.get("TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN") or "").strip()
+    token_file = (values.get("TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE") or "").strip()
+    if not token and token_file:
+        tpath = Path(token_file)
+        if not tpath.is_file():
+            raise BridgeError(f"TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE does not exist: {token_file}")
+        token = tpath.read_text(encoding="utf-8").strip()
+    if not token:
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN or TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE is required for remote CANNBench submission"
+        )
+
+    consent = (values.get("TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT") or "").strip()
+    if consent and not MCP_CONSENT_VERSION_RE.fullmatch(consent):
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT must match v<N> (e.g. v1): {consent!r}"
+        )
+
+    return {
+        "mcp_url": mcp_url,
+        "token": token,
+        "benchmark_version": (values.get("TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION") or "").strip(),
+        "pool_id": (values.get("TILEFOUNDRY_NPU_CANNBENCH_POOL_ID") or "").strip(),
+        "aggregation_token": (values.get("TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN") or "").strip(),
+        "independent_env_consent": consent,
+    }
+
+
+def _parse_proto_operator(proto_path: Path) -> tuple[str, str]:
+    text = proto_path.read_text(encoding="utf-8")
+    name_m = re.search(r"^\s*name:\s*['\"]?([A-Za-z0-9_]+)['\"]?\s*$", text, re.MULTILINE)
+    schema_m = re.search(r"^\s*schema:\s*['\"]?([A-Za-z0-9_]+)\s*\(", text, re.MULTILINE)
+    if not name_m or not schema_m:
+        raise BridgeError(f"cannot parse operator name/schema from {proto_path}")
+    return name_m.group(1), schema_m.group(1)
+
+
+def _check_candidate_compliance(candidate: Path, function_name: str) -> list[str]:
+    try:
+        src = candidate.read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=str(candidate))
+    except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+        return [f"EVAL-CANN-004: invalid Python candidate ({exc})"]
+
+    violations: list[str] = []
+    exported_names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            exported_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    exported_names.add(tgt.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                exported_names.add(alias.asname or alias.name)
+    if function_name not in exported_names:
+        violations.append(f"EVAL-CANN-005: missing callable {function_name!r} in {candidate.name}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if attr == "cpu" and not node.args and not node.keywords:
+                violations.append("SUB-BEH-004: .cpu() call detected (CPU fallback forbidden)")
+            elif attr == "data_ptr":
+                violations.append("SUB-BEH-005: data_ptr() call detected (pointer caching forbidden)")
+            elif attr in _BANNED_TORCH_DELEGATES:
+                owner = node.func.value
+                if isinstance(owner, ast.Name) and owner.id in {"F", "torch"}:
+                    violations.append(f"SUB-BEH-001: {owner.id}.{attr}() delegation forbidden")
+                elif isinstance(owner, ast.Attribute) and owner.attr in {"functional", "aten"}:
+                    violations.append(f"SUB-BEH-001: *.{owner.attr}.{attr}() delegation forbidden")
+    return violations
+
+
+def _build_remote_submission_zip(
+    candidate: Path, op_name: str, func_name: str, out_dir: Path
+) -> Path:
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", func_name).strip("_") or "operator"
+    pkg_root = out_dir / "pkg"
+    cann_pkg = pkg_root / "cann_bench"
+    cann_pkg.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(candidate, cann_pkg / f"{slug}.py")
+    (cann_pkg / "__init__.py").write_text(
+        f"from .{slug} import {func_name}\n\n__all__ = [{func_name!r}]\n",
+        encoding="utf-8",
+    )
+    (pkg_root / "setup.py").write_text(
+        "from setuptools import find_packages, setup\n\n"
+        "setup(name='cann_bench', version='1.0.0', packages=find_packages())\n",
+        encoding="utf-8",
+    )
+    build_sh = pkg_root / "build.sh"
+    build_sh.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "python3 -m pip wheel --no-deps --no-build-isolation -w dist .\n",
+        encoding="utf-8",
+    )
+    build_sh.chmod(0o755)
+
+    zip_path = out_dir / f"{slug}_submission.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(p for p in pkg_root.rglob("*") if p.is_file()):
+            rel = file_path.relative_to(pkg_root).as_posix()
+            zf.write(file_path, arcname=rel)
+    return zip_path
+
+
+def _parse_mcp_response(raw_body: str, content_type: str) -> dict:
+    if "text/event-stream" in content_type:
+        last_payload: dict | None = None
+        for line in raw_body.splitlines():
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data and data != "[DONE]":
+                    last_payload = json.loads(data)
+        if last_payload is None:
+            raise BridgeError("empty SSE response from BenchSite MCP server")
+        return last_payload
+    return json.loads(raw_body)
+
+
+def _mcp_http_post(
+    url: str,
+    token: str,
+    payload: dict,
+    *,
+    session_id: str = "",
+    timeout: float = 30.0,
+) -> tuple[dict, str]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            ctype = resp.headers.get("Content-Type", "")
+            next_sid = resp.headers.get("Mcp-Session-Id", session_id)
+            if not body.strip():
+                return {}, next_sid
+            return _parse_mcp_response(body, ctype), next_sid
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise BridgeError(f"BenchSite MCP HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise BridgeError(f"BenchSite MCP request failed: {exc}") from exc
+
+
+def _extract_mcp_tool_json(resp: dict) -> dict:
+    if "error" in resp:
+        raise BridgeError(f"BenchSite MCP JSON-RPC error: {resp['error']}")
+    result = resp.get("result") or {}
+    if result.get("isError"):
+        raise BridgeError(f"BenchSite MCP tool error: {result}")
+    if isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    for item in result.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text = (item.get("text") or "").strip()
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except ValueError:
+                return {"message": text}
+    return dict(result)
+
+
+def _mcp_submit_kernel(
+    mcp_cfg: dict[str, str],
+    *,
+    task: str,
+    op_name: str,
+    zip_path: Path,
+    timeout: float,
+) -> dict:
+    url = mcp_cfg["mcp_url"]
+    token = mcp_cfg["token"]
+    init_resp, sid = _mcp_http_post(
+        url,
+        token,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "tilefoundry-npu-adapter", "version": "1.0.0"},
+            },
+        },
+        timeout=min(timeout, 30.0),
+    )
+    if "error" in init_resp:
+        raise BridgeError(f"BenchSite MCP initialize failed: {init_resp['error']}")
+    _mcp_http_post(
+        url,
+        token,
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        session_id=sid,
+        timeout=min(timeout, 15.0),
+    )
+
+    submit_args: dict[str, object] = {
+        "task": task,
+        "operator": op_name,
+        "filename": zip_path.name,
+        "archive_base64": base64.b64encode(zip_path.read_bytes()).decode("ascii"),
+    }
+    if mcp_cfg["benchmark_version"]:
+        submit_args["benchmark_version"] = mcp_cfg["benchmark_version"]
+    if mcp_cfg["pool_id"]:
+        submit_args["requested_pool_id"] = mcp_cfg["pool_id"]
+    if mcp_cfg["independent_env_consent"]:
+        submit_args["independent_environment_consent_version"] = mcp_cfg["independent_env_consent"]
+
+    call_resp, _ = _mcp_http_post(
+        url,
+        token,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "submit_kernel", "arguments": submit_args},
+        },
+        session_id=sid,
+        timeout=timeout,
+    )
+    return _extract_mcp_tool_json(call_resp)
+
+
+def run_cannbench_remote(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+    source = _source_root()
+    repo = cannbench_repo(values)
+    wroot = work_root(values, source, repo)
+    targets_source, targets = resolve_cannbench_targets(values, source, repo)
+    mcp_cfg = _resolve_mcp_config(values)
+
+    submissions_root = wroot / "submissions"
+    submissions_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    all_compliant = True
+    all_archives_valid = True
+    all_submitted = True
+    results = []
+
+    for index, (task, candidate_rel) in enumerate(targets):
+        op_name, func_name = _parse_proto_operator(repo / "tasks" / task / "proto.yaml")
+        candidate = (source / candidate_rel).resolve()
+        violations = _check_candidate_compliance(candidate, func_name)
+
+        sub_dir = submissions_root / f"{stamp}_{task.replace('/', '__')}_{index}"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = _build_remote_submission_zip(candidate, op_name, func_name, sub_dir)
+        archive_valid = zip_path.is_file() and zip_path.stat().st_size > 0
+
+        if violations:
+            all_compliant = False
+            all_submitted = False
+            results.append({
+                "task": task,
+                "operator": op_name,
+                "candidate": candidate_rel,
+                "archivePath": str(zip_path),
+                "archiveValid": archive_valid,
+                "compliant": False,
+                "violations": violations,
+                "submitted": False,
+                "submissionId": "",
+                "status": "compliance_failed",
+            })
+            continue
+
+        if not archive_valid:
+            all_archives_valid = False
+            all_submitted = False
+            results.append({
+                "task": task,
+                "operator": op_name,
+                "candidate": candidate_rel,
+                "archivePath": str(zip_path),
+                "archiveValid": False,
+                "compliant": True,
+                "violations": [],
+                "submitted": False,
+                "submissionId": "",
+                "status": "archive_failed",
+            })
+            continue
+
+        receipt = _mcp_submit_kernel(
+            mcp_cfg,
+            task=task,
+            op_name=op_name,
+            zip_path=zip_path,
+            timeout=max(30.0, timeout / max(1, len(targets))),
+        )
+        (sub_dir / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+        sub_id = str(receipt.get("submission_id") or receipt.get("id") or "")
+        status = str(receipt.get("status") or "submitted")
+        submitted = bool(sub_id or status)
+        if not submitted:
+            all_submitted = False
+        results.append({
+            "task": task,
+            "operator": op_name,
+            "candidate": candidate_rel,
+            "archivePath": str(zip_path),
+            "archiveValid": True,
+            "compliant": True,
+            "violations": [],
+            "submitted": submitted,
+            "submissionId": sub_id,
+            "status": status,
+            "benchmarkVersion": mcp_cfg["benchmark_version"] or str(receipt.get("benchmark_version") or ""),
+            "poolId": mcp_cfg["pool_id"] or str(receipt.get("pool_id") or ""),
+        })
+
+    ok = all_compliant and all_archives_valid and all_submitted and bool(results)
+    obs = {
+        "exitCodeZero": ok,
+        "compliancePassed": all_compliant,
+        "archiveValid": all_archives_valid,
+        "mcpSubmitted": all_submitted and bool(results),
+        "targetCount": len(targets),
+        "targetsSource": targets_source,
+        "mcpUrl": mcp_cfg["mcp_url"],
+        "results": results,
+    }
+    return (0 if ok else 1), obs
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     timeout = None
@@ -1579,6 +1958,8 @@ def main(argv: list[str] | None = None) -> int:
         return check_config(check_device=True)
     if args == ["--check-config-cannbench"]:
         return check_config(check_device=True, check_cannbench=True)
+    if args == ["--check-config-cannbench-remote"]:
+        return check_config(check_device=False, check_cannbench_remote=True)
 
     try:
         values = machine_values()
@@ -1610,11 +1991,18 @@ def main(argv: list[str] | None = None) -> int:
             _die(75, str(exc))
         print(json.dumps(obs, sort_keys=True))
         return rc
+    if args == ["--cannbench-remote"]:
+        try:
+            rc, obs = run_cannbench_remote(values, DEFAULT_REMOTE_TIMEOUT if timeout is None else timeout)
+        except BridgeError as exc:
+            _die(75, str(exc))
+        print(json.dumps(obs, sort_keys=True))
+        return rc
 
     _die(
         2,
-        f"usage: {PROG} (--cpu | --device | --cannbench-prep | --cannbench | "
-        "--check-config | --check-config-device | --check-config-cannbench) [--timeout SECONDS]",
+        f"usage: {PROG} (--cpu | --device | --cannbench-prep | --cannbench | --cannbench-remote | "
+        "--check-config | --check-config-device | --check-config-cannbench | --check-config-cannbench-remote) [--timeout SECONDS]",
     )
     return 2
 

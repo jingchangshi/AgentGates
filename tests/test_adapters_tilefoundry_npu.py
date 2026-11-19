@@ -45,6 +45,7 @@ class ManifestAndParityCase(unittest.TestCase):
         dev_recipe = manifest.resolve_recipe("tilefoundry-npu.device", manifest.root)
         prep_recipe = manifest.resolve_recipe("tilefoundry-npu.cannbench-prep", manifest.root)
         bench_recipe = manifest.resolve_recipe("tilefoundry-npu.cannbench", manifest.root)
+        remote_recipe = manifest.resolve_recipe("tilefoundry-npu.cannbench-remote", manifest.root)
         self.assertFalse(cpu_recipe.uses_device)
         self.assertIsNone(cpu_recipe.device_window)
         self.assertTrue(dev_recipe.uses_device)
@@ -53,6 +54,8 @@ class ManifestAndParityCase(unittest.TestCase):
         self.assertEqual(prep_recipe.device_window, 60.0)
         self.assertTrue(bench_recipe.uses_device)
         self.assertEqual(bench_recipe.device_window, 60.0)
+        self.assertFalse(remote_recipe.uses_device)
+        self.assertIsNone(remote_recipe.device_window)
 
     def test_key_and_engine_wiring_parity(self):
         self.assertEqual(tuple(sorted(GATE.TOOLCHAIN_KEYS)), tuple(sorted(machine_env.TILEFOUNDRY_NPU_KEYS)))
@@ -184,20 +187,20 @@ class CannbenchIntegrationCase(unittest.TestCase):
             (self.src / sub).mkdir(parents=True)
         (self.src / "examples/ascend950pr_ops/attention_residual/kernels.py").write_text("# candidate\n", encoding="utf-8")
 
-        self.repo = self.root / "cannbot-ops"
+        self.repo = self.root / "cann-bench"
         for sub in (
-            "tools",
-            "vendor/cannbench/src/kernel_eval",
-            "vendor/cannbench/src/cann_bench_utils",
-            "operators/metadata",
-            "operators/level4/attention_residual",
+            "scripts",
+            "src/kernel_eval",
+            "src/cann_bench_utils",
+            "tasks/metadata",
+            "tasks/level4/attention_residual",
         ):
             (self.repo / sub).mkdir(parents=True)
-        (self.repo / "tools/run_cannbench.py").write_text("# runner\n", encoding="utf-8")
-        (self.repo / "vendor/cannbench/src/cann_bench_utils/CMakeLists.txt").write_text("# cmake\n", encoding="utf-8")
-        (self.repo / "vendor/cannbench/src/cann_bench_utils/ext.cpp").write_text("// ext\n", encoding="utf-8")
+        (self.repo / "scripts/run_evaluation.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.repo / "src/cann_bench_utils/CMakeLists.txt").write_text("# cmake\n", encoding="utf-8")
+        (self.repo / "src/cann_bench_utils/ext.cpp").write_text("// ext\n", encoding="utf-8")
         for fname in ("proto.yaml", "cases.yaml", "golden.py"):
-            (self.repo / "operators/level4/attention_residual" / fname).write_text(f"# {fname}\n", encoding="utf-8")
+            (self.repo / "tasks/level4/attention_residual" / fname).write_text(f"# {fname}\n", encoding="utf-8")
 
         self.work_root = self.root / "tf-work"
         self.cann = self.root / "set_env.sh"
@@ -235,9 +238,9 @@ class CannbenchIntegrationCase(unittest.TestCase):
         )
 
         # In-repo cannbench_targets.json overrides env.sh fallback cleanly.
-        (self.repo / "operators/level4/mla").mkdir(parents=True)
+        (self.repo / "tasks/level4/mla").mkdir(parents=True)
         for fname in ("proto.yaml", "cases.yaml", "golden.py"):
-            (self.repo / "operators/level4/mla" / fname).write_text(f"# {fname}\n", encoding="utf-8")
+            (self.repo / "tasks/level4/mla" / fname).write_text(f"# {fname}\n", encoding="utf-8")
         (self.src / "examples/ascend950pr_ops/mla").mkdir(parents=True)
         (self.src / "examples/ascend950pr_ops/mla/kernels.py").write_text("# mla\n", encoding="utf-8")
         (self.src / "examples/ascend950pr_ops/cannbench_targets.json").write_text(
@@ -367,19 +370,19 @@ class TilelangReuseCase(unittest.TestCase):
             (self.src / sub).mkdir(parents=True)
         (self.src / "examples/ascend950pr_ops/attention_residual/kernels.py").write_text("# candidate\n", encoding="utf-8")
 
-        self.repo = self.root / "cannbot-ops"
+        self.repo = self.root / "cann-bench"
         for sub in (
-            "tools",
-            "vendor/cannbench/src/kernel_eval",
-            "vendor/cannbench/src/cann_bench_utils",
-            "operators/metadata",
-            "operators/level4/attention_residual",
+            "scripts",
+            "src/kernel_eval",
+            "src/cann_bench_utils",
+            "tasks/metadata",
+            "tasks/level4/attention_residual",
         ):
             (self.repo / sub).mkdir(parents=True)
-        (self.repo / "tools/run_cannbench.py").write_text("# runner\n", encoding="utf-8")
-        (self.repo / "vendor/cannbench/src/cann_bench_utils/CMakeLists.txt").write_text("# cmake\n", encoding="utf-8")
+        (self.repo / "scripts/run_evaluation.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.repo / "src/cann_bench_utils/CMakeLists.txt").write_text("# cmake\n", encoding="utf-8")
         for fname in ("proto.yaml", "cases.yaml", "golden.py"):
-            (self.repo / "operators/level4/attention_residual" / fname).write_text(f"# {fname}\n", encoding="utf-8")
+            (self.repo / "tasks/level4/attention_residual" / fname).write_text(f"# {fname}\n", encoding="utf-8")
 
         self.work_root = self.root / "tf-work"
         self.tl_src = self.root / "tilelang"
@@ -670,6 +673,177 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught2:
                     GATE.main(["--check-config"])
                 self.assertEqual(caught2.exception.code, 75)
+        finally:
+            os.chdir(old_cwd)
+
+
+class CannbenchRemoteCase(unittest.TestCase):
+    """Remote CANNBench submission validates MCP rules, packages compliant ZIPs, and submits via MCP."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.src = self.root / "tf-repo"
+        for sub in (
+            "src/tilefoundry",
+            "tests/tilefoundry",
+            "tests/ascend/target",
+            "tests/ascend/ir",
+            "tests/ascend/passes",
+            "tests/ascend/operators",
+            "examples/ascend950pr_ops/attention_residual",
+        ):
+            (self.src / sub).mkdir(parents=True)
+        (self.src / "examples/ascend950pr_ops/attention_residual/kernels.py").write_text(
+            "def attention_residual(x):\n    return x\n",
+            encoding="utf-8",
+        )
+
+        self.repo = self.root / "cann-bench"
+        for sub in (
+            "scripts",
+            "src/kernel_eval",
+            "src/cann_bench_utils",
+            "tasks/metadata",
+            "tasks/level4/attention_residual",
+        ):
+            (self.repo / sub).mkdir(parents=True)
+        (self.repo / "scripts/run_evaluation.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.repo / "src/cann_bench_utils/CMakeLists.txt").write_text("# cmake\n", encoding="utf-8")
+        (self.repo / "tasks/level4/attention_residual/proto.yaml").write_text(
+            "operator:\n  name: AttentionResidual\n  schema: attention_residual(Tensor x) -> Tensor\n",
+            encoding="utf-8",
+        )
+        for fname in ("cases.yaml", "golden.py"):
+            (self.repo / "tasks/level4/attention_residual" / fname).write_text(f"# {fname}\n", encoding="utf-8")
+
+        self.work_root = self.root / "tf-work"
+        self.cann = self.root / "set_env.sh"
+        self.cann.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.conda_sh = self.root / "conda.sh"
+        self.conda_sh.write_text("conda() { :; }\n", encoding="utf-8")
+        self.py = self.root / "python3"
+        self.py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.py.chmod(0o755)
+        self.token_file = self.root / "mcp.token"
+        self.token_file.write_text("secret-bearer-token\n", encoding="utf-8")
+        self.env_file = self.root / "machine.env"
+        self.write_env()
+
+    def write_env(self, **overrides):
+        data = {
+            "TILEFOUNDRY_NPU_CANN_SETUP": str(self.cann),
+            "TILEFOUNDRY_NPU_CONDA_SH": str(self.conda_sh),
+            "TILEFOUNDRY_NPU_CONDA_ENV": "tilefoundry-npu",
+            "TILEFOUNDRY_NPU_PYTHON": str(self.py),
+            "TILEFOUNDRY_NPU_BUILD_SUBDIR": "build",
+            "TILEFOUNDRY_NPU_CANNBENCH_REPO": str(self.repo),
+            "TILEFOUNDRY_NPU_WORK_ROOT": str(self.work_root),
+            "TILEFOUNDRY_NPU_CANNBENCH_TARGETS": "level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py",
+            "TILEFOUNDRY_NPU_CANNBENCH_MCP_URL": "https://cannbench.com/mcp",
+            "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE": str(self.token_file),
+        }
+        data.update(overrides)
+        self.env_file.write_text("".join(f"{k}={v}\n" for k, v in data.items()), encoding="utf-8")
+
+    def test_check_config_cannbench_remote_requires_token_and_validates_consent(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            env = {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(GATE.main(["--check-config-cannbench-remote"]), 0)
+
+            self.write_env(TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE="", TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN="")
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    GATE.main(["--check-config-cannbench-remote"])
+                self.assertEqual(caught.exception.code, 75)
+
+            self.write_env(TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT="invalid")
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(SystemExit) as caught2:
+                    GATE.main(["--check-config-cannbench-remote"])
+                self.assertEqual(caught2.exception.code, 75)
+        finally:
+            os.chdir(old_cwd)
+
+    def test_remote_compliance_blocks_cheat_patterns_without_network_call(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            (self.src / "examples/ascend950pr_ops/attention_residual/kernels.py").write_text(
+                "import torch.nn.functional as F\ndef attention_residual(x):\n    return F.softmax(x.cpu(), dim=-1)\n",
+                encoding="utf-8",
+            )
+            values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+            with patch.object(GATE, "_mcp_http_post") as mock_post:
+                rc, obs = GATE.run_cannbench_remote(values, 60.0)
+            self.assertEqual(rc, 1)
+            self.assertFalse(obs["compliancePassed"])
+            self.assertFalse(obs["mcpSubmitted"])
+            self.assertTrue(obs["results"][0]["violations"])
+            mock_post.assert_not_called()
+        finally:
+            os.chdir(old_cwd)
+
+    def test_remote_submit_packages_zip_and_forwards_mcp_rules(self):
+        import zipfile
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            self.write_env(
+                TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION="2.1.0",
+                TILEFOUNDRY_NPU_CANNBENCH_POOL_ID="pool-950pr",
+                TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT="v1",
+            )
+            values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+            calls = []
+
+            def fake_post(url, token, payload, *, session_id="", timeout=30.0):
+                calls.append((url, token, payload, session_id))
+                method = payload.get("method")
+                if method == "initialize":
+                    return {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26"}}, "sid-123"
+                if method == "notifications/initialized":
+                    return {}, "sid-123"
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "structuredContent": {
+                            "submission_id": "sub-999",
+                            "status": "queued",
+                            "benchmark_version": "2.1.0",
+                            "pool_id": "pool-950pr",
+                        }
+                    },
+                }, "sid-123"
+
+            with patch.object(GATE, "_mcp_http_post", side_effect=fake_post):
+                rc, obs = GATE.run_cannbench_remote(values, 60.0)
+            self.assertEqual(rc, 0)
+            self.assertTrue(obs["compliancePassed"])
+            self.assertTrue(obs["archiveValid"])
+            self.assertTrue(obs["mcpSubmitted"])
+            self.assertEqual(obs["results"][0]["submissionId"], "sub-999")
+            self.assertEqual(obs["results"][0]["benchmarkVersion"], "2.1.0")
+            self.assertEqual(obs["results"][0]["poolId"], "pool-950pr")
+
+            zip_path = Path(obs["results"][0]["archivePath"])
+            self.assertTrue(zip_path.is_file())
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                names = set(zf.namelist())
+            self.assertEqual(names, {"build.sh", "setup.py", "cann_bench/__init__.py", "cann_bench/attention_residual.py"})
+
+            submit_call = calls[-1][2]["params"]
+            self.assertEqual(submit_call["name"], "submit_kernel")
+            self.assertEqual(submit_call["arguments"]["benchmark_version"], "2.1.0")
+            self.assertEqual(submit_call["arguments"]["requested_pool_id"], "pool-950pr")
+            self.assertEqual(submit_call["arguments"]["independent_environment_consent_version"], "v1")
+            self.assertEqual(calls[-1][1], "secret-bearer-token")
+            self.assertEqual(calls[-1][3], "sid-123")
         finally:
             os.chdir(old_cwd)
 

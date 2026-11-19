@@ -5,7 +5,8 @@
   "capabilities": [
     "cpu-regression",
     "device-regression",
-    "cannbench-eval"
+    "cannbench-eval",
+    "cannbench-remote"
   ],
   "skills": [],
   "permissions": {
@@ -16,7 +17,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_host_gate.py": "b33970cd76d9ec0bca93e38ae26fefbce250fc933f62e83b3ab60158b6171f46"
+    "scripts/tilefoundry_host_gate.py": "abfde16c7f08e91fce8947849666d23235be467dceccd7c0315e50d3e45438e6"
   },
   "recipes": [
     {
@@ -116,6 +117,29 @@
       "blockedExitCodes": [
         75
       ]
+    },
+    {
+      "id": "tilefoundry-npu.cannbench-remote",
+      "cwd": "source",
+      "timeout": 900,
+      "device": "none",
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--cannbench-remote",
+        "--timeout",
+        "840"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--check-config-cannbench-remote"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
     }
   ],
   "gates": [
@@ -183,6 +207,17 @@
       "dependsOn": [
         "tilefoundry-npu-cannbench-prep"
       ]
+    },
+    {
+      "id": "tilefoundry-npu-cannbench-remote",
+      "recipeId": "tilefoundry-npu.cannbench-remote",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "compliancePassed": true,
+        "archiveValid": true,
+        "mcpSubmitted": true
+      }
     }
   ]
 }

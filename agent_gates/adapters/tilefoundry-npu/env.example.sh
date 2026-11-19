@@ -100,22 +100,24 @@ TILEFOUNDRY_NPU_BUILD_SUBDIR=build
 
 # ---------------------------------------------------------------------------
 # CANNBench operator accuracy & performance gates (optional; required only for
-# `tilefoundry-npu-cannbench-prep` and `tilefoundry-npu-cannbench`)
+# `tilefoundry-npu-cannbench-prep`, `tilefoundry-npu-cannbench`, and
+# `tilefoundry-npu-cannbench-remote`)
 # ---------------------------------------------------------------------------
-# Required for CANNBench gates: absolute host path to the read-only CANNBench
-# checkout (e.g. `<user-home>/workspace/cannbot-ops`) containing
-# `tools/run_cannbench.py`, `vendor/cannbench/src/kernel_eval`,
-# `vendor/cannbench/src/cann_bench_utils`, and `operators/metadata`.
+# Required for CANNBench gates: absolute host path to the official CANNBench
+# checkout (e.g. `<user-home>/workspace/cann-bench`) containing
+# `scripts/run_evaluation.sh`, `src/kernel_eval`,
+# `src/cann_bench_utils`, and `tasks/metadata`.
 TILEFOUNDRY_NPU_CANNBENCH_REPO=
 
 # Required for CANNBench gates: isolated host work root (e.g.
 # `<user-home>/workspace/tilefoundry-cannbench-work`) placed OUTSIDE both
 # `--source` and `TILEFOUNDRY_NPU_CANNBENCH_REPO`. Stores the ABI-isolated
-# `cann_bench_utils` build (`<work-root>/cannbench-utils/...`) and persisted
-# CANNBench reports (`<work-root>/reports/...`) without colliding with bska-npu.
+# `cann_bench_utils` build (`<work-root>/cannbench-utils/...`), persisted
+# CANNBench reports (`<work-root>/reports/...`), and remote submission
+# archives/receipts (`<work-root>/submissions/...`).
 TILEFOUNDRY_NPU_WORK_ROOT=
 
-# Optional for CANNBench gates: NPU build arch for `cann_bench_utils`
+# Optional for local CANNBench gates: NPU build arch for `cann_bench_utils`
 # (`ascend950`, `ascend910b`, or `ascend910_93`). Leave empty to use `ascend950`.
 TILEFOUNDRY_NPU_CANNBENCH_ARCH=
 
@@ -130,6 +132,32 @@ TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE=
 # does not exist: comma/whitespace-separated `levelN/op:relative/candidate.py` pairs, e.g.:
 #   TILEFOUNDRY_NPU_CANNBENCH_TARGETS=level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py
 TILEFOUNDRY_NPU_CANNBENCH_TARGETS=
+
+# ---------------------------------------------------------------------------
+# Remote CANNBench submission via BenchSite MCP (https://cannbench.com/docs/mcp)
+# Required only for `tilefoundry-npu-cannbench-remote`
+# ---------------------------------------------------------------------------
+# Optional: BenchSite MCP Streamable HTTP endpoint URL (defaults to https://cannbench.com/mcp).
+TILEFOUNDRY_NPU_CANNBENCH_MCP_URL=
+
+# Required for remote submit (inline token OR token file): Bearer token for BenchSite MCP.
+TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN=
+
+# Alternative to inline token: absolute host path to a chmod-600 file containing the Bearer token.
+TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE=
+
+# Optional: explicit `benchmark_version` passed to `submit_kernel` (e.g. `1.1.2` or `2.1.0`).
+TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION=
+
+# Optional: explicit `requested_pool_id` passed to `submit_kernel` (auto-routed when empty).
+TILEFOUNDRY_NPU_CANNBENCH_POOL_ID=
+
+# Optional: `aggregation_token` for `list_runner_pools` authorization queries.
+TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN=
+
+# Optional: explicit user consent version for independent execution environments (e.g. `v1`).
+# Leave empty unless the user has explicitly consented (pool/team membership is NOT consent).
+TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT=
 
 # ---------------------------------------------------------------------------
 # Optional neuro-symbolic agent LLM & reference repo configuration
