@@ -168,6 +168,45 @@ class CheckConfigAndRunCase(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_run_cpu_isolates_user_site_and_excludes_agent_llm_keys(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            self.write_env(
+                TILEFOUNDRY_NPU_LLM_BACKEND="agy_cli",
+                TILEFOUNDRY_NPU_AGY_BIN=str(self.py),
+                TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL="custom-exploit-model",
+                TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL="custom-explore-model",
+                TILEFOUNDRY_NPU_AGY_COMMON_ARGS="--print",
+                TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY="4",
+            )
+            captured_envs = []
+
+            def fake_run_host_bash(cmd, *, cwd, env, **kwargs):
+                captured_envs.append(dict(env))
+                # Write minimal passing JUnit XML referenced by --junit-xml=...
+                for part in cmd.split():
+                    if part.startswith("--junit-xml="):
+                        xml_path = Path(part.split("=", 1)[1].strip("'\""))
+                        xml_path.write_text(
+                            '<testsuite tests="1" failures="0" errors="0" skipped="0"></testsuite>',
+                            encoding="utf-8",
+                        )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_run_host_bash):
+                rc, obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc, 0)
+            self.assertTrue(obs["exitCodeZero"])
+            self.assertEqual(len(captured_envs), 1)
+            cpu_env = captured_envs[0]
+            self.assertEqual(cpu_env.get("PYTHONNOUSERSITE"), "1")
+            for key in GATE.OPTIONAL_AGENT_LLM_KEYS:
+                self.assertNotIn(key, cpu_env)
+        finally:
+            os.chdir(old_cwd)
+
 
 class CannbenchIntegrationCase(unittest.TestCase):
     def setUp(self):
@@ -336,16 +375,24 @@ class CannbenchIntegrationCase(unittest.TestCase):
                 }],
             }
             bench_res = types.SimpleNamespace(returncode=0, stdout=json.dumps(bench_payload) + "\n", stderr="")
+            captured_bench_envs = []
+            def fake_bench_bash(cmd, *, cwd, env, **kwargs):
+                captured_bench_envs.append((cmd, dict(env)))
+                return bench_res
+
             with patch.dict(os.environ, env, clear=True), \
                     patch.object(GATE, "_inspect_conda_cannbench_env", return_value=info), \
                     patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
-                    patch.object(GATE.adapter_runtime, "run_host_bash", return_value=bench_res):
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_bench_bash):
                 rc_b, obs_b = GATE.run_cannbench(values, 60.0)
             self.assertEqual(rc_b, 0)
             self.assertTrue(obs_b["officialReportValid"])
             self.assertEqual(obs_b["score"], 81.25)
             self.assertEqual(obs_b["targetsSource"], "env-file")
             self.assertEqual(obs_b["deviceWindow"]["resource"], "npu:1")
+            self.assertEqual(captured_bench_envs[0][1].get("PYTHONNOUSERSITE"), "1")
+            self.assertIn('env["PYTHONNOUSERSITE"] = "1"', GATE.CANNBENCH_RUNNER)
+            self.assertTrue((self.work_root / ".msprof.lock").is_file())
         finally:
             os.chdir(old_cwd)
 
@@ -656,11 +703,45 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 with patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_cpu):
                     rc, _obs = GATE.run_cpu(GATE.machine_values(), 30.0)
                 self.assertEqual(rc, 0)
-                self.assertEqual(captured_env["TILEFOUNDRY_NPU_LLM_BACKEND"], "agy_cli")
-                self.assertEqual(captured_env["TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL"], "gemini-4-hydrogen-medium")
-                self.assertEqual(captured_env["TILEFOUNDRY_NPU_AGY_COMMON_ARGS"], "--print --mode plan")
+                self.assertNotIn("TILEFOUNDRY_NPU_LLM_BACKEND", captured_env)
+                self.assertNotIn("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", captured_env)
                 self.assertEqual(captured_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
                 self.assertNotIn("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", captured_env)
+
+                captured_dev_env = {}
+                probe_json = json.dumps({
+                    "tilefoundryImported": True,
+                    "npuAvailable": True,
+                    "deviceCountOne": True,
+                    "tensorOnDevice": True,
+                    "fp32VectorOk": True,
+                    "bf16MatmulOk": True,
+                    "numericalOk": True,
+                    "synchronizeOk": True,
+                    "deviceMemoryPositive": True,
+                })
+
+                def fake_dev(cmd, *, cwd, env, **kwargs):
+                    captured_dev_env.update(env)
+                    return types.SimpleNamespace(returncode=0, stdout=probe_json + "\n", stderr="")
+
+                lease = self.root / "locks" / "npu.lock"
+                dev_env = {
+                    "TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file),
+                    "TILEFOUNDRY_NPU_DEVICE_ID": "0",
+                    "AGENT_GATES_DEVICE_LEASE_PATH": str(lease),
+                    "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:0",
+                    "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "2",
+                }
+                with patch.dict(os.environ, dev_env, clear=True), \
+                        patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                        patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_dev):
+                    rc_d, _obs_d = GATE.run_device(GATE.machine_values(), 30.0)
+                self.assertEqual(rc_d, 0)
+                self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_LLM_BACKEND"], "agy_cli")
+                self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL"], "gemini-4-hydrogen-medium")
+                self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_AGY_COMMON_ARGS"], "--print --mode plan")
+                self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
 
             self.write_env(TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY="0")
             with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):

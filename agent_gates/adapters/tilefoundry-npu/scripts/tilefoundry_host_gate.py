@@ -66,19 +66,24 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
 
-OPTIONAL_FORWARDED_KEYS = (
+OPTIONAL_REPO_AND_PYTHON_KEYS = (
     "TILEFOUNDRY_NPU_PYTHON",
+    "TILEFOUNDRY_NPU_TILELANG_REPO",
+    "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
+    "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
+    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
+)
+
+OPTIONAL_AGENT_LLM_KEYS = (
     "TILEFOUNDRY_NPU_LLM_BACKEND",
     "TILEFOUNDRY_NPU_AGY_BIN",
     "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
     "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
     "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
     "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
-    "TILEFOUNDRY_NPU_TILELANG_REPO",
-    "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
-    "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
-    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
+
+OPTIONAL_FORWARDED_KEYS = OPTIONAL_REPO_AND_PYTHON_KEYS + OPTIONAL_AGENT_LLM_KEYS
 
 OPTIONAL_ABS_PATH_KEYS = (
     "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE",
@@ -315,6 +320,7 @@ for index, item in enumerate(cfg["targets"]):
         env = os.environ.copy()
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(cfg["device"])
         env["TILELANG_DISABLE_CACHE"] = "1"
+        env["PYTHONNOUSERSITE"] = "1"
         tl_src = (cfg.get("tilelang_source") or "").strip()
         if tl_src:
             env.setdefault("USE_CUDA", "0")
@@ -974,6 +980,34 @@ def _open_device_window(device: str, *, warmup_seconds: float | None = None):
         os.close(fd)
 
 
+@contextmanager
+def _open_msprof_lock(wroot: Path, *, timeout_seconds: float = 3600.0):
+    """Serialize host-wide CANN msprof profiling across concurrent NPU device runs."""
+    wroot.mkdir(parents=True, exist_ok=True)
+    lock_path = wroot / ".msprof.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BridgeError(
+                        f"host msprof lock {lock_path} did not open within {timeout_seconds}s"
+                    ) from exc
+                time.sleep(min(0.25, remaining))
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 def _extract_last_json(stdout: str, marker_key: str) -> dict:
     for line in reversed((stdout or "").splitlines()):
         cleaned = line.strip()
@@ -1017,6 +1051,7 @@ def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
         run_env["CONDA_ENVS_PATH"] = envs_path
     run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    run_env["PYTHONNOUSERSITE"] = "1"
     completed = adapter_runtime.run_host_bash(
         f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ENV_INSPECT)}",
         cwd=source,
@@ -1034,11 +1069,24 @@ def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
     return info
 
 
-def _forward_optional_env(run_env: dict[str, str], values: dict[str, str]) -> None:
-    for key in OPTIONAL_FORWARDED_KEYS:
+def _forward_optional_env(
+    run_env: dict[str, str],
+    values: dict[str, str],
+    *,
+    include_agent_llm: bool = True,
+) -> None:
+    keys = (
+        OPTIONAL_FORWARDED_KEYS
+        if include_agent_llm
+        else OPTIONAL_REPO_AND_PYTHON_KEYS
+    )
+    for key in keys:
         val = (values.get(key) or "").strip()
         if val:
             run_env[key] = val
+    if not include_agent_llm:
+        for key in OPTIONAL_AGENT_LLM_KEYS:
+            run_env.pop(key, None)
 
 
 def _validate_optional_agent_keys(values: dict[str, str]) -> None:
@@ -1117,9 +1165,10 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
         if envs_path:
             run_env["CONDA_ENVS_PATH"] = envs_path
-        _forward_optional_env(run_env, values)
+        _forward_optional_env(run_env, values, include_agent_llm=False)
         run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
         run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        run_env["PYTHONNOUSERSITE"] = "1"
         run_env["TILELANG_DISABLE_CACHE"] = "1"
         run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
         if tl_identity is not None:
@@ -1201,6 +1250,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             _forward_optional_env(run_env, values)
             run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
             run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            run_env["PYTHONNOUSERSITE"] = "1"
             run_env["TILELANG_DISABLE_CACHE"] = "1"
             run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
             if tl_identity is not None:
@@ -1350,6 +1400,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
             if envs_path:
                 build_env["CONDA_ENVS_PATH"] = envs_path
             build_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            build_env["PYTHONNOUSERSITE"] = "1"
             try:
                 built = adapter_runtime.run_host_bash(
                     build_cmd,
@@ -1397,6 +1448,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
             run_env["CONDA_ENVS_PATH"] = envs_path
         run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
         run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        run_env["PYTHONNOUSERSITE"] = "1"
         run_env["PYTHONPATH"] = str(utils_dir)
         probe_cmd = f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ABI_PROBE)}"
         try:
@@ -1501,90 +1553,92 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         "targets": [{"task": t, "candidate": c} for t, c in targets],
     }
 
-    with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
-        with tempfile.TemporaryDirectory(prefix="tilefoundry-cannbench-") as tmp:
-            tmp_dir = Path(tmp)
-            runner_py = tmp_dir / "runner.py"
-            cfg_json = tmp_dir / "runner_cfg.json"
-            runner_py.write_text(CANNBENCH_RUNNER, encoding="utf-8")
-            cfg_json.write_text(json.dumps(runner_cfg), encoding="utf-8")
+    with _open_msprof_lock(wroot):
+        with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
+            with tempfile.TemporaryDirectory(prefix="tilefoundry-cannbench-") as tmp:
+                tmp_dir = Path(tmp)
+                runner_py = tmp_dir / "runner.py"
+                cfg_json = tmp_dir / "runner_cfg.json"
+                runner_py.write_text(CANNBENCH_RUNNER, encoding="utf-8")
+                cfg_json.write_text(json.dumps(runner_cfg), encoding="utf-8")
 
-            run_env = dict(os.environ)
-            run_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
-            envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
-            if envs_path:
-                run_env["CONDA_ENVS_PATH"] = envs_path
-            run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-            cmd = f"{shlex.quote(str(python))} {shlex.quote(str(runner_py))} {shlex.quote(str(cfg_json))}"
-            try:
-                completed = adapter_runtime.run_host_bash(
-                    cmd,
-                    cwd=source,
-                    env=run_env,
-                    cann_setup=cann_setup,
-                    conda_sh=conda_sh,
-                    conda_env=conda_env,
-                    timeout=max(60.0, timeout - warmup_seconds),
-                    isolate_temp=True,
-                )
-            except subprocess.TimeoutExpired as exc:
-                occ, win = finalize_window()
-                if exc.stderr:
-                    sys.stderr.write(str(exc.stderr)[-4000:])
-                timeout_obs = {
-                    "exitCodeZero": False,
-                    "officialReportValid": False,
-                    "allCasesPassed": False,
-                    "allTimingsValid": False,
-                    "targetCount": len(targets),
-                    "targetsSource": targets_source,
-                    "caseCount": 0,
-                    "passedCases": 0,
-                    "timedCases": 0,
-                    "score": 0.0,
-                    "avgSpeedup": 0.0,
-                    "results": [],
-                    "windowOpened": True,
-                    "windowReleased": True,
-                    "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-                    "deviceWindow": win,
-                }
-                if tl_identity is not None:
-                    timeout_obs["tilelang"] = tl_identity
-                return 1, timeout_obs
+                run_env = dict(os.environ)
+                run_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+                envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+                if envs_path:
+                    run_env["CONDA_ENVS_PATH"] = envs_path
+                run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                run_env["PYTHONNOUSERSITE"] = "1"
+                cmd = f"{shlex.quote(str(python))} {shlex.quote(str(runner_py))} {shlex.quote(str(cfg_json))}"
+                try:
+                    completed = adapter_runtime.run_host_bash(
+                        cmd,
+                        cwd=source,
+                        env=run_env,
+                        cann_setup=cann_setup,
+                        conda_sh=conda_sh,
+                        conda_env=conda_env,
+                        timeout=max(60.0, timeout - warmup_seconds),
+                        isolate_temp=True,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    occ, win = finalize_window()
+                    if exc.stderr:
+                        sys.stderr.write(str(exc.stderr)[-4000:])
+                    timeout_obs = {
+                        "exitCodeZero": False,
+                        "officialReportValid": False,
+                        "allCasesPassed": False,
+                        "allTimingsValid": False,
+                        "targetCount": len(targets),
+                        "targetsSource": targets_source,
+                        "caseCount": 0,
+                        "passedCases": 0,
+                        "timedCases": 0,
+                        "score": 0.0,
+                        "avgSpeedup": 0.0,
+                        "results": [],
+                        "windowOpened": True,
+                        "windowReleased": True,
+                        "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
+                        "deviceWindow": win,
+                    }
+                    if tl_identity is not None:
+                        timeout_obs["tilelang"] = tl_identity
+                    return 1, timeout_obs
 
-        occ, win = finalize_window()
-        if completed.stderr.strip():
-            sys.stderr.write(completed.stderr[-4000:])
-        parsed = _extract_last_json(completed.stdout, "officialReportValid")
-        report_valid = bool(parsed.get("officialReportValid", False))
-        cases_passed = bool(parsed.get("allCasesPassed", False))
-        timings_valid = bool(parsed.get("allTimingsValid", False))
-        ok = completed.returncode == 0 and report_valid and cases_passed and timings_valid
-        if not ok:
-            sys.stderr.write((completed.stdout or "")[-4000:])
+            occ, win = finalize_window()
+            if completed.stderr.strip():
+                sys.stderr.write(completed.stderr[-4000:])
+            parsed = _extract_last_json(completed.stdout, "officialReportValid")
+            report_valid = bool(parsed.get("officialReportValid", False))
+            cases_passed = bool(parsed.get("allCasesPassed", False))
+            timings_valid = bool(parsed.get("allTimingsValid", False))
+            ok = completed.returncode == 0 and report_valid and cases_passed and timings_valid
+            if not ok:
+                sys.stderr.write((completed.stdout or "")[-4000:])
 
-        obs = {
-            "exitCodeZero": ok,
-            "officialReportValid": report_valid,
-            "allCasesPassed": cases_passed,
-            "allTimingsValid": timings_valid,
-            "targetCount": int(parsed.get("targetCount", len(targets))),
-            "targetsSource": targets_source,
-            "caseCount": int(parsed.get("caseCount", 0)),
-            "passedCases": int(parsed.get("passedCases", 0)),
-            "timedCases": int(parsed.get("timedCases", 0)),
-            "score": float(parsed.get("score", 0.0)),
-            "avgSpeedup": float(parsed.get("avgSpeedup", 0.0)),
-            "results": list(parsed.get("results") or []),
-            "windowOpened": True,
-            "windowReleased": True,
-            "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-            "deviceWindow": win,
-        }
-        if tl_identity is not None:
-            obs["tilelang"] = tl_identity
-        return (0 if ok else (completed.returncode or 1)), obs
+            obs = {
+                "exitCodeZero": ok,
+                "officialReportValid": report_valid,
+                "allCasesPassed": cases_passed,
+                "allTimingsValid": timings_valid,
+                "targetCount": int(parsed.get("targetCount", len(targets))),
+                "targetsSource": targets_source,
+                "caseCount": int(parsed.get("caseCount", 0)),
+                "passedCases": int(parsed.get("passedCases", 0)),
+                "timedCases": int(parsed.get("timedCases", 0)),
+                "score": float(parsed.get("score", 0.0)),
+                "avgSpeedup": float(parsed.get("avgSpeedup", 0.0)),
+                "results": list(parsed.get("results") or []),
+                "windowOpened": True,
+                "windowReleased": True,
+                "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
+                "deviceWindow": win,
+            }
+            if tl_identity is not None:
+                obs["tilelang"] = tl_identity
+            return (0 if ok else (completed.returncode or 1)), obs
 
 
 _BANNED_TORCH_DELEGATES = frozenset({
