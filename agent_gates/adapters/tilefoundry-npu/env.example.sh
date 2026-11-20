@@ -162,15 +162,48 @@ TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT=
 # ---------------------------------------------------------------------------
 # Optional neuro-symbolic agent LLM & reference repo configuration
 # ---------------------------------------------------------------------------
-# Optional LLM backend selector (`agy_cli` or `mock`).
+# Optional backend: agy_cli, openai_compat, claude_cli, codex_cli, custom_cli, or mock.
 TILEFOUNDRY_NPU_LLM_BACKEND=
+
+# HTTP endpoint base URL, for example https://llm.example.invalid/v1.
+TILEFOUNDRY_NPU_LLM_API_BASE=
+
+# Name of the process environment variable holding the API credential.
+# Use a name such as MODEL_PROVIDER_API_KEY. Keep its value outside env.sh.
+TILEFOUNDRY_NPU_LLM_API_KEY_ENV=
+
+# Optional model IDs for the four generation roles.
+TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL=
+TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL=
+TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL=
+TILEFOUNDRY_NPU_LLM_REPAIR_MODEL=
+
+# Optional effort cap. MAX_EFFORT takes precedence over EFFORT_CAP.
+TILEFOUNDRY_NPU_LLM_MAX_EFFORT=
+TILEFOUNDRY_NPU_LLM_EFFORT_CAP=
+
+# Set to 1 to send reasoning_effort to a compatible HTTP endpoint.
+TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT=
+
+# Set to 1 to stream OpenAI-compatible chat completions using server-sent events.
+TILEFOUNDRY_NPU_LLM_STREAM=
+
+# Optional concurrency cap (positive integer) and role time budgets (positive seconds).
+TILEFOUNDRY_NPU_LLM_MAX_CONCURRENCY=
+TILEFOUNDRY_NPU_LLM_EXPLOIT_TIMEOUT_SEC=
+TILEFOUNDRY_NPU_LLM_REASONING_TIMEOUT_SEC=
+
+# Optional CLI executable and quoted command template for custom_cli.
+TILEFOUNDRY_NPU_LLM_CLI_BIN=
+TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE=
 
 # Optional absolute host path to the `agy` CLI binary (e.g. `<user-home>/.local/bin/agy`).
 TILEFOUNDRY_NPU_AGY_BIN=
 
-# Optional model IDs for rule-guided exploit/repair vs rule-blind creative search.
+# Optional legacy model IDs for exploit, explore, and escalation with agy_cli.
 TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL=
 TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL=
+TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL=
 
 # Optional common CLI flags forwarded to headless `agy` worker subprocesses.
 # Quote the full string when passing multiple space-separated flags, e.g. "--print --mode plan".

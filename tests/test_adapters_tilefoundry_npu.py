@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -20,15 +21,17 @@ ADAPTER = ROOT / "agent_gates" / "adapters" / "tilefoundry-npu"
 SCRIPT = ADAPTER / "scripts" / "tilefoundry_host_gate.py"
 
 
-def load_gate():
-    spec = importlib.util.spec_from_file_location("tilefoundry_host_gate_test", SCRIPT)
+def load_script(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-GATE = load_gate()
+GATE = load_script(SCRIPT, "tilefoundry_host_gate_test")
+ENV_CONTEXT = load_script(SCRIPT.with_name("env_context.py"), "tilefoundry_env_context_test")
 
 
 class ManifestAndParityCase(unittest.TestCase):
@@ -59,6 +62,7 @@ class ManifestAndParityCase(unittest.TestCase):
 
     def test_key_and_engine_wiring_parity(self):
         self.assertEqual(tuple(sorted(GATE.TOOLCHAIN_KEYS)), tuple(sorted(machine_env.TILEFOUNDRY_NPU_KEYS)))
+        self.assertEqual(set(ENV_CONTEXT.OPTIONAL_FORWARDED_KEYS), set(GATE.OPTIONAL_FORWARDED_KEYS))
         self.assertEqual(machine_env.ADAPTERS["tilefoundry-npu"]["prefix"], "TILEFOUNDRY_NPU_")
         self.assertEqual(engine.ENV_KEYS["tilefoundry-npu"], "TILEFOUNDRY_NPU_ENV_FILE")
         self.assertEqual(engine.DEVICE_ADAPTERS["tilefoundry-npu"], "TILEFOUNDRY_NPU_DEVICE_ID")
@@ -114,6 +118,88 @@ class CheckConfigAndRunCase(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_provider_settings_are_parsed_and_forwarded_from_the_machine_file(self):
+        settings = {
+            "TILEFOUNDRY_NPU_LLM_BACKEND": "openai_compat",
+            "TILEFOUNDRY_NPU_LLM_API_BASE": "https://llm.example.invalid/v1",
+            "TILEFOUNDRY_NPU_LLM_API_KEY_ENV": "MODEL_PROVIDER_BEARER",
+            "TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL": "exploit-model",
+            "TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL": "explore-model",
+            "TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL": "escalate-model",
+            "TILEFOUNDRY_NPU_LLM_REPAIR_MODEL": "repair-model",
+            "TILEFOUNDRY_NPU_LLM_MAX_EFFORT": "xhigh",
+            "TILEFOUNDRY_NPU_LLM_EFFORT_CAP": "xhigh",
+            "TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT": "1",
+            "TILEFOUNDRY_NPU_LLM_STREAM": "1",
+            "TILEFOUNDRY_NPU_LLM_MAX_CONCURRENCY": "2",
+            "TILEFOUNDRY_NPU_LLM_EXPLOIT_TIMEOUT_SEC": "120",
+            "TILEFOUNDRY_NPU_LLM_REASONING_TIMEOUT_SEC": "180.5",
+            "TILEFOUNDRY_NPU_LLM_CLI_BIN": "model-cli",
+            "TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE": "{bin} exec -m {model} {prompt}",
+            "TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL": "legacy-escalate-model",
+        }
+        file_values = {**settings, "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/target"}
+        template_key = "TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE"
+        file_values[template_key] = f'"{settings[template_key]}"'
+        self.write_env(**file_values)
+        credential_name = settings["TILEFOUNDRY_NPU_LLM_API_KEY_ENV"]
+        credential = "fixture-only-key"
+        other_key = "OTHER_PROVIDER_API_KEY"
+        worker_env = {
+            "TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file),
+            "TILEFOUNDRY_NPU_DEVICE_ID": "0",
+            "AGENT_GATES_DEVICE_LEASE_PATH": str(self.root / "npu.lock"),
+            credential_name: credential,
+            other_key: "unrelated-key",
+        }
+        with patch.dict(os.environ, worker_env, clear=True):
+            values = GATE.machine_values()
+            machine = machine_env.read("tilefoundry-npu")
+            self.assertEqual(values, machine.values)
+            self.assertEqual({key: values[key] for key in settings}, settings)
+            self.assertEqual(ENV_CONTEXT.forward_optional_machine_env({}, values), {
+                **settings, "TILEFOUNDRY_NPU_PYTHON": str(self.py),
+            })
+
+            cpu_env = GATE._host_child_env(values)
+            GATE._forward_optional_env(cpu_env, values, include_agent_llm=False)
+            self.assertTrue(settings.keys().isdisjoint(cpu_env))
+            self.assertNotIn(credential_name, cpu_env)
+            self.assertNotIn(other_key, cpu_env)
+
+            stderr = io.StringIO()
+            failed = types.SimpleNamespace(returncode=1, stdout=credential, stderr=credential)
+            with patch.object(sys, "stderr", stderr), \
+                    patch.object(GATE, "_source_root", return_value=self.src), \
+                    patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", return_value=failed) as child:
+                rc, observations = GATE.run_device(values, 30.0)
+            self.assertEqual(rc, 1)
+            device_env = child.call_args.kwargs["env"]
+            self.assertEqual({key: device_env[key] for key in settings}, settings)
+            self.assertEqual(device_env[credential_name], credential)
+            self.assertNotIn(other_key, device_env)
+            self.assertNotIn(credential, json.dumps(observations))
+            self.assertEqual(stderr.getvalue(), "[redacted][redacted]")
+
+    def test_provider_key_assignment_is_rejected_without_printing_its_value(self):
+        raw_key = "TILEFOUNDRY_NPU_LLM_API_KEY"
+        credential = "fixture-only-key"
+        selector = {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}
+        for file_values, exports in (
+            ({raw_key: credential}, {}),
+            ({}, {raw_key: credential}),
+            ({"TILEFOUNDRY_NPU_LLM_API_KEY_ENV": credential}, {}),
+        ):
+            with self.subTest(file_keys=tuple(file_values), export_keys=tuple(exports)):
+                self.write_env(**file_values)
+                stderr = io.StringIO()
+                with patch.dict(os.environ, {**selector, **exports}, clear=True), \
+                        patch.object(sys, "stderr", stderr), self.assertRaises(SystemExit) as caught:
+                    GATE.main(["--check-config"])
+                self.assertEqual(caught.exception.code, 75)
+                self.assertNotIn(credential, stderr.getvalue())
+
     def test_check_config_device_checks_exclusivity(self):
         old_cwd = os.getcwd()
         try:
@@ -148,18 +234,22 @@ class CheckConfigAndRunCase(unittest.TestCase):
                 "deviceMemoryPositive": True,
             })
             fake_completed = types.SimpleNamespace(returncode=0, stdout=probe_json + "\n", stderr="")
+            credential_name = "MODEL_PROVIDER_BEARER"
+            self.write_env(TILEFOUNDRY_NPU_LLM_API_KEY_ENV=credential_name)
             env = {
                 "TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file),
                 "TILEFOUNDRY_NPU_DEVICE_ID": "1",
                 "AGENT_GATES_DEVICE_LEASE_PATH": str(lease),
                 "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:1",
                 "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "2",
+                credential_name: "example-credential",
             }
             with patch.dict(os.environ, env, clear=True), \
                     patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
-                    patch.object(GATE.adapter_runtime, "run_host_bash", return_value=fake_completed):
+                    patch.object(GATE.adapter_runtime, "run_host_bash", return_value=fake_completed) as child:
                 rc, obs = GATE.run_device(GATE.machine_values(), 30.0)
             self.assertEqual(rc, 0)
+            self.assertNotIn(credential_name, child.call_args.kwargs["env"])
             self.assertTrue(obs["exitCodeZero"])
             self.assertTrue(obs["windowOpened"])
             self.assertTrue(obs["windowReleased"])
@@ -683,8 +773,11 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 TILEFOUNDRY_NPU_AGY_BIN="/opt/agy/bin/agy",
                 TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL="gemini-4-hydrogen-medium",
                 TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL="gemini-4-hydrogen-high",
+                TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL="agy-escalation-model",
                 TILEFOUNDRY_NPU_AGY_COMMON_ARGS='"--print --mode plan"',
                 TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY="3",
+                TILEFOUNDRY_NPU_CPU_TESTS="",
+                TILEFOUNDRY_NPU_DEVICE_TESTS="",
                 TILEFOUNDRY_NPU_TILELANG_REPO="/refs/tilelang",
                 TILEFOUNDRY_NPU_CANNBOT_DSL_REPO="/refs/cannbot-dsl",
                 TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO="/refs/ops-transformer",
@@ -700,9 +793,10 @@ class OptionalAgentKeysCase(unittest.TestCase):
                     junit.write_text('<testsuite tests="1" errors="0" failures="0" skipped="0"/>', encoding="utf-8")
                     return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-                with patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_cpu):
+                with patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_cpu) as cpu:
                     rc, _obs = GATE.run_cpu(GATE.machine_values(), 30.0)
                 self.assertEqual(rc, 0)
+                self.assertTrue(cpu.call_args.args[0].endswith(" " + " ".join(GATE.DEFAULT_CPU_TESTS)))
                 self.assertNotIn("TILEFOUNDRY_NPU_LLM_BACKEND", captured_env)
                 self.assertNotIn("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", captured_env)
                 self.assertEqual(captured_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
@@ -735,11 +829,13 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 }
                 with patch.dict(os.environ, dev_env, clear=True), \
                         patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
-                        patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_dev):
+                        patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_dev) as device:
                     rc_d, _obs_d = GATE.run_device(GATE.machine_values(), 30.0)
                 self.assertEqual(rc_d, 0)
+                self.assertNotIn("-m pytest", device.call_args.args[0])
                 self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_LLM_BACKEND"], "agy_cli")
                 self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL"], "gemini-4-hydrogen-medium")
+                self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL"], "agy-escalation-model")
                 self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_AGY_COMMON_ARGS"], "--print --mode plan")
                 self.assertEqual(captured_dev_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
 

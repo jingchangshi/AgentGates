@@ -72,13 +72,41 @@ conflicting exports in the launching environment):
   remote BenchSite MCP submission settings (`https://cannbench.com/docs/mcp`) used by
   `tilefoundry-npu-cannbench-remote`. `INDEPENDENT_ENV_CONSENT` (e.g. `v1`) is never
   set automatically and must only be supplied after explicit user consent.
-- `TILEFOUNDRY_NPU_LLM_BACKEND` / `TILEFOUNDRY_NPU_AGY_BIN` /
-  `TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL` / `TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL` /
-  `TILEFOUNDRY_NPU_AGY_COMMON_ARGS` / `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY`:
-  optional headless `agy` LLM backend configuration forwarded when non-empty.
+- `TILEFOUNDRY_NPU_LLM_BACKEND` selects `agy_cli`, `openai_compat`, `claude_cli`,
+  `codex_cli`, `custom_cli`, or `mock`.
+- `TILEFOUNDRY_NPU_LLM_API_BASE` is the HTTP endpoint base URL.
+  `TILEFOUNDRY_NPU_LLM_API_KEY_ENV` names the process environment variable that
+  holds the API credential. Store only the variable name in `env.sh`.
+- `TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL`, `TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL`,
+  `TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL`, and `TILEFOUNDRY_NPU_LLM_REPAIR_MODEL`
+  choose model IDs for the four generation roles.
+- `TILEFOUNDRY_NPU_LLM_MAX_EFFORT` sets the effort cap.
+  `TILEFOUNDRY_NPU_LLM_EFFORT_CAP` is a fallback when `MAX_EFFORT` is unset.
+  Set `TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT=1` for an HTTP endpoint that
+  accepts `reasoning_effort`.
+- Set `TILEFOUNDRY_NPU_LLM_STREAM=1` to stream `openai_compat` chat completions
+  using server-sent events. Leave it empty for the default JSON response.
+- `TILEFOUNDRY_NPU_LLM_MAX_CONCURRENCY` caps concurrent provider calls.
+  `TILEFOUNDRY_NPU_LLM_EXPLOIT_TIMEOUT_SEC` and
+  `TILEFOUNDRY_NPU_LLM_REASONING_TIMEOUT_SEC` set time budgets in seconds for
+  the exploit and repair roles and for the explore and escalate roles, respectively.
+- `TILEFOUNDRY_NPU_LLM_CLI_BIN` selects the CLI executable.
+  `TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE` supplies a quoted command template for
+  `custom_cli`, such as `"{bin} exec -m {model} {prompt}"`.
+- `TILEFOUNDRY_NPU_AGY_BIN`, `TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL`,
+  `TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL`, `TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL`,
+  `TILEFOUNDRY_NPU_AGY_COMMON_ARGS`, and `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY`
+  are supported by existing `agy_cli` deployments.
 - `TILEFOUNDRY_NPU_TILELANG_REPO` / `TILEFOUNDRY_NPU_CANNBOT_DSL_REPO` /
   `TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO` / `TILEFOUNDRY_NPU_ASC_DEVKIT_REPO`:
   optional absolute host paths to read-only Ascend 950 reference checkouts forwarded when non-empty.
+
+The host adapter reads LLM settings directly from `env.sh`. When
+`TILEFOUNDRY_NPU_LLM_API_KEY_ENV` is set, it supplies the named credential
+from the worker environment to the local device run with extra pytest paths.
+The adapter drops other `API_KEY` and `*_API_KEY` variables from child
+processes in this configuration. An asynchronous systemd worker starts
+independently of the shell that submits the run.
 
 `TILEFOUNDRY_NPU_DEVICE_ID` and `TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE` are
 per-run launch/config parameters supplied via `--device-id` or

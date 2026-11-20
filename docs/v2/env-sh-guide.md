@@ -46,12 +46,28 @@
 | `TILEFOUNDRY_NPU_CANNBENCH_ARCH` | CANNBench 可选 | 目标架构（默认 `ascend950`） | 可选 `ascend950`、`ascend910b`、`ascend910_93` |
 | `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` | CANNBench 可选 | 相对 `--source` 路径 | 默认 `examples/ascend950pr_ops/cannbench_targets.json`，优先从仓内读取待测 `(task, candidate)` |
 | `TILEFOUNDRY_NPU_CANNBENCH_TARGETS` | 兜底必填 | `task:rel_path` 列表 | 当仓内 targets 文件不存在时启用，如 `level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py` |
-| `TILEFOUNDRY_NPU_LLM_BACKEND` | 可选 | `agy_cli` 或 `mock` | 神经符号 Agent 后端选择（非空时透传到门禁子进程） |
+| `TILEFOUNDRY_NPU_LLM_BACKEND` | Optional | `agy_cli`, `openai_compat`, `claude_cli`, `codex_cli`, `custom_cli`, or `mock` | TileFoundry generation backend |
+| `TILEFOUNDRY_NPU_LLM_API_BASE` | Optional | HTTP base URL | Endpoint for `openai_compat` |
+| `TILEFOUNDRY_NPU_LLM_API_KEY_ENV` | Optional | Environment variable name | Name of the process variable holding the credential |
+| `TILEFOUNDRY_NPU_LLM_{EXPLOIT,EXPLORE,ESCALATE,REPAIR}_MODEL` | Optional | Model ID | Model per generation role |
+| `TILEFOUNDRY_NPU_LLM_MAX_EFFORT` / `TILEFOUNDRY_NPU_LLM_EFFORT_CAP` | Optional | Effort level | Upper effort limit. `EFFORT_CAP` is a fallback for `MAX_EFFORT` |
+| `TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT` | Optional | `1` to enable | Send `reasoning_effort` to compatible HTTP endpoints |
+| `TILEFOUNDRY_NPU_LLM_STREAM` | Optional | `1` to enable | Stream `openai_compat` chat completions using server-sent events |
+| `TILEFOUNDRY_NPU_LLM_MAX_CONCURRENCY` | Optional | Positive integer | Maximum concurrent provider calls |
+| `TILEFOUNDRY_NPU_LLM_EXPLOIT_TIMEOUT_SEC` | Optional | Positive seconds | Time budget for exploit and repair |
+| `TILEFOUNDRY_NPU_LLM_REASONING_TIMEOUT_SEC` | Optional | Positive seconds | Time budget for explore and escalate |
+| `TILEFOUNDRY_NPU_LLM_CLI_BIN` / `TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE` | Optional | Executable / quoted command template | Select the CLI executable and configure `custom_cli` |
 | `TILEFOUNDRY_NPU_AGY_BIN` | 可选 | 宿主机绝对路径 | `agy` CLI 可执行文件路径 |
 | `TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL` / `_EXPLORE_MODEL` | 可选 | 模型名 | 内层规则分支与受保护创造分支使用的 `agy` 模型标识 |
+| `TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL` | Optional | Model ID | Legacy escalation model for `agy_cli` |
 | `TILEFOUNDRY_NPU_AGY_COMMON_ARGS` | 可选 | CLI 参数串 | 无状态沙盒 `agy` 子进程公共参数 |
 | `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY` | 可选 | 正整数 | `agy` 并发子进程上限 |
 | `TILEFOUNDRY_NPU_{TILELANG,CANNBOT_DSL,OPS_TRANSFORMER,ASC_DEVKIT}_REPO` | 可选 | 宿主机绝对路径 | 本地只读 Ascend 950 参考仓路径（非空时透传；运行时隔离沙盒严禁直接访问） |
+
+Store only the credential variable name in `env.sh`. The host adapter reads
+settings from this file and resolves the named credential from the worker
+process environment when running extra device tests. For asynchronous runs,
+that environment comes from the systemd user worker.
 
 ---
 

@@ -30,6 +30,32 @@ from agent_gates import adapter_runtime
 
 PROG = "tilefoundry-npu-gate"
 ADAPTER_DIR = Path(__file__).resolve().parent.parent
+LLM_API_KEY_ENV = "TILEFOUNDRY_NPU_LLM_API_KEY_ENV"
+
+OPTIONAL_AGENT_LLM_KEYS = (
+    "TILEFOUNDRY_NPU_LLM_BACKEND",
+    "TILEFOUNDRY_NPU_LLM_API_BASE",
+    LLM_API_KEY_ENV,
+    "TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL",
+    "TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL",
+    "TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL",
+    "TILEFOUNDRY_NPU_LLM_REPAIR_MODEL",
+    "TILEFOUNDRY_NPU_LLM_MAX_EFFORT",
+    "TILEFOUNDRY_NPU_LLM_EFFORT_CAP",
+    "TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT",
+    "TILEFOUNDRY_NPU_LLM_STREAM",
+    "TILEFOUNDRY_NPU_LLM_MAX_CONCURRENCY",
+    "TILEFOUNDRY_NPU_LLM_EXPLOIT_TIMEOUT_SEC",
+    "TILEFOUNDRY_NPU_LLM_REASONING_TIMEOUT_SEC",
+    "TILEFOUNDRY_NPU_LLM_CLI_BIN",
+    "TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE",
+    "TILEFOUNDRY_NPU_AGY_BIN",
+    "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+    "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+    "TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL",
+    "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
+    "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+)
 
 TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CANN_SETUP",
@@ -54,12 +80,7 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CANNBENCH_POOL_ID",
     "TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN",
     "TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT",
-    "TILEFOUNDRY_NPU_LLM_BACKEND",
-    "TILEFOUNDRY_NPU_AGY_BIN",
-    "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
-    "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
-    "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
-    "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+    *OPTIONAL_AGENT_LLM_KEYS,
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
@@ -72,15 +93,6 @@ OPTIONAL_REPO_AND_PYTHON_KEYS = (
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
     "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
-)
-
-OPTIONAL_AGENT_LLM_KEYS = (
-    "TILEFOUNDRY_NPU_LLM_BACKEND",
-    "TILEFOUNDRY_NPU_AGY_BIN",
-    "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
-    "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
-    "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
-    "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
 )
 
 OPTIONAL_FORWARDED_KEYS = OPTIONAL_REPO_AND_PYTHON_KEYS + OPTIONAL_AGENT_LLM_KEYS
@@ -477,7 +489,18 @@ def machine_values() -> dict[str, str]:
             raise BridgeError(f"{name} is exported in shell but absent from {path}")
         if os.environ[name] != values[name]:
             raise BridgeError(f"{name} export disagrees with {path}")
+    _llm_credential_name(values)
     return values
+
+
+def _llm_credential_name(values: dict[str, str]) -> str:
+    """Return the configured credential variable name."""
+    name = (values.get(LLM_API_KEY_ENV) or "").strip()
+    if name and (
+        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name.startswith("TILEFOUNDRY_NPU_")
+    ):
+        raise BridgeError(f"{LLM_API_KEY_ENV} must name a separate environment variable")
+    return name
 
 
 def _required(values: dict[str, str], name: str) -> str:
@@ -1041,11 +1064,25 @@ def _abi_slot(
     return f"{arch}-{digest}", slot_dir, slot_dir / "cann_bench_utils"
 
 
+def _host_child_env(values: dict[str, str], *, include_llm_credential: bool = False) -> dict[str, str]:
+    """Limit provider API keys when a credential variable is configured."""
+    name = _llm_credential_name(values)
+    if not name:
+        return dict(os.environ)
+    env = {
+        key: value for key, value in os.environ.items()
+        if key != name and key.upper() != "API_KEY" and not key.upper().endswith("_API_KEY")
+    }
+    if include_llm_credential and name in os.environ:
+        env[name] = os.environ[name]
+    return env
+
+
 def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
-    run_env = dict(os.environ)
+    run_env = _host_child_env(values)
     envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
     if envs_path:
         run_env["CONDA_ENVS_PATH"] = envs_path
@@ -1161,7 +1198,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
 
     with tempfile.TemporaryDirectory(prefix="tilefoundry-cpu-") as tmp:
         report = Path(tmp) / "junit.xml"
-        run_env = dict(os.environ)
+        run_env = _host_child_env(values)
         envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
         if envs_path:
             run_env["CONDA_ENVS_PATH"] = envs_path
@@ -1229,6 +1266,15 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         return (0 if succeeded else 1), obs
 
 
+def _redact_llm_credential(text: str | bytes, credential: str) -> str:
+    """Redact the credential from device subprocess output."""
+    if isinstance(text, bytes):
+        text = text.decode(errors="replace")
+    if credential:
+        text = text.replace(credential, "[redacted]")
+    return text
+
+
 def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
@@ -1243,7 +1289,8 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
             probe_path = Path(tmp) / "probe.py"
             probe_path.write_text(DEVICE_PROBE, encoding="utf-8")
-            run_env = dict(os.environ)
+            run_env = _host_child_env(values, include_llm_credential=bool(extra_tests))
+            credential = run_env.get(_llm_credential_name(values), "").strip()
             envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
             if envs_path:
                 run_env["CONDA_ENVS_PATH"] = envs_path
@@ -1277,7 +1324,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             except subprocess.TimeoutExpired as exc:
                 occ, win = finalize_window()
                 if exc.stderr:
-                    sys.stderr.write(str(exc.stderr)[-4000:])
+                    sys.stderr.write(_redact_llm_credential(exc.stderr, credential)[-4000:])
                 print(f"{PROG}: device probe timed out after {timeout}s", file=sys.stderr)
                 timeout_obs = {
                     "exitCodeZero": False,
@@ -1302,7 +1349,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
 
         occ, win = finalize_window()
         if completed.stderr.strip():
-            sys.stderr.write(completed.stderr[-4000:])
+            sys.stderr.write(_redact_llm_credential(completed.stderr, credential)[-4000:])
 
         parsed = _extract_last_json(completed.stdout, "npuAvailable")
         tilelang_reused_ok = True if tl_identity is None else (parsed.get("tilelangReused") is True)
@@ -1321,7 +1368,7 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             )
         )
         if not ok:
-            sys.stderr.write((completed.stdout or "")[-4000:])
+            sys.stderr.write(_redact_llm_credential(completed.stdout or "", credential)[-4000:])
 
         obs = {
             "exitCodeZero": ok,
@@ -1341,7 +1388,9 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         }
         if tl_identity is not None:
             obs["tilelangReused"] = bool(parsed.get("tilelangReused", False))
-            obs["tilelangVersion"] = str(parsed.get("tilelangVersion", ""))
+            obs["tilelangVersion"] = _redact_llm_credential(
+                str(parsed.get("tilelangVersion", "")), credential
+            )
             obs["tilelang"] = tl_identity
         return (0 if ok else (completed.returncode or 1)), obs
 
@@ -1395,7 +1444,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
                 ]),
                 " ".join(["cmake", "--build", shlex.quote(str(stage_utils / "build")), "--parallel", "4"]),
             ])
-            build_env = dict(os.environ)
+            build_env = _host_child_env(values)
             envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
             if envs_path:
                 build_env["CONDA_ENVS_PATH"] = envs_path
@@ -1442,7 +1491,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
     warmup_seconds = round(time.monotonic() - warmup_started, 3)
 
     with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
-        run_env = dict(os.environ)
+        run_env = _host_child_env(values)
         envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
         if envs_path:
             run_env["CONDA_ENVS_PATH"] = envs_path
@@ -1562,7 +1611,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                 runner_py.write_text(CANNBENCH_RUNNER, encoding="utf-8")
                 cfg_json.write_text(json.dumps(runner_cfg), encoding="utf-8")
 
-                run_env = dict(os.environ)
+                run_env = _host_child_env(values)
                 run_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
                 envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
                 if envs_path:
