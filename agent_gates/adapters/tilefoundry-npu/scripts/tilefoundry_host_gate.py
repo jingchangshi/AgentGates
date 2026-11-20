@@ -1357,6 +1357,9 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                     run_env["CONDA_ENVS_PATH"] = envs_path
                 _forward_optional_env(run_env, values)
                 run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
+                # A caller that imported tilefoundry_ascend without CANN sourced
+                # exports "0"; torch only autoloads torch_npu when this is "1".
+                run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
                 run_env["PYTHONDONTWRITEBYTECODE"] = "1"
                 run_env["PYTHONNOUSERSITE"] = "1"
                 run_env["TILELANG_DISABLE_CACHE"] = "0" if cache_enabled else "1"

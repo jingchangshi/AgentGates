@@ -269,6 +269,12 @@ class DeviceModeCase(unittest.TestCase):
         self.assertEqual(env["TILELANG_DISABLE_CACHE"], "1")
         self.assertNotIn(str(self.shim), env["PYTHONPATH"].split(os.pathsep))
 
+    def test_fast_gate_forces_torch_backend_autoload(self):
+        with self._record_host_call() as calls:
+            rc, _ = self.run_fast(extra_env={"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0][1]["TORCH_DEVICE_BACKEND_AUTOLOAD"], "1")
+
     def test_fast_failure_output_redacts_llm_credential(self):
         (self.src / "tests" / "device" / "test_fail.py").write_text(
             "import os\n\n"
