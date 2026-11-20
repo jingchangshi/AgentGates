@@ -473,6 +473,7 @@ class CannbenchIntegrationCase(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True), \
                     patch.object(GATE, "_inspect_conda_cannbench_env", return_value=info), \
                     patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                    patch.object(GATE.locking, "lock_root", return_value=self.root / "locks"), \
                     patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_bench_bash):
                 rc_b, obs_b = GATE.run_cannbench(values, 60.0)
             self.assertEqual(rc_b, 0)
@@ -482,7 +483,7 @@ class CannbenchIntegrationCase(unittest.TestCase):
             self.assertEqual(obs_b["deviceWindow"]["resource"], "npu:1")
             self.assertEqual(captured_bench_envs[0][1].get("PYTHONNOUSERSITE"), "1")
             self.assertIn('env["PYTHONNOUSERSITE"] = "1"', GATE.CANNBENCH_RUNNER)
-            self.assertTrue((self.work_root / ".msprof.lock").is_file())
+            self.assertTrue((self.root / "locks" / ".msprof.lock").is_file())
         finally:
             os.chdir(old_cwd)
 

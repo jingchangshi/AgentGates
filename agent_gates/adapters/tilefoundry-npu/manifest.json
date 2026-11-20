@@ -17,7 +17,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_host_gate.py": "78dfa04c571227f60d0a8b1cd4e4c828244292ec7ace298cbf215a346d31e1d9"
+    "scripts/tilefoundry_host_gate.py": "7f19d95fecd07885997037d72f9c320fef978d36d7c63908b403bcb4f483d0db"
   },
   "recipes": [
     {
@@ -55,6 +55,31 @@
         "-B",
         "{pack}/scripts/tilefoundry_host_gate.py",
         "--device",
+        "--timeout",
+        "600"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--check-config-device"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "tilefoundry-npu.device-fast",
+      "cwd": "source",
+      "timeout": 660,
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/tilefoundry_host_gate.py",
+        "--device-fast",
         "--timeout",
         "600"
       ],
@@ -176,6 +201,17 @@
       "dependsOn": [
         "tilefoundry-npu-cpu"
       ]
+    },
+    {
+      "id": "tilefoundry-npu-device-fast",
+      "recipeId": "tilefoundry-npu.device-fast",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true
+      }
     },
     {
       "id": "tilefoundry-npu-cannbench-prep",

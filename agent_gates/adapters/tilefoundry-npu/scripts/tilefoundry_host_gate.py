@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import NoReturn
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -26,7 +27,7 @@ import zipfile
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from agent_gates import adapter_runtime
+from agent_gates import adapter_runtime, locking
 
 PROG = "tilefoundry-npu-gate"
 ADAPTER_DIR = Path(__file__).resolve().parent.parent
@@ -67,6 +68,8 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_TILELANG_BUILD",
     "TILEFOUNDRY_NPU_CPU_TESTS",
     "TILEFOUNDRY_NPU_DEVICE_TESTS",
+    "TILEFOUNDRY_NPU_MSPROF_LOCK",
+    "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE",
     "TILEFOUNDRY_NPU_BUILD_SUBDIR",
     "TILEFOUNDRY_NPU_CANNBENCH_REPO",
     "TILEFOUNDRY_NPU_WORK_ROOT",
@@ -218,6 +221,18 @@ print(json.dumps(facts, sort_keys=True))
 sys.exit(0 if all(v for v in facts.values() if isinstance(v, bool)) else 1)
 """
 
+DEVICE_PROBE_FLAGS = (
+    "tilefoundryImported",
+    "npuAvailable",
+    "deviceCountOne",
+    "tensorOnDevice",
+    "fp32VectorOk",
+    "bf16MatmulOk",
+    "numericalOk",
+    "synchronizeOk",
+    "deviceMemoryPositive",
+)
+
 CANNBENCH_ENV_INSPECT = r"""
 import importlib, importlib.metadata as md, json, pathlib, sys
 missing = []
@@ -367,12 +382,21 @@ for index, item in enumerate(cfg["targets"]):
     score = 0.0
     avg_speedup = 0.0
     valid = False
+    case_rows = []
     if final_path.is_file():
         try:
             report = json.loads(final_path.read_text(encoding="utf-8"))
             op = report["operators"][0]
             cases = op["cases"]
             count = len(cases)
+            case_rows = [
+                {
+                    "case_id": str(c.get("case_id", "")),
+                    "speedup": float(c.get("speedup") or 0.0),
+                    "elapsed_us": float(c.get("elapsed_us") or 0.0),
+                }
+                for c in cases
+            ]
             passed = sum(
                 1 for c in cases
                 if c.get("status") == "success" and (c.get("accuracy") or {}).get("passed") is True
@@ -410,6 +434,7 @@ for index, item in enumerate(cfg["targets"]):
         "caseCount": count,
         "passedCases": passed,
         "timedCases": timed,
+        "cases": case_rows,
         "score": round(score, 6),
         "avgSpeedup": round(avg_speedup, 6),
     })
@@ -436,7 +461,7 @@ class BridgeError(RuntimeError):
     EXIT = adapter_runtime.BLOCKED_ENV
 
 
-def _die(code: int, message: str) -> None:
+def _die(code: int, message: str) -> NoReturn:
     print(f"{PROG}: {message}", file=sys.stderr)
     raise SystemExit(code)
 
@@ -508,6 +533,15 @@ def _required(values: dict[str, str], name: str) -> str:
     if not value:
         raise BridgeError(f"{name} is required in the machine file")
     return value
+
+
+def _binary_flag(values: dict[str, str], name: str) -> bool:
+    raw = (values.get(name) or "").strip()
+    if raw == "1":
+        return True
+    if raw in {"", "0"}:
+        return False
+    raise BridgeError(f"{name} must be 0 or 1")
 
 
 def build_subdir(values: dict[str, str]) -> str:
@@ -864,10 +898,14 @@ def tilelang_reuse_identity(values: dict[str, str]) -> dict[str, str] | None:
     }
 
 
-def _effective_pythonpath(tl_identity: dict[str, str] | None) -> str:
-    if tl_identity is None:
-        return DEFAULT_PYTHONPATH
-    return f"{tl_identity['source']}:{DEFAULT_PYTHONPATH}"
+def _effective_pythonpath(
+    tl_identity: dict[str, str] | None, *, shim: str | None = None
+) -> str:
+    parts = [shim] if shim else []
+    if tl_identity is not None:
+        parts.append(tl_identity["source"])
+    parts.append(DEFAULT_PYTHONPATH)
+    return ":".join(parts)
 
 
 def device_id() -> str | None:
@@ -1150,6 +1188,8 @@ def check_config(
             _required(values, name)
         build_subdir(values)
         _validate_optional_agent_keys(values)
+        _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK")
+        _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
         cann = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
         if not cann.is_file():
             raise BridgeError(f"TILEFOUNDRY_NPU_CANN_SETUP does not exist: {cann}")
@@ -1275,7 +1315,16 @@ def _redact_llm_credential(text: str | bytes, credential: str) -> str:
     return text
 
 
-def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+def _window_evidence(occupancy: str, window: dict) -> dict:
+    return {
+        "windowOpened": True,
+        "windowReleased": True,
+        "occupancyRecorded": occupancy in {"free", "unknown"} or occupancy.startswith("shared("),
+        "deviceWindow": window,
+    }
+
+
+def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) -> tuple[int, dict]:
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
     device = require_device()
@@ -1283,116 +1332,154 @@ def run_device(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
-    extra_tests = device_tests(values)
+    tests = device_tests(values)
+    if fast and not tests:
+        raise BridgeError(
+            "tilefoundry-npu-device-fast requires TILEFOUNDRY_NPU_DEVICE_TESTS"
+        )
+    msprof_lock = _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK")
+    cache_enabled = _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
 
-    with _open_device_window(device) as finalize_window:
-        with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
-            probe_path = Path(tmp) / "probe.py"
-            probe_path.write_text(DEVICE_PROBE, encoding="utf-8")
-            run_env = _host_child_env(values, include_llm_credential=bool(extra_tests))
-            credential = run_env.get(_llm_credential_name(values), "").strip()
-            envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
-            if envs_path:
-                run_env["CONDA_ENVS_PATH"] = envs_path
-            _forward_optional_env(run_env, values)
-            run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
-            run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-            run_env["PYTHONNOUSERSITE"] = "1"
-            run_env["TILELANG_DISABLE_CACHE"] = "1"
-            run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
-            if tl_identity is not None:
-                run_env.setdefault("USE_CUDA", "0")
-                run_env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
+    started = time.monotonic()
+    lock = (
+        _open_msprof_lock(locking.lock_root(), timeout_seconds=max(1.0, timeout - 30.0))
+        if msprof_lock
+        else nullcontext()
+    )
+    with lock:
+        with _open_device_window(device) as finalize_window:
+            with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
+                report = Path(tmp) / "junit.xml"
+                run_env = _host_child_env(values, include_llm_credential=bool(tests))
+                credential = run_env.get(_llm_credential_name(values), "").strip()
+                envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+                if envs_path:
+                    run_env["CONDA_ENVS_PATH"] = envs_path
+                _forward_optional_env(run_env, values)
+                run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
+                run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                run_env["PYTHONNOUSERSITE"] = "1"
+                run_env["TILELANG_DISABLE_CACHE"] = "0" if cache_enabled else "1"
+                shim = (run_env.get("TF_SURROGATE_SHIM_DIR") or "").strip() if cache_enabled else ""
+                run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity, shim=shim)
+                if tl_identity is not None:
+                    run_env.setdefault("USE_CUDA", "0")
+                    run_env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
 
-            cmd = f"{shlex.quote(str(python))} {shlex.quote(str(probe_path))}"
-            if extra_tests:
-                cmd += " && " + " ".join(
-                    [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider"]
-                    + [shlex.quote(t) for t in extra_tests]
-                )
-            try:
-                completed = adapter_runtime.run_host_bash(
-                    cmd,
-                    cwd=source,
-                    env=run_env,
-                    cann_setup=cann_setup,
-                    conda_sh=conda_sh,
-                    conda_env=conda_env,
-                    timeout=timeout,
-                    isolate_temp=True,
-                )
-            except subprocess.TimeoutExpired as exc:
+                if fast:
+                    cmd = " ".join(
+                        [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider",
+                         f"--junit-xml={shlex.quote(str(report))}"]
+                        + [shlex.quote(t) for t in tests]
+                    )
+                else:
+                    probe_path = Path(tmp) / "probe.py"
+                    probe_path.write_text(DEVICE_PROBE, encoding="utf-8")
+                    cmd = f"{shlex.quote(str(python))} {shlex.quote(str(probe_path))}"
+                    if tests:
+                        cmd += " && " + " ".join(
+                            [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider"]
+                            + [shlex.quote(t) for t in tests]
+                        )
+                remaining = max(1.0, timeout - (time.monotonic() - started))
+                try:
+                    completed = adapter_runtime.run_host_bash(
+                        cmd,
+                        cwd=source,
+                        env=run_env,
+                        cann_setup=cann_setup,
+                        conda_sh=conda_sh,
+                        conda_env=conda_env,
+                        timeout=remaining,
+                        isolate_temp=True,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    # run_host_bash SIGTERM/SIGKILLs the whole process group and
+                    # reaps it before raising, so no profiling child survives
+                    # this return and the msprof lock is safe to release.
+                    occ, win = finalize_window()
+                    if exc.stderr:
+                        sys.stderr.write(_redact_llm_credential(exc.stderr, credential)[-4000:])
+                    print(f"{PROG}: device run timed out after {timeout}s", file=sys.stderr)
+                    if fast:
+                        obs = {
+                            "exitCodeZero": False,
+                            "testsCollected": 0,
+                            "testsPassed": 0,
+                            "testsFailed": 0,
+                            "testsSkipped": 0,
+                            **_window_evidence(occ, win),
+                        }
+                    else:
+                        obs = {
+                            "exitCodeZero": False,
+                            **dict.fromkeys(DEVICE_PROBE_FLAGS, False),
+                            **_window_evidence(occ, win),
+                        }
+                        if tl_identity is not None:
+                            obs["tilelangReused"] = False
+                    if tl_identity is not None:
+                        obs["tilelang"] = tl_identity
+                    return 1, obs
+
                 occ, win = finalize_window()
-                if exc.stderr:
-                    sys.stderr.write(_redact_llm_credential(exc.stderr, credential)[-4000:])
-                print(f"{PROG}: device probe timed out after {timeout}s", file=sys.stderr)
-                timeout_obs = {
-                    "exitCodeZero": False,
-                    "tilefoundryImported": False,
-                    "npuAvailable": False,
-                    "deviceCountOne": False,
-                    "tensorOnDevice": False,
-                    "fp32VectorOk": False,
-                    "bf16MatmulOk": False,
-                    "numericalOk": False,
-                    "synchronizeOk": False,
-                    "deviceMemoryPositive": False,
-                    "windowOpened": True,
-                    "windowReleased": True,
-                    "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-                    "deviceWindow": win,
+                if fast:
+                    counts = _junit_counts(report)
+                    if counts is None:
+                        sys.stderr.write(
+                            _redact_llm_credential(
+                                completed.stderr or completed.stdout, credential
+                            )[-4000:]
+                        )
+                        print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
+                        counts = {"collected": 0, "passed": 0, "failed": 0, "skipped": 0}
+                    ok = (
+                        completed.returncode == 0
+                        and counts["collected"] > 0
+                        and counts["failed"] == 0
+                        and counts["skipped"] < counts["collected"]
+                    )
+                    if not ok:
+                        sys.stderr.write(
+                            _redact_llm_credential(
+                                completed.stdout + "\n" + completed.stderr, credential
+                            )[-4000:]
+                        )
+                    obs = {
+                        "exitCodeZero": ok,
+                        "testsCollected": counts["collected"],
+                        "testsPassed": counts["passed"],
+                        "testsFailed": counts["failed"],
+                        "testsSkipped": counts["skipped"],
+                        **_window_evidence(occ, win),
+                    }
+                    if tl_identity is not None:
+                        obs["tilelang"] = tl_identity
+                    return (0 if ok else (completed.returncode or 1)), obs
+
+                if completed.stderr.strip():
+                    sys.stderr.write(_redact_llm_credential(completed.stderr, credential)[-4000:])
+
+                parsed = _extract_last_json(completed.stdout, "npuAvailable")
+                tilelang_reused_ok = True if tl_identity is None else (parsed.get("tilelangReused") is True)
+                ok = completed.returncode == 0 and bool(parsed) and tilelang_reused_ok and all(
+                    parsed.get(k) is True for k in DEVICE_PROBE_FLAGS
+                )
+                if not ok:
+                    sys.stderr.write(_redact_llm_credential(completed.stdout or "", credential)[-4000:])
+
+                obs = {
+                    "exitCodeZero": ok,
+                    **{key: bool(parsed.get(key, False)) for key in DEVICE_PROBE_FLAGS},
+                    **_window_evidence(occ, win),
                 }
                 if tl_identity is not None:
-                    timeout_obs["tilelangReused"] = False
-                    timeout_obs["tilelang"] = tl_identity
-                return 1, timeout_obs
-
-        occ, win = finalize_window()
-        if completed.stderr.strip():
-            sys.stderr.write(_redact_llm_credential(completed.stderr, credential)[-4000:])
-
-        parsed = _extract_last_json(completed.stdout, "npuAvailable")
-        tilelang_reused_ok = True if tl_identity is None else (parsed.get("tilelangReused") is True)
-        ok = completed.returncode == 0 and bool(parsed) and tilelang_reused_ok and all(
-            parsed.get(k) is True
-            for k in (
-                "tilefoundryImported",
-                "npuAvailable",
-                "deviceCountOne",
-                "tensorOnDevice",
-                "fp32VectorOk",
-                "bf16MatmulOk",
-                "numericalOk",
-                "synchronizeOk",
-                "deviceMemoryPositive",
-            )
-        )
-        if not ok:
-            sys.stderr.write(_redact_llm_credential(completed.stdout or "", credential)[-4000:])
-
-        obs = {
-            "exitCodeZero": ok,
-            "tilefoundryImported": bool(parsed.get("tilefoundryImported", False)),
-            "npuAvailable": bool(parsed.get("npuAvailable", False)),
-            "deviceCountOne": bool(parsed.get("deviceCountOne", False)),
-            "tensorOnDevice": bool(parsed.get("tensorOnDevice", False)),
-            "fp32VectorOk": bool(parsed.get("fp32VectorOk", False)),
-            "bf16MatmulOk": bool(parsed.get("bf16MatmulOk", False)),
-            "numericalOk": bool(parsed.get("numericalOk", False)),
-            "synchronizeOk": bool(parsed.get("synchronizeOk", False)),
-            "deviceMemoryPositive": bool(parsed.get("deviceMemoryPositive", False)),
-            "windowOpened": True,
-            "windowReleased": True,
-            "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-            "deviceWindow": win,
-        }
-        if tl_identity is not None:
-            obs["tilelangReused"] = bool(parsed.get("tilelangReused", False))
-            obs["tilelangVersion"] = _redact_llm_credential(
-                str(parsed.get("tilelangVersion", "")), credential
-            )
-            obs["tilelang"] = tl_identity
-        return (0 if ok else (completed.returncode or 1)), obs
+                    obs["tilelangReused"] = bool(parsed.get("tilelangReused", False))
+                    obs["tilelangVersion"] = _redact_llm_credential(
+                        str(parsed.get("tilelangVersion", "")), credential
+                    )
+                    obs["tilelang"] = tl_identity
+                return (0 if ok else (completed.returncode or 1)), obs
 
 
 def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dict]:
@@ -1602,7 +1689,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         "targets": [{"task": t, "candidate": c} for t, c in targets],
     }
 
-    with _open_msprof_lock(wroot):
+    with _open_msprof_lock(locking.lock_root()):
         with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
             with tempfile.TemporaryDirectory(prefix="tilefoundry-cannbench-") as tmp:
                 tmp_dir = Path(tmp)
@@ -2080,6 +2167,15 @@ def main(argv: list[str] | None = None) -> int:
             _die(75, str(exc))
         print(json.dumps(obs, sort_keys=True))
         return rc
+    if args == ["--device-fast"]:
+        try:
+            rc, obs = run_device(
+                values, DEFAULT_DEVICE_TIMEOUT if timeout is None else timeout, fast=True
+            )
+        except BridgeError as exc:
+            _die(75, str(exc))
+        print(json.dumps(obs, sort_keys=True))
+        return rc
     if args == ["--cannbench-prep"]:
         try:
             rc, obs = run_cannbench_prep(values, DEFAULT_PREP_TIMEOUT if timeout is None else timeout)
@@ -2104,7 +2200,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _die(
         2,
-        f"usage: {PROG} (--cpu | --device | --cannbench-prep | --cannbench | --cannbench-remote | "
+        f"usage: {PROG} (--cpu | --device | --device-fast | --cannbench-prep | --cannbench | --cannbench-remote | "
         "--check-config | --check-config-device | --check-config-cannbench | --check-config-cannbench-remote) [--timeout SECONDS]",
     )
     return 2
