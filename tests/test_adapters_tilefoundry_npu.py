@@ -85,6 +85,15 @@ class ManifestAndParityCase(unittest.TestCase):
         self.assertEqual(engine.EXCLUSIVE_VARIABLE["tilefoundry-npu"], "TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE")
 
 
+    def test_l3_preflight_uses_the_exported_tilelang_environment_api(self):
+        # tilelang/__init__.py exports `env` as an Environment instance, which
+        # shadows `import tilelang.env as ...`; the cache API belongs to that
+        # exported instance. Reverting to `tilelang_env.env` breaks real runs.
+        self.assertIn("from tilelang.env import env as tilelang_env", GATE.L3_PREFLIGHT)
+        self.assertIn("tilelang_env.get_cache_write_dir()", GATE.L3_PREFLIGHT)
+        self.assertNotIn("tilelang_env.env", GATE.L3_PREFLIGHT)
+
+
 class CheckConfigAndRunCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

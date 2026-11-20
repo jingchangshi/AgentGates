@@ -611,9 +611,12 @@ try:
             "passedOnEqual": bool(verdict.passed),
         }
 
-    import tilelang.env as tilelang_env
+    # tilelang/__init__.py exports ``env`` as an Environment instance, which
+    # shadows ``import tilelang.env as ...``; read the cache API from that
+    # exported instance instead of assuming the attribute is the submodule.
+    from tilelang.env import env as tilelang_env
 
-    facts["tilelangCacheDir"] = tilelang_env.env.get_cache_write_dir()
+    facts["tilelangCacheDir"] = tilelang_env.get_cache_write_dir()
     facts["cache"]["tilelang"] = _cache_probe(
         "tilelang", os.environ.get("TILELANG_CACHE_DIR", "")
     )
