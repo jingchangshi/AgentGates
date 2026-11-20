@@ -379,10 +379,39 @@ def test_execution_models_are_closed():
         api.ExecutionRequest(workspace="w", adapter="a", gates=["g"], shell_command="rm -rf /")
 
 
-def test_execution_request_has_no_machine_parameter_fields():
-    """C2: the tool-facing request must not be able to carry machine settings."""
+def test_execution_request_carries_only_bounded_ids_and_request_data():
+    """C2: the tool-facing request must not be able to carry machine settings.
+
+    `target` and `candidate` are data for a route that declares `dynamicTarget`,
+    not machine parameters: they never become argv, and the adapter performs its
+    own workload validation. `device_id` is likewise an id from the configured
+    authorized set, not a machine setting: it can only choose among the cards the
+    operator already allowed, and omitting it keeps the configured default.
+    """
     fields = set(api.ExecutionRequest.model_fields)
-    assert fields == {"workspace", "adapter", "gates", "request_id"}
+    assert fields == {"workspace", "adapter", "gates", "request_id",
+                      "target", "candidate", "device_id"}
+
+
+def test_submit_cli_forwards_the_optional_device(monkeypatch, capsys, tmp_path):
+    """The CLI spelling is --device-id; it must reach the API request intact."""
+    submitted = []
+
+    class FakeManager:
+        def submit(self, request):
+            submitted.append(request)
+            return api.ExecutionStatus(
+                execution_id="e" * 32, state=api.ExecutionState.SUBMITTED,
+                workspace=request.workspace, adapter=request.adapter,
+                gates=request.gates, device_id=request.device_id)
+
+    monkeypatch.setattr("agent_gates.cli.ExecutionManager", FakeManager)
+    status = main(["submit", "--workspace", "w", "--adapter", "a",
+                   "--gate", "g", "--device-id", "0", "--json",
+                   "--evidence-root", str(tmp_path / "evidence")])
+    assert status == 0
+    assert submitted[0].device_id == "0"
+    assert json.loads(capsys.readouterr().out)["device_id"] == "0"
 
 
 def test_terminal_states_are_exactly_the_three_outcomes():

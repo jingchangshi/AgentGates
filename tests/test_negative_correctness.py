@@ -51,7 +51,8 @@ def local_engine(tmp_path, sandbox, *, adapter='fixture', code="print('{}')", co
     (directory / 'manifest.json').write_text(json.dumps(raw))
     registry = Registry(tmp_path / 'registry')
     store = EvidenceStore(tmp_path / 'evidence')
-    engine = Engine(registry=registry, store=store, lock_root=tmp_path / 'locks')
+    engine = Engine(registry=registry, store=store, lock_root=tmp_path / 'locks',
+                    device_lock_root=tmp_path / 'locks')
     return engine, store, directory
 
 

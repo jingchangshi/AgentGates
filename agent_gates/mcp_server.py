@@ -89,6 +89,10 @@ class DoctorInput(_Input):
     # own dependency graph, so it cannot steer a command line.
     gates: list[str] | None = Field(
         None, description="Gate ids to diagnose (dependencies included); omit to probe every route.")
+    target: str | None = Field(
+        None, description="Typed workload target; requires a gate selection whose recipe accepts one.")
+    candidate: str | None = Field(
+        None, description="Source-relative candidate file for the target.")
 
 
 class SubmitInput(_Input):
@@ -97,6 +101,13 @@ class SubmitInput(_Input):
     gates: list[str] = Field(description="Gate ids; dependencies are added automatically.")
     request_id: str | None = Field(
         None, description="Idempotency key: the same id with the same request returns the original execution.")
+    target: str | None = Field(
+        None, description="Typed workload target for a dynamic-target route.")
+    candidate: str | None = Field(
+        None, description="Source-relative candidate file for the target.")
+    device_id: str | None = Field(
+        None, description="Explicit NPU card for this execution; must be in the "
+                          "configured authorized set. Omit to use the default.")
 
 
 class ExecutionInput(_Input):
@@ -119,6 +130,10 @@ class RequirementsInput(_Input):
     adapter: str = Field(description="Adapter id the run must be bound to.")
     required_gates: list[str] = Field(description="Every gate that must have passed.")
     run_id: str = Field(description="Explicit run id; there is no latest shortcut.")
+    target: str | None = Field(
+        None, description="Require the receipt to have executed this typed target.")
+    candidate: str | None = Field(
+        None, description="Require the receipt to have executed this candidate path.")
 
 
 # ---- output models --------------------------------------------------------
@@ -147,6 +162,8 @@ class ReportView(BaseModel):
     gates: list[api.GateResult]
     failures: list[str]
     verification: api.EvidenceVerification | None = None
+    target: str | None = None
+    candidate: str | None = None
 
 
 def _receipt_report(run_id, store, registry):
@@ -161,6 +178,13 @@ def _receipt_report(run_id, store, registry):
                 status=_status_enum(gate.get("status")),
                 failures=list(gate.get("failures") or []),
                 recipe_id=gate.get("recipeId")))
+    confirmation = receipt.get("dynamicTarget")
+    target = None
+    candidate = None
+    if isinstance(confirmation, dict):
+        target = confirmation.get("target")
+        if isinstance(confirmation.get("candidate"), dict):
+            candidate = confirmation["candidate"].get("relativePath")
     return ReportView(
         run_id=run_id,
         status=str(verification.get("status")),
@@ -174,7 +198,9 @@ def _receipt_report(run_id, store, registry):
             run_id=run_id,
             status=_status_enum(verification.get("status")),
             valid=bool(verification.get("valid")),
-            failures=list(verification.get("failures") or [])))
+            failures=list(verification.get("failures") or [])),
+        target=target,
+        candidate=candidate)
 
 
 def _reject_unknown(received: dict, declared: set) -> None:
@@ -259,8 +285,11 @@ def build_server():
                              "adapter. Runs no compiler test and never satisfies a requirement. "
                              "Name gates to diagnose one route only; the reply states its scope.")
     async def doctor(workspace: str, adapter: str,
-                     gates: list[str] | None = None) -> api.DoctorReport:
-        payload = DoctorInput(workspace=workspace, adapter=adapter, gates=gates)
+                     gates: list[str] | None = None,
+                     target: str | None = None,
+                     candidate: str | None = None) -> api.DoctorReport:
+        payload = DoctorInput(workspace=workspace, adapter=adapter, gates=gates,
+                              target=target, candidate=candidate)
         from .engine import Engine, config_reason
         manager = _manager()
         workspace = manager.config.workspace(payload.workspace)
@@ -295,7 +324,8 @@ def build_server():
                 payload.adapter, workspace.source_root,
                 selected=selected_gates, env_file=adapter.env_file,
                 device_id=device_id,
-                require_exclusive_device=manager.config.devices.require_exclusive)
+                require_exclusive_device=manager.config.devices.require_exclusive,
+                target=payload.target, candidate=payload.candidate)
         finally:
             if had_smi:
                 os.environ["AGENT_GATES_SMI_COMMAND"] = prev_smi
@@ -324,13 +354,20 @@ def build_server():
                  description="Submit gates for asynchronous execution. Returns an execution "
                              "id immediately; the gates run in an independent systemd worker.")
     async def submit(workspace: str, adapter: str, gates: list[str],
-                     request_id: str | None = None) -> api.ExecutionStatus:
+                     request_id: str | None = None,
+                     target: str | None = None,
+                     candidate: str | None = None,
+                     device_id: str | None = None) -> api.ExecutionStatus:
         payload = SubmitInput(workspace=workspace, adapter=adapter,
-                              gates=gates, request_id=request_id)
+                              gates=gates, request_id=request_id,
+                              target=target, candidate=candidate,
+                              device_id=device_id)
         manager = _manager()
         return manager.submit(api.ExecutionRequest(
             workspace=payload.workspace, adapter=payload.adapter,
-            gates=payload.gates, request_id=payload.request_id))
+            gates=payload.gates, request_id=payload.request_id,
+            target=payload.target, candidate=payload.candidate,
+            device_id=payload.device_id))
 
     @server.tool(name="status", description="Read one execution current state.")
     async def status(execution_id: str) -> api.ExecutionStatus:
@@ -379,13 +416,17 @@ def build_server():
                              "gates for the current source state. This is what a completion gate calls.")
     async def verify_requirements_tool(workspace: str, adapter: str,
                                         required_gates: list[str], run_id: str,
+                                        target: str | None = None,
+                                        candidate: str | None = None,
                                         ) -> api.RequirementVerificationResult:
         payload = RequirementsInput(workspace=workspace, adapter=adapter,
-                                    required_gates=required_gates, run_id=run_id)
+                                    required_gates=required_gates, run_id=run_id,
+                                    target=target, candidate=candidate)
         manager = _manager()
         requirement = api.VerificationRequirement(
             workspace=payload.workspace, adapter=payload.adapter,
-            required_gates=payload.required_gates, run_id=payload.run_id)
+            required_gates=payload.required_gates, run_id=payload.run_id,
+            target=payload.target, candidate=payload.candidate)
         return verify_requirements(requirement, config=manager.config,
                                    registry=manager.registry, store=manager.evidence)
 

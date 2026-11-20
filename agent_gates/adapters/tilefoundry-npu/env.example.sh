@@ -133,6 +133,45 @@ TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE=
 #   TILEFOUNDRY_NPU_CANNBENCH_TARGETS=level4/attention_residual:examples/ascend950pr_ops/attention_residual/kernels.py
 TILEFOUNDRY_NPU_CANNBENCH_TARGETS=
 
+# Both L4 recipes (`tilefoundry-npu-cannbench-prep` and
+# `tilefoundry-npu-cannbench`) declare an optional `dynamicTarget`: a managed
+# request (canonical task and source-relative candidate published by the engine
+# as AGENT_GATES_TARGET and AGENT_GATES_CANDIDATE) binds prep and official
+# measurement to exactly that pair, while an unmanaged invocation keeps
+# evaluating the targets above. Never export the pair from a parent shell.
+
+# ---------------------------------------------------------------------------
+# L3 promotion (`tilefoundry-npu-l3-promotion`)
+# ---------------------------------------------------------------------------
+# The recipe is a `dynamicTarget` gate: the engine publishes the canonical task
+# and the source-relative candidate as AGENT_GATES_TARGET and
+# AGENT_GATES_CANDIDATE to the recipe and its configCheck only. Never export
+# these from a parent shell; a stale pair is refused by the engine.
+#
+# The adapter activates the same CANN/Conda/TileLang environment for its
+# preflight and the acceptance pytest, then passes TF_L3_PROFILE=l3-promotion,
+# TF_L3_TARGET_OPERATOR, TF_L3_TARGET_MODULE_PATH, TF_L3_EXPECTED_PYTHON,
+# TF_L3_CANNBENCH_REPO, TF_L3_CACHE_EXPECTATION, CANNBENCH_CACHE_MODE=required,
+# and TF_L3_EVIDENCE_PATH to the target interpreter. The suite writes the
+# tilefoundry-l3-evidence/v1 sidecar at TF_L3_EVIDENCE_PATH.
+#
+# Dedicated caches are derived from TILEFOUNDRY_NPU_WORK_ROOT:
+#   <work-root>/l3/cache/<operator>/{tilelang,reference}
+#   <work-root>/l3/runs/<operator>/<UTC>_<pid>_<ns>/{preflight,workload facts,junit.xml,evidence.json}
+# The shared TileLang/CANNBench caches are never touched. The ordinary
+# promotion gate always uses TF_L3_CACHE_EXPECTATION=any, so legal mixed hits
+# and cache rebuilds are accepted. It never reads or writes reference-warm.json;
+# only the Lead-owned explicit strict cold/warm acceptance may do that. The
+# observation still records the signed pre-run cache directories and tree
+# sizes, and the producer's per-kind hits/misses/writes/errors are preserved
+# verbatim in the evidence and receipt.
+#
+# Optional positive L3 workload budget in seconds, at most 1800. Leave empty
+# for 1200. The outer recipe bound is 1920 seconds; the configCheck has its own
+# independent bound. All waits, preflight, compile and target execution are
+# paid from this single monotonic deadline.
+TILEFOUNDRY_NPU_L3_TIMEOUT_SEC=
+
 # ---------------------------------------------------------------------------
 # Remote CANNBench submission via BenchSite MCP (https://cannbench.com/docs/mcp)
 # Required only for `tilefoundry-npu-cannbench-remote`

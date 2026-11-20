@@ -15,6 +15,7 @@ from .evaluator import equal, evaluate
 from .executor import file_reference
 from .manifest import Manifest, strict_json
 from .source_identity import snapshot
+from . import dynamic_target
 
 RUN_ID = re.compile(r"^[0-9a-f]{32}$")
 
@@ -25,6 +26,15 @@ def canonical(value):
 
 def default_root():
     return Path.home() / ".local/state/agent-gates"
+
+
+def _candidate_current(source: Path, candidate: dict) -> bool:
+    """Whether the candidate file still has the bytes the receipt records."""
+    try:
+        return dynamic_target.candidate_reference(
+            source, candidate["relativePath"]) == candidate
+    except (OSError, ValueError):
+        return False
 
 
 class EvidenceStore:
@@ -108,9 +118,30 @@ class EvidenceStore:
             manifest = registry.get(receipt["adapter"]["id"]) if registry else Manifest(Path(receipt["adapter"]["path"]))
             if manifest.manifest_hash != receipt["adapter"]["sha256"]:
                 return self._result(run_id, "STALE", ["ADAPTER_IDENTITY_CHANGED"])
-            current = snapshot(Path(receipt["source"]["root"]))
+            request = receipt.get("dynamicTarget")
+            if request is not None:
+                if not isinstance(request, dict) or set(request) != {"target", "candidate"}:
+                    raise ValueError("invalid dynamic target binding")
+                dynamic_target.validate_target(request["target"])
+                candidate = request["candidate"]
+                if not isinstance(candidate, dict) or set(candidate) != {"relativePath", "path", "bytes", "sha256"}:
+                    raise ValueError("invalid dynamic target candidate binding")
+                dynamic_target.validate_candidate(candidate["relativePath"])
+            source_path = Path(receipt["source"]["root"])
+            current = snapshot(source_path)
             if current != receipt["source"]:
+                # Prefer the specific reason when the candidate itself moved:
+                # a receipt over a replaced candidate is stale for that reason,
+                # even though the candidate is also part of the source snapshot.
+                if request is not None and not _candidate_current(source_path, candidate):
+                    return self._result(run_id, "STALE", ["CANDIDATE_IDENTITY_CHANGED"])
                 return self._result(run_id, "STALE", ["SOURCE_IDENTITY_CHANGED"])
+            if request is not None:
+                # The receipt describes the bytes that ran, not the path that
+                # named them: re-hashing turns a replaced candidate into stale
+                # evidence instead of a pass over a file nobody executed.
+                if not _candidate_current(source_path, candidate):
+                    return self._result(run_id, "STALE", ["CANDIDATE_IDENTITY_CHANGED"])
             for reference in receipt.get("configuration", {}).get("files", []):
                 if not self._matches(reference):
                     return self._result(run_id, "STALE", ["CONFIGURATION_IDENTITY_CHANGED"])
@@ -121,6 +152,8 @@ class EvidenceStore:
             for gate in receipt["gates"]:
                 definition = manifest.gates[gate["gateId"]]
                 recipe = manifest.resolve_recipe(definition["recipeId"], Path(receipt["source"]["root"]))
+                if recipe.dynamic_target and request is None:
+                    raise ValueError("dynamic target binding missing for a gate that requires it")
                 if gate["recipeId"] != recipe.id or not equal(gate["checks"], definition["observationChecks"]):
                     raise ValueError("receipt gate rules differ from manifest")
                 if gate.get("status") == "PASS":

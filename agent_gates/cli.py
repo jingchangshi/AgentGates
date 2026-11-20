@@ -6,6 +6,7 @@ import sys
 from .engine import Engine
 from .evidence import EvidenceStore
 from .registry import Registry
+from . import dynamic_target
 from .api_types import APIError, ExecutionRequest, VerificationRequirement, jsonable
 from .config import ConfigError
 from .docker_quarantine import QUARANTINED_ADAPTERS, QUARANTINED_GATES
@@ -26,6 +27,8 @@ def parser():
             command.add_argument("--source", required=True, type=Path)
             command.add_argument("--env-file", type=Path)
             command.add_argument("--device-id", help="explicitly authorize this NPU device for the run")
+            command.add_argument("--target", help="typed workload target for a dynamic-target route")
+            command.add_argument("--candidate", help="source-relative candidate file for the target")
         if name == "run":
             selection = command.add_mutually_exclusive_group(required=True)
             selection.add_argument("--gate", action="append", help="gate ID; dependencies run first")
@@ -43,6 +46,11 @@ def parser():
             command.add_argument("--adapter", required=True)
             command.add_argument("--gate", action="append", required=True)
             command.add_argument("--request-id")
+            command.add_argument("--target")
+            command.add_argument("--candidate")
+            command.add_argument(
+                "--device-id",
+                help="authorized NPU card for this execution; omit for the configured default")
         if name in {"status", "wait", "cancel"}:
             command.add_argument("--execution-id", required=True)
         if name == "wait":
@@ -52,6 +60,8 @@ def parser():
             command.add_argument("--adapter", required=True)
             command.add_argument("--gate", action="append", required=True)
             command.add_argument("--run-id", required=True)
+            command.add_argument("--target")
+            command.add_argument("--candidate")
     return root
 
 
@@ -83,7 +93,8 @@ def main(argv=None):
                 ]
             }
         elif args.command in {"doctor", "run"}:
-            options = {"env_file": args.env_file, "device_id": args.device_id}
+            options = {"env_file": args.env_file, "device_id": args.device_id,
+                       "target": args.target, "candidate": args.candidate}
             if args.command == "doctor":
                 result = engine.doctor(args.adapter, args.source, selected=args.gate, **options)
             else:
@@ -144,6 +155,15 @@ def main(argv=None):
             for failure in result.get("failures", []):
                 print(f"  {failure}")
         return 0 if result.get("status", "PASS") == "PASS" else 1
+    except dynamic_target.TargetRequestError as exc:
+        # A target/candidate pair is request data: an unusable one is refused
+        # before a run exists, never recorded as a machine verdict.
+        result = {"status": "INVALID_REQUEST", "failures": [str(exc)]}
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"INVALID_REQUEST: {exc}", file=sys.stderr)
+        return 2
     except (OSError, ValueError, RuntimeError) as exc:
         result = {"status": "BLOCKED_ENV", "failures": [str(exc)]}
         if args.json:
@@ -165,7 +185,9 @@ def _async_command(args):
         manager = ExecutionManager()
         if args.command == "submit":
             request = ExecutionRequest(workspace=args.workspace, adapter=args.adapter,
-                                       gates=args.gate, request_id=args.request_id)
+                                       gates=args.gate, request_id=args.request_id,
+                                       target=args.target, candidate=args.candidate,
+                                       device_id=args.device_id)
             return _emit(manager.submit(request), args)
         if args.command == "status":
             return _emit(manager.status(args.execution_id), args)
@@ -177,7 +199,8 @@ def _async_command(args):
         if args.command == "cancel":
             return _emit(manager.cancel(args.execution_id), args)
         requirement = VerificationRequirement(workspace=args.workspace, adapter=args.adapter,
-                                              required_gates=args.gate, run_id=args.run_id)
+                                              required_gates=args.gate, run_id=args.run_id,
+                                              target=args.target, candidate=args.candidate)
         result = verify_requirements(requirement, config=manager.config,
                                      registry=manager.registry, store=manager.evidence)
         return _emit(result, args, status_ok=result.satisfied)

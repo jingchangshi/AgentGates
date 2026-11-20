@@ -113,9 +113,12 @@ invalidation.
 **Status:** accepted (mandated by objective C2).
 
 **Decision.** Tool inputs are limited to: workspace, adapter, gates,
-execution_id/run_id, request_id, and a bounded wait duration. Everything else —
-source root, env_file, python executable, CANN paths, conda init, evidence_root,
-device id — is resolved from `~/.config/agent-gates/config.toml`.
+execution_id/run_id, request_id, the typed target/candidate request pair, an
+optional `device_id` that can only select from the operator-authorized cards,
+and a bounded wait duration. Everything else — source root, env_file, python
+executable, CANN paths, conda init, evidence_root, the device allowlist and the
+default device — is resolved from `~/.config/agent-gates/config.toml`. The
+device selector narrows the configured set; it can never widen it.
 
 **Enforcement.** The API models for tool input simply have no field for those
 values, so there is nothing to validate away. Workspace ids are looked up in the
@@ -173,6 +176,13 @@ Selection is deterministic: with no configuration a gate uses device `0`. A gate
 that silently picked "whatever looks idle" would make two identical requests run
 on different hardware, and the receipt would stop describing a reproducible
 machine state.
+
+A request may still name one permitted card explicitly (`--device-id` in the
+CLI, `device_id` in the V2 API) so an operator can move work off a failing card.
+The id is canonicalised and checked against the same allowlist; omitting it keeps
+the deterministic default. The resolved id is part of the request identity: the
+record, the execution status and the receipt all name it, and replaying the same
+`request_id` on another card is a `CONFLICT` rather than a silent switch.
 
 ### Occupancy is reported, not enforced
 

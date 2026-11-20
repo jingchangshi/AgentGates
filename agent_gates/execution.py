@@ -16,9 +16,11 @@ from contextlib import contextmanager
 from datetime import datetime
 import os
 from pathlib import Path
+import re
 import time
 
 from . import api_types as api
+from . import dynamic_target
 from . import systemd_units
 from .config import ConfigError, load
 from .docker_quarantine import is_quarantined_recipe, quarantine_reason
@@ -26,6 +28,7 @@ from .evidence import EvidenceStore
 from .execution_store import AdmissionLock, EXECUTION_ID, ExecutionStore, new_execution_id
 from .manifest import ManifestError
 from .registry import Registry
+from .source_identity import snapshot
 
 # A wait is always bounded. The MCP wait tool must never hold a single call
 # open until a compiler finishes; callers poll instead.
@@ -83,7 +86,8 @@ class ExecutionManager:
 
     # ── validation ──────────────────────────────────────────────────────────
 
-    def _resolve(self, workspace_id: str, adapter_id: str, gates: list):
+    def _resolve(self, workspace_id: str, adapter_id: str, gates: list,
+                 target=None, candidate=None):
         """Validate a request against the registry, refusing with stable codes."""
         try:
             workspace = self.config.workspace(workspace_id)
@@ -130,7 +134,17 @@ class ExecutionManager:
                     api.ErrorCode.GATE_NOT_ALLOWED,
                     quarantine_reason(f"gate {gate_id!r}"),
                 )
-        return workspace, manifest, ordered
+        # The pair is validated against the resolved gate closure before any
+        # execution exists: an unknown target grammar or a candidate outside the
+        # workspace is a request refusal, not a failed run to clean up. The
+        # returned binding carries the candidate bytes, not just its path.
+        try:
+            binding = dynamic_target.resolve_request(
+                manifest, ordered, workspace.source_root,
+                target=target, candidate=candidate)
+        except dynamic_target.TargetRequestError as exc:
+            raise api.APIError(api.ErrorCode.INVALID_REQUEST, str(exc)) from None
+        return workspace, manifest, ordered, binding
 
     def _device_for(self, adapter_id: str, requested_device):
         """Choose the NPU device a request will use.
@@ -145,13 +159,30 @@ class ExecutionManager:
         are optional; with neither set, every device is available and the
         selection is deterministic so a receipt keeps describing a
         reproducible machine state.
+
+        A caller may name one card explicitly. It is canonicalised and then
+        checked against the SAME allowlist configuration uses, so explicit
+        selection cannot widen what the operator authorized. Omitting it keeps
+        the deterministic default. A non-device Adapter still gets no card:
+        its profile never required one, and an id passed to it is ignored just
+        as the Engine ignores one it has no variable for.
         """
-        if not adapter_id.endswith("-npu"):
-            return None
         if requested_device is not None:
-            # An execution request has no device field, so this is reachable
-            # only from an internal caller passing one explicitly.
             device = str(requested_device)
+            if not re.fullmatch(r"[0-9]+", device):
+                raise api.APIError(
+                    api.ErrorCode.INVALID_REQUEST,
+                    "device_id must be a nonnegative decimal ID",
+                    field="device_id")
+            # The Engine normalises the id the same way ("07" and "7" name one
+            # card); keeping the canonical spelling here means the record, the
+            # status and the receipt cannot disagree about which card ran.
+            device = str(int(device))
+            if not adapter_id.endswith("-npu"):
+                # No device variable exists for this Adapter, so naming a card
+                # cannot change what it executes. Refusing would break the
+                # host-only profiles that legitimately need no device.
+                return None
             if not self.config.devices.permits(device):
                 raise api.APIError(
                     api.ErrorCode.DEVICE_NOT_AUTHORIZED,
@@ -159,6 +190,8 @@ class ExecutionManager:
                     field="devices.allowed_npu_devices",
                     details={"allowed": sorted(self.config.devices.allowed or [])})
             return device
+        if not adapter_id.endswith("-npu"):
+            return None
         return self.config.devices.select()
 
     @staticmethod
@@ -182,9 +215,34 @@ class ExecutionManager:
         worker can never run a request the store does not describe.
         """
         self.store.initialize()
-        workspace, manifest, ordered = self._resolve(
-            request.workspace, request.adapter, list(request.gates))
-        device_id = self._device_for(request.adapter, None)
+        workspace, manifest, ordered, binding = self._resolve(
+            request.workspace, request.adapter, list(request.gates),
+            request.target, request.candidate)
+        resolved_device = self._device_for(request.adapter, request.device_id)
+        # Whether this execution will actually bind the card. A device Adapter
+        # may also ship host-only recipes (`"device": "none"`), and the Engine
+        # records `authorizedDeviceId` only for a gate that drives the card. The
+        # record keeps the distinction so recovery can demand a card from a
+        # device run without refusing a genuinely device-less one.
+        device_required = resolved_device is not None and any(
+            manifest.resolve_recipe(manifest.gates[gate_id]["recipeId"],
+                                    workspace.source_root).uses_device
+            for gate_id in ordered)
+        # A host-only profile binds no card: the Engine takes no lease and
+        # publishes no authorizedDeviceId, so submit must not claim hardware the
+        # run will never use by recording a selected id.
+        device_id = resolved_device if device_required else None
+        # Freeze the tree the request was submitted against. A worker that starts
+        # later verifies this identity before running anything, so a candidate
+        # or source swapped while the execution was queued is refused instead of
+        # executed. Storing only paths would bind the request to whatever bytes
+        # happen to be on disk when a busy worker gets to it.
+        try:
+            source_identity = snapshot(workspace.source_root)
+        except (OSError, ValueError) as exc:
+            raise api.APIError(
+                api.ErrorCode.INVALID_REQUEST,
+                "workspace source cannot be snapshotted: " + str(exc)) from None
 
         # Idempotency (D1): the same request id must not create a second real
         # execution, and a different request under the same id is a conflict.
@@ -197,7 +255,19 @@ class ExecutionManager:
                     bound = self.store.read_request(existing) or {}
                     same = (bound.get("workspace") == request.workspace
                             and bound.get("adapter") == request.adapter
-                            and list(bound.get("requested_gates") or []) == list(request.gates))
+                            and list(bound.get("requested_gates") or []) == list(request.gates)
+                            and bound.get("target") == request.target
+                            and bound.get("candidate") == request.candidate
+                            # The resolved card is part of the request identity,
+                            # not the raw spelling: replaying the same request id
+                            # on a different card is a different execution, while
+                            # an explicit "1" and the configured default 1 name
+                            # the same one.
+                            and bound.get("device_id") == device_id
+                            # Same path is not the same request: the candidate
+                            # bytes the first submission bound are part of its
+                            # identity, so a replaced candidate is a conflict.
+                            and bound.get("dynamic_target") == binding)
                     if not same:
                         raise api.APIError(
                             api.ErrorCode.CONFLICT,
@@ -234,6 +304,16 @@ class ExecutionManager:
                 "requested_gates": list(request.gates),
                 "request_id": request.request_id,
                 "device_id": device_id,
+                # The resolved card is only a claim about hardware when a
+                # selected Gate drives it; this flag keeps the two cases apart
+                # for receipt adoption after a crash.
+                "device_required": device_required,
+                "target": request.target,
+                "candidate": request.candidate,
+                # The candidate bytes and source tree this request was admitted
+                # against. The worker re-verifies both before it runs a gate.
+                "dynamic_target": binding,
+                "source_identity": source_identity,
                 "source_root": str(workspace.source_root),
                 "adapter_manifest_sha256": manifest.manifest_hash,
                 "config_digest": self.config.config_digest,
@@ -247,6 +327,12 @@ class ExecutionManager:
                 "adapter": request.adapter,
                 "gates": ordered,
                 "requestId": request.request_id,
+                "target": request.target,
+                "candidate": request.candidate,
+                # The card this execution is bound to. The Engine records the
+                # same id as authorizedDeviceId in the receipt, and the adapter
+                # receives it through its device variable.
+                "deviceId": device_id,
                 "submittedAt": time.time(),
                 "startedAt": None,
                 "finishedAt": None,
@@ -324,6 +410,9 @@ class ExecutionManager:
             completed_gates=list(status.get("completedGates") or []),
             message=status.get("message"),
             exit_reason=status.get("exitReason"),
+            target=status.get("target"),
+            candidate=status.get("candidate"),
+            device_id=status.get("deviceId"),
         )
 
     def wait(self, execution_id: str, timeout=None) -> api.WaitResult:
@@ -491,22 +580,28 @@ class ExecutionManager:
             return None
         if receipt.get("adapter", {}).get("id") != record.get("adapter"):
             return None
+        if not self._receipt_matches_request(receipt, record):
+            return None
         gate_results = [{"gate_id": gate.get("gateId"), "status": gate.get("status"),
                          "failures": list(gate.get("failures") or []),
                          "recipe_id": gate.get("recipeId")}
                         for gate in receipt.get("gates", []) if isinstance(gate, dict)]
+        fields = {
+            "runId": candidate,
+            "gateStatus": verification.get("status"),
+            "gateResults": gate_results,
+            "completedGates": [item["gate_id"] for item in gate_results],
+            "currentGate": None,
+            "exitReason": "recovered from published receipt",
+            "finishedAt": time.time(),
+        }
+        if "device_id" in record:
+            # The card resolved at admission is the card this execution reports,
+            # even if the crash lost the status field that first carried it.
+            fields["deviceId"] = record.get("device_id")
         return self.store.transition(
             execution_id, api.ExecutionState.FINISHED,
-            event="recovered_from_receipt",
-            **{
-                "runId": candidate,
-                "gateStatus": verification.get("status"),
-                "gateResults": gate_results,
-                "completedGates": [item["gate_id"] for item in gate_results],
-                "currentGate": None,
-                "exitReason": "recovered from published receipt",
-                "finishedAt": time.time(),
-            })
+            event="recovered_from_receipt", **fields)
 
     def _find_receipt(self, execution_id: str, record: dict):
         """Look for a receipt this execution produced, most recent first."""
@@ -536,6 +631,8 @@ class ExecutionManager:
                     continue
             if receipt.get("adapter", {}).get("id") != record.get("adapter"):
                 continue
+            if not self._receipt_matches_request(receipt, record):
+                continue
             if os.path.realpath(receipt.get("source", {}).get("root", "") or "") != os.path.realpath(
                     record.get("source_root") or ""):
                 continue
@@ -545,6 +642,53 @@ class ExecutionManager:
                 continue
             return run_id
         return None
+
+    @staticmethod
+    def _receipt_matches_request(receipt: dict, record: dict) -> bool:
+        """Whether a receipt executed exactly the request the record describes.
+
+        Recovery must not adopt a nearby receipt from a different target or
+        candidate. The receipt's own verification proves the candidate bytes;
+        this compares the identity the caller asked for, including the candidate
+        digest frozen at submission and the source tree it was admitted against.
+        """
+        bound = receipt.get("dynamicTarget")
+        target, candidate = record.get("target"), record.get("candidate")
+        identity = record.get("source_identity")
+        if isinstance(identity, dict) and receipt.get("source") != identity:
+            return False
+        # A receipt that names a card must name the one this execution was
+        # admitted on, and a device run must have a receipt that names one at
+        # all. A receipt without `authorizedDeviceId` proves no card was bound,
+        # so it cannot complete a request whose selected gates drive the card -
+        # that would let a crashed device run be "recovered" by a host-only
+        # receipt. A genuinely device-less request keeps adopting its receipt:
+        # both sides record no card, which is the same machine fact.
+        receipt_device = receipt.get("authorizedDeviceId")
+        record_device = record.get("device_id")
+        required = record.get("device_required")
+        if required is None:
+            # Records written before the flag existed named a card only for a
+            # device Adapter; keep their stricter reading.
+            required = record_device is not None
+        if required:
+            if receipt_device is None or str(receipt_device) != str(record_device):
+                return False
+        elif receipt_device is not None:
+            return False
+        if target is None and candidate is None:
+            return bound is None
+        if not isinstance(bound, dict) or not isinstance(bound.get("candidate"), dict):
+            return False
+        if (bound.get("target") != target
+                or bound["candidate"].get("relativePath") != candidate):
+            return False
+        expected = record.get("dynamic_target")
+        if isinstance(expected, dict) and bound != expected:
+            # Same path, different bytes: the receipt describes a candidate the
+            # caller did not submit, so it cannot complete this execution.
+            return False
+        return True
 
 
 def _process_alive(worker: dict) -> bool:

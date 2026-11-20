@@ -68,6 +68,17 @@ class Recipe:
     # Recipe of a device Adapter declares `"device": "none"` so that building it
     # does not demand a device id for work that never touches one.
     uses_device: bool = True
+    # Whether this Recipe accepts the typed target/candidate request. The
+    # request names data, not a command: the argv stays pinned, and the values
+    # arrive in the recipe environment so the Adapter performs its own workload
+    # validation. A required Recipe may only run with the pair; an optional one
+    # accepts it when the caller supplies one and otherwise resolves its own
+    # managed fixed target.
+    dynamic_target: bool = False
+    dynamic_target_optional: bool = False
+    # An optional independent cap for the configuration check. Without it the
+    # check keeps the historical `min(120, timeout)` bound.
+    config_check_timeout: float | None = None
 
 
 class Manifest:
@@ -177,9 +188,51 @@ class Manifest:
         if not isinstance(blocked, list) or any(type(code) is not int or not 1 <= code <= 255 for code in blocked) \
                 or len(set(blocked)) != len(blocked):
             raise ManifestError("blockedExitCodes must be distinct exit codes between 1 and 255")
-        return Recipe(recipe_id, self._argv(item.get("argv")), str(Path(source).resolve() if cwd == "source" else self.root),
+        config_check_timeout = self._config_check_timeout(item, recipe_id, bool(check))
+        dynamic_target, dynamic_target_optional = self._dynamic_target(item, recipe_id)
+        if (dynamic_target or dynamic_target_optional) and cwd != "source":
+            raise ManifestError(f"recipe {recipe_id} dynamicTarget requires cwd \"source\"")
+        return Recipe(recipe_id, self._argv(item.get("argv")),
+                      str(Path(source).resolve() if cwd == "source" else self.root),
                       float(timeout), self._argv(check, check=True) if check else (), tuple(blocked),
-                      self._device_window(item, recipe_id), self._uses_device(item, recipe_id))
+                      self._device_window(item, recipe_id), self._uses_device(item, recipe_id),
+                      dynamic_target, dynamic_target_optional, config_check_timeout)
+
+    @staticmethod
+    def _dynamic_target(item, recipe_id):
+        """Whether a Recipe requires or accepts the target/candidate request.
+
+        `true` is required (the route cannot run without a pair); `"optional"`
+        accepts a pair when the caller supplies one and otherwise lets the
+        Adapter resolve its managed fixed target. Any other value is refused
+        rather than guessed.
+        """
+        value = item.get("dynamicTarget")
+        if value is None:
+            return False, False
+        if value is True:
+            return True, False
+        if value == "optional":
+            return False, True
+        raise ManifestError(
+            f"recipe {recipe_id} dynamicTarget must be true or \"optional\"")
+
+    @staticmethod
+    def _config_check_timeout(item, recipe_id, has_check):
+        """An independent bound for the configuration check, or the old default."""
+        value = item.get("configCheckTimeout")
+        if value is None:
+            return None
+        if not has_check:
+            raise ManifestError(f"recipe {recipe_id} configCheckTimeout requires configCheck")
+        # type(...) rather than isinstance so a bool cannot become one second.
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ManifestError(
+                f"recipe {recipe_id} configCheckTimeout must be a positive number of seconds")
+        if not math.isfinite(value) or not 0 < value <= 86400:
+            raise ManifestError(
+                f"recipe {recipe_id} configCheckTimeout must be a positive number of seconds")
+        return float(value)
 
     @staticmethod
     def _uses_device(item, recipe_id):

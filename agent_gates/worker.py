@@ -20,6 +20,7 @@ import traceback
 
 from . import api_types as api
 from .config import ConfigError, load
+from .dynamic_target import TargetRequestError
 from .engine import Engine
 from .evidence import EvidenceStore
 from .execution_store import EXECUTION_ID, ExecutionStore
@@ -103,11 +104,31 @@ def run_execution(execution_id: str, *, store: ExecutionStore, config, engine=No
     prev_smi = os.environ.get("AGENT_GATES_SMI_COMMAND")
     if config.devices.smi_command:
         os.environ["AGENT_GATES_SMI_COMMAND"] = config.devices.smi_command
+    # The submission froze the candidate bytes and the source tree this request
+    # was admitted against. Pass them on so the Engine can refuse a queued
+    # request whose files changed while it waited, instead of executing bytes
+    # nobody submitted.
+    binding = request.get("dynamic_target")
+    expected_candidate = binding.get("candidate") if isinstance(binding, dict) else None
     try:
         receipt = engine.run(adapter, source, gates,
                              env_file=adapter_entry.env_file,
                              device_id=device_id,
-                             require_exclusive_device=config.devices.require_exclusive)
+                             require_exclusive_device=config.devices.require_exclusive,
+                             target=request.get("target"),
+                             candidate=request.get("candidate"),
+                             expected_source=request.get("source_identity"),
+                             expected_candidate=expected_candidate)
+    except TargetRequestError as exc:
+        # The request no longer describes the tree, so nothing ran. This is a
+        # refusal of the queued request, not a gate verdict: publishing FAIL or
+        # BLOCKED_ENV would blame the machine or the candidate for a caller's
+        # changed files.
+        store.transition(execution_id, api.ExecutionState.INTERRUPTED,
+                         event="request_identity_changed",
+                         **{"exitReason": "REQUEST_IDENTITY_CHANGED: " + str(exc)[:400],
+                            "finishedAt": time.time()})
+        return store.read_status(execution_id)
     except LockBusy as exc:
         # A competing AgentGates run holds the source or build lease. This is
         # a resource refusal, not an environment fault, and no gate ran.

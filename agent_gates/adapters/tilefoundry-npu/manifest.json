@@ -5,6 +5,7 @@
   "capabilities": [
     "cpu-regression",
     "device-regression",
+    "l3-promotion",
     "cannbench-eval",
     "cannbench-remote"
   ],
@@ -17,7 +18,8 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_host_gate.py": "0477f3f8dc5bfbeac1bc5c1f7068e4234c34947010e7447ef1fbedbbf299024b"
+    "scripts/tilefoundry_host_gate.py": "79656286cecc0725a199ed1a525585964793937f3037e3b6549d3bf5ee99dfdc",
+    "scripts/host_control.sh": "683a3b9f562dd2bf47149d52ebf638428236bfd49665644d1dca4c39bf73d029"
   },
   "recipes": [
     {
@@ -94,24 +96,50 @@
       ]
     },
     {
-      "id": "tilefoundry-npu.cannbench-prep",
+      "id": "tilefoundry-npu.l3-promotion",
       "cwd": "source",
-      "timeout": 900,
+      "timeout": 1920,
+      "configCheckTimeout": 120,
+      "dynamicTarget": true,
       "deviceWindow": {
         "waitSeconds": 60
       },
       "argv": [
-        "python3",
-        "-B",
-        "{pack}/scripts/tilefoundry_host_gate.py",
+        "bash",
+        "-e",
+        "{pack}/scripts/host_control.sh",
+        "--l3-promotion"
+      ],
+      "configCheck": [
+        "bash",
+        "-e",
+        "{pack}/scripts/host_control.sh",
+        "--check-config-l3"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "tilefoundry-npu.cannbench-prep",
+      "cwd": "source",
+      "timeout": 900,
+      "dynamicTarget": "optional",
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
+      "argv": [
+        "bash",
+        "-e",
+        "{pack}/scripts/host_control.sh",
         "--cannbench-prep",
         "--timeout",
         "840"
       ],
       "configCheck": [
-        "python3",
-        "-B",
-        "{pack}/scripts/tilefoundry_host_gate.py",
+        "bash",
+        "-e",
+        "{pack}/scripts/host_control.sh",
         "--check-config-cannbench"
       ],
       "blockedExitCodes": [
@@ -122,21 +150,22 @@
       "id": "tilefoundry-npu.cannbench",
       "cwd": "source",
       "timeout": 3600,
+      "dynamicTarget": "optional",
       "deviceWindow": {
         "waitSeconds": 60
       },
       "argv": [
-        "python3",
-        "-B",
-        "{pack}/scripts/tilefoundry_host_gate.py",
+        "bash",
+        "-e",
+        "{pack}/scripts/host_control.sh",
         "--cannbench",
         "--timeout",
         "3300"
       ],
       "configCheck": [
-        "python3",
-        "-B",
-        "{pack}/scripts/tilefoundry_host_gate.py",
+        "bash",
+        "-e",
+        "{pack}/scripts/host_control.sh",
         "--check-config-cannbench"
       ],
       "blockedExitCodes": [
@@ -211,6 +240,24 @@
         "windowOpened": true,
         "windowReleased": true,
         "occupancyRecorded": true
+      }
+    },
+    {
+      "id": "tilefoundry-npu-l3-promotion",
+      "recipeId": "tilefoundry-npu.l3-promotion",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "promotionEligible": true,
+        "coverageComplete": true,
+        "cachePreflightOk": true,
+        "testsCollectedPositive": true,
+        "notAllSkipped": true,
+        "testsFailed": 0,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true,
+        "candidateDigestRecorded": true
       }
     },
     {

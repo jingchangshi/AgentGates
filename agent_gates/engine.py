@@ -1,17 +1,19 @@
 """Run one adapter's gate DAG with source leases and independent evidence."""
 from __future__ import annotations
+from contextlib import ExitStack
 import hashlib
 import os
 from pathlib import Path
 import re
 import sys
+from . import dynamic_target
 from .evaluator import evaluate
 from .docker_quarantine import is_quarantined_recipe, quarantine_reason
 from .evidence import EvidenceStore, aggregate
 from .executor import execute, executable_identity, file_reference, now
 from . import machine_env
-from .locking import acquire, lock_path
-from .manifest import Manifest, ManifestError, SHA256
+from .locking import acquire, device_lock_root as shared_device_lock_root, lock_path
+from .manifest import Manifest, ManifestError, SHA256, strict_json
 from .registry import Registry
 from .source_identity import snapshot, source_root
 
@@ -70,27 +72,104 @@ EXCLUSIVE_VARIABLE = {"tilelang-hivm-npu": "TILELANG_HIVM_REQUIRE_EXCLUSIVE_DEVI
 # other users' process ids, nothing the receipt should not carry.
 REASON_LIMIT = 300
 
+# A configuration check may explain a structured refusal on one stderr line. The
+# engine keeps only the last such line, validates its tiny grammar, and records
+# it beside the human-readable reason. A malformed line is ignored: diagnostics
+# must never become a second, unreviewed classification channel.
+CONFIG_OBSERVATION_PREFIX = "AGENT_GATES_CONFIG:"
+CONFIG_CATEGORIES = frozenset({"CONFIG", "DEPENDENCY", "DEVICE", "RESOURCE",
+                               "TARGET", "CACHE"})
+
 # Variables that change which toolchain, interpreter or libraries the recipe
 # executes without appearing in the adapter's own prefix. They are inherited
 # from the launching shell, so the receipt binds them by hash: two runs of the
 # same recorded argv must not resolve to different compilers while their
 # configuration hash stays identical. Values are never written to a receipt.
-EXECUTION_ENV = ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "HOME", "SHELL")
+EXECUTION_ENV = ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH",
+                 "HOME", "SHELL", "AGENT_GATES_DEVICE_LOCK_ROOT")
 
 
-def config_reason(check):
-    reference = check.get("stderr") or check.get("stdout") or {}
+def _tail_text(reference, limit=65536):
+    """The last bounded bytes of one log, decoded, without reading a whole file.
+
+    A misbehaving configuration check can write an unbounded log before it is
+    killed; diagnostics read a fixed tail so recording a reason cannot become a
+    second resource problem.
+    """
     path = reference.get("path")
     if not path:
         return ""
     try:
-        text = Path(path).read_text(errors="replace")
+        with Path(path).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - limit))
+            data = stream.read()
     except OSError:
         return ""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return ""
-    return lines[-1][:REASON_LIMIT]
+    if size > limit:
+        # The first line is likely cut mid-way; a diagnostic line must be whole.
+        data = data.split(b"\n", 1)[-1]
+    return data.decode("utf-8", "replace")
+
+
+def config_reason(check):
+    # The human line usually lands on stderr, but a check that puts its
+    # observation there and its prose on stdout must not lose the prose.
+    for name in ("stderr", "stdout"):
+        text = _tail_text(check.get(name) or {})
+        lines = [line.strip() for line in text.splitlines() if line.strip()
+                 and not line.lstrip().startswith(CONFIG_OBSERVATION_PREFIX)]
+        if lines:
+            return lines[-1][:REASON_LIMIT]
+    return ""
+
+
+def config_observation(check):
+    """The last well-formed structured configuration observation, or None."""
+    for name in ("stderr", "stdout"):
+        text = _tail_text(check.get(name) or {})
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line.startswith(CONFIG_OBSERVATION_PREFIX):
+                continue
+            payload = line[len(CONFIG_OBSERVATION_PREFIX):].strip()
+            try:
+                value = strict_json(payload)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(value, dict) or set(value) != {"category", "detail"}:
+                continue
+            category, detail = value["category"], value["detail"]
+            if not isinstance(category, str) or category not in CONFIG_CATEGORIES:
+                continue
+            if not isinstance(detail, str):
+                continue
+            detail = " ".join(detail.split())[:REASON_LIMIT]
+            if not detail:
+                continue
+            return {"category": category, "detail": detail}
+    return None
+
+
+def config_check_timeout(recipe):
+    """The independent configuration-check bound, or the historical default."""
+    if recipe.config_check_timeout is not None:
+        return recipe.config_check_timeout
+    return min(120, recipe.timeout)
+
+
+def candidate_matches(source, request):
+    """Whether the bound candidate still has the bytes the receipt records."""
+    if not isinstance(request, dict):
+        return False
+    candidate = request.get("candidate")
+    if not isinstance(candidate, dict) or not isinstance(candidate.get("relativePath"), str):
+        return False
+    try:
+        return dynamic_target.candidate_reference(source, candidate["relativePath"]) == candidate
+    except (OSError, ValueError):
+        return False
 
 
 def environment(manifest: Manifest, env_file: Path | None = None, device_id: str | None = None,
@@ -133,7 +212,9 @@ def environment(manifest: Manifest, env_file: Path | None = None, device_id: str
     # A lease handle is handed to one specific recipe for one specific window.
     # Inheriting it would let a stale export point a recipe at a lease file the
     # engine never took, so every run starts from "no lease was published".
-    for name in LEASE_ENVIRONMENT:
+    # The target/candidate pair follows the same rule: it is published only to a
+    # recipe that declares it, never inherited from the launching shell.
+    for name in (*LEASE_ENVIRONMENT, *dynamic_target.REQUEST_ENVIRONMENT):
         env.pop(name, None)
     exclusive_variable = EXCLUSIVE_VARIABLE.get(manifest.id)
     if exclusive_variable is not None:
@@ -348,13 +429,23 @@ def device_window(observations, lease):
 
 
 class Engine:
-    def __init__(self, *, registry=None, store=None, lock_root=None):
+    def __init__(self, *, registry=None, store=None, lock_root=None, device_lock_root=None):
         self.registry = registry or Registry()
         self.store = store or EvidenceStore()
         self.lock_root = lock_root
+        # Device leases are host-wide, not evidence-directory-wide. An explicit
+        # value exists for tests and unusual deployments; production V1 and V2
+        # both resolve the same canonical root (or its one environment override)
+        # so two processes cannot drive one card at the same time.
+        self.device_lock_root = device_lock_root
+
+    def _device_root(self) -> Path:
+        if self.device_lock_root is not None:
+            return Path(self.device_lock_root)
+        return shared_device_lock_root()
 
     def doctor(self, adapter, source, *, selected=None, env_file=None, device_id=None,
-               require_exclusive_device=False):
+               require_exclusive_device=False, target=None, candidate=None):
         """Probe the configuration checks of one adapter, optionally for one route.
 
         Every route is the default, because a machine diagnostic that silently
@@ -379,10 +470,21 @@ class Engine:
         # the same error with the same precedence rather than an evidence tree
         # to clean up.
         gates = manifest.order(selected) if selected else None
+        request = None
+        if gates is None:
+            if target is not None or candidate is not None:
+                raise dynamic_target.TargetRequestError(
+                    "target and candidate require an explicit gate selection")
+        else:
+            # A scoped diagnosis speaks for the route that will actually run,
+            # so a dynamic route must be probed with the same pair a run needs.
+            request = dynamic_target.resolve_request(
+                manifest, gates, source, target=target, candidate=candidate)
         run_id, directory = self.store.create_run()
         checks, failures, checked, deduplicated = [], [], [], {}
         for recipe_id in self._doctor_recipes(manifest, gates, source, deduplicated):
             recipe = manifest.resolve_recipe(recipe_id, source)
+            check_env = dynamic_target.apply_environment(env, recipe, request)
             if is_quarantined_recipe(manifest.id, recipe_id, recipe.argv):
                 msg = quarantine_reason(f"recipe {recipe_id!r}")
                 checks.append({
@@ -401,7 +503,8 @@ class Engine:
                 if not recipe.config_check:
                     failures.append(f"CONFIG_CHECK_MISSING: {recipe_id}")
                     continue
-                result = execute(recipe.config_check, cwd=recipe.cwd, env=env, timeout=min(120, recipe.timeout),
+                result = execute(recipe.config_check, cwd=recipe.cwd, env=check_env,
+                                 timeout=config_check_timeout(recipe),
                                  log_dir=directory / "doctor" / recipe_id)
                 checks.append({"recipeId": recipe_id, **result})
                 checked.append(recipe_id)
@@ -460,19 +563,60 @@ class Engine:
         return recipes
 
     def run(self, adapter, source, selected, *, env_file=None, device_id=None,
-            require_exclusive_device=False):
+            require_exclusive_device=False, target=None, candidate=None,
+            expected_source: dict | None = None,
+            expected_candidate: dict | None = None):
+        """Execute one route and publish its signed receipt.
+
+        A queued request (`submit` -> worker) passes the source and candidate
+        identities frozen at admission as `expected_source` and
+        `expected_candidate`. They are checked here, before a run directory
+        exists and again under the locks, so a worker that starts after the tree
+        changed refuses instead of executing bytes nobody submitted. V1 callers
+        pass neither and keep the old behaviour.
+        """
         manifest = self.registry.get(adapter)
         source = source_root(Path(source))
         if self.store.root.resolve().is_relative_to(source):
             raise ValueError("evidence directory must be outside the source root")
         env = environment(manifest, env_file, device_id, require_exclusive_device)
         order = manifest.order(selected)
+        if expected_candidate is not None:
+            # Check the frozen binding against the tree before resolving the
+            # request, so a deleted or replaced candidate is always reported as
+            # an identity change rather than as whichever resolution error it
+            # happened to cause.
+            relative = expected_candidate.get("relativePath") \
+                if isinstance(expected_candidate, dict) else None
+            if not isinstance(relative, str):
+                raise dynamic_target.TargetRequestError(
+                    "CANDIDATE_IDENTITY_CHANGED: the candidate binding is malformed")
+            try:
+                current = dynamic_target.candidate_reference(source, relative)
+            except (OSError, ValueError) as exc:
+                raise dynamic_target.TargetRequestError(
+                    "CANDIDATE_IDENTITY_CHANGED: the candidate bound at submission "
+                    "is no longer a readable file under the source") from exc
+            if current != expected_candidate:
+                raise dynamic_target.TargetRequestError(
+                    "CANDIDATE_IDENTITY_CHANGED: the candidate is not the one bound at submission")
+        request = dynamic_target.resolve_request(
+            manifest, order, source, target=target, candidate=candidate)
+        if expected_candidate is not None and (
+                request is None or request["candidate"] != expected_candidate):
+            raise dynamic_target.TargetRequestError(
+                "CANDIDATE_IDENTITY_CHANGED: the candidate is not the one bound at submission")
+        if expected_source is not None and snapshot(source) != expected_source:
+            raise dynamic_target.TargetRequestError(
+                "SOURCE_IDENTITY_CHANGED: the source is not the one bound at submission")
         run_id, directory = self.store.create_run()
         receipt = {"schemaVersion": 1, "runId": run_id, "startedAt": now(), "finishedAt": None,
                    "adapter": {"id": manifest.id, "path": str(manifest.path), "sha256": manifest.manifest_hash,
                                "files": manifest.files}, "selectedGates": selected, "gates": [],
                    "source": snapshot(source), "configuration": {}, "status": "NOT_RUN",
                    "trust": "local-user-integrity", "historicalPassReuse": False}
+        if request is not None:
+            receipt["dynamicTarget"] = request
         try:
             receipt["configuration"] = configuration(manifest, env)
             resources = ["source:" + str(source)]
@@ -482,15 +626,18 @@ class Engine:
             build = build_directory(source, manifest, env)
             resources.append("build:" + str(build))
             variable, windows = device_lease_plan(manifest, order, source)
+            device_resource = None
+            device_root = None
             if variable is not None:
                 device = env.get(variable, "")
                 if not re.fullmatch(r"[0-9]+", device):
                     raise ValueError(f"explicit {variable} or --device-id authorization required")
                 receipt["authorizedDeviceId"] = str(int(device))
+                device_root = self._device_root()
                 if not windows:
                     # Nothing declared a window, so the engine holds the card for
                     # the whole recipe exactly as it always has.
-                    resources.append("npu:" + str(int(device)))
+                    device_resource = "npu:" + str(int(device))
                 else:
                     # The card is NOT leased here: each windowed recipe takes it
                     # itself, immediately around the work that touches it. The
@@ -499,9 +646,19 @@ class Engine:
                     receipt["deviceLease"] = {"mode": "windowed",
                                               "resource": "npu:" + str(int(device)),
                                               "gates": sorted(windows)}
-            with acquire(resources, root=self.lock_root) as lease_fds:
+            with ExitStack() as stack:
+                lease_fds = stack.enter_context(acquire(resources, root=self.lock_root))
+                if device_resource is not None:
+                    lease_fds += stack.enter_context(
+                        acquire([device_resource], root=device_root))
                 # Capture after acquiring locks; another AgentGates run may just have finished.
                 receipt["source"] = snapshot(source)
+                if expected_source is not None and receipt["source"] != expected_source:
+                    raise dynamic_target.TargetRequestError(
+                        "SOURCE_IDENTITY_CHANGED: the source changed before the run acquired its locks")
+                if request is not None and not candidate_matches(source, request):
+                    raise dynamic_target.TargetRequestError(
+                        "CANDIDATE_IDENTITY_CHANGED: the candidate changed before the run acquired its locks")
                 for gate_id in order:
                     definition = manifest.gates[gate_id]
                     recipe = manifest.resolve_recipe(definition["recipeId"], source)
@@ -520,7 +677,7 @@ class Engine:
                         continue
                     try:
                         self._gate(manifest, source, recipe, gate, receipt, env, directory, lease_fds,
-                                   windows.get(gate_id))
+                                   windows.get(gate_id), device_root)
                     except KeyboardInterrupt:
                         gate.update(status="FAIL", failures=["INTERRUPTED"])
                         break
@@ -531,6 +688,10 @@ class Engine:
                 for gate in receipt["gates"]:
                     if gate["status"] == "PASS" and any(not self.store._matches(item) for item in gate["artifacts"]):
                         gate.update(status="STALE", failures=["ARTIFACT_IDENTITY_CHANGED"])
+                if request is not None and not candidate_matches(source, request):
+                    for gate in receipt["gates"]:
+                        if gate["status"] == "PASS":
+                            gate.update(status="STALE", failures=["CANDIDATE_IDENTITY_CHANGED"])
                 current = snapshot(source)
                 if current != receipt["source"]:
                     for gate in receipt["gates"]:
@@ -541,6 +702,11 @@ class Engine:
                     for gate in receipt["gates"]:
                         if gate["status"] == "PASS":
                             gate.update(status="STALE", failures=["CONFIGURATION_IDENTITY_CHANGED"])
+        except dynamic_target.TargetRequestError:
+            # A request that no longer describes the tree is a request refusal,
+            # not a gate verdict: publishing BLOCKED_ENV would claim the machine
+            # was at fault for a caller's changing candidate.
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             existing = {item["gateId"] for item in receipt["gates"]}
             for gate_id in order:
@@ -575,8 +741,20 @@ class Engine:
         return {**receipt, "receiptPath": str(path)}
 
     def _gate(self, manifest, source, recipe, gate, receipt, env, directory, lease_fds,
-              window_recipe=None):
+              window_recipe=None, device_root=None):
         manifest.validate_files()
+        request = receipt.get("dynamicTarget")
+        bound = request if isinstance(request, dict) else None
+        if recipe.dynamic_target:
+            if bound is None:
+                gate.update(status="INVALID_EVIDENCE", failures=["DYNAMIC_TARGET_MISSING"])
+                return
+        # A recipe that accepts the request consumes it when the run has one, so
+        # its evidence must describe the same candidate bytes throughout.
+        consumed = bound if dynamic_target.accepts_request(recipe) else None
+        if consumed is not None and not candidate_matches(source, consumed):
+            gate.update(status="STALE", failures=["CANDIDATE_IDENTITY_CHANGED"])
+            return
         gate["sourceBefore"] = snapshot(source)
         if gate["sourceBefore"] != receipt["source"]:
             gate.update(status="STALE", failures=["SOURCE_IDENTITY_CHANGED"])
@@ -586,7 +764,9 @@ class Engine:
             gate.update(status="BLOCKED_ENV", failures=["CONFIG_CHECK_MISSING"])
             return
         if recipe.config_check:
-            check = execute(recipe.config_check, cwd=recipe.cwd, env=env, timeout=min(120, recipe.timeout),
+            check_env = dynamic_target.apply_environment(env, recipe, bound)
+            check = execute(recipe.config_check, cwd=recipe.cwd, env=check_env,
+                            timeout=config_check_timeout(recipe),
                             log_dir=directory / gate["gateId"] / "config", lease_fds=lease_fds)
             gate["configCheck"] = check
             if check["exitCode"] != 0 or check["timedOut"] or check["interrupted"]:
@@ -595,10 +775,19 @@ class Engine:
                 # bounded line on the Gate so a reader does not have to open
                 # the log to learn why the Gate never started. The failure
                 # marker itself stays machine-readable and unparameterised.
-                gate.update(status="BLOCKED_ENV", failures=["CONFIG_CHECK_FAILED"],
-                            configReason=config_reason(check))
+                # A structured observation, when the Adapter publishes one,
+                # adds the machine-readable category beside that human line.
+                update = {"status": "BLOCKED_ENV", "failures": ["CONFIG_CHECK_FAILED"],
+                          "configReason": config_reason(check)}
+                observation = config_observation(check)
+                if observation is not None:
+                    update["configObservation"] = observation
+                gate.update(**update)
                 return
         manifest.validate_files()
+        if consumed is not None and not candidate_matches(source, consumed):
+            gate.update(status="STALE", failures=["CANDIDATE_IDENTITY_CHANGED"])
+            return
         if snapshot(source) != gate["sourceBefore"]:
             gate.update(status="STALE", failures=["SOURCE_CHANGED_DURING_CONFIG_CHECK"])
             return
@@ -607,15 +796,16 @@ class Engine:
             return
         inputs = artifact_inputs(source, manifest, env)
         gate["artifactInputs"] = list(inputs.values())
-        recipe_env = env
+        recipe_env = dynamic_target.apply_environment(env, recipe, bound)
         lease = None
         if window_recipe is not None:
             # The recipe opens the lease itself, so it is given the exact file the
             # engine would have locked. The whole-recipe lease is deliberately not
             # held: holding it here would deadlock the child that waits for it.
+            root = device_root if device_root is not None else self._device_root()
             lease = {"resource": "npu:" + receipt["authorizedDeviceId"],
-                     "path": str(lock_path("npu:" + receipt["authorizedDeviceId"], self.lock_root))}
-            recipe_env = dict(env)
+                     "path": str(lock_path("npu:" + receipt["authorizedDeviceId"], root))}
+            recipe_env = dict(recipe_env)
             recipe_env.update({DEVICE_LEASE_PATH: lease["path"],
                                DEVICE_LEASE_RESOURCE: lease["resource"],
                                DEVICE_LEASE_WAIT: repr(float(window_recipe.device_window))})
@@ -637,8 +827,17 @@ class Engine:
             # A timeout or an interrupt is a different event even when the
             # supervisor's final status happens to match: the child may have
             # been killed mid-run after starting work, so it stays a failure.
-            gate.update(status="BLOCKED_ENV", failures=[f"BLOCKED_EXIT_CODE: {process['exitCode']}"],
-                        configReason=config_reason(process))
+            update = {"status": "BLOCKED_ENV", "failures": [f"BLOCKED_EXIT_CODE: {process['exitCode']}"],
+                      "configReason": config_reason(process)}
+            # A structured observation belongs to the configuration PREFLIGHT.
+            # A recipe's own exit code describes execution, so it keeps only the
+            # Adapter's human reason; letting the preflight category override an
+            # execution-time classification would relabel a workload failure.
+            gate.update(**update)
+        if consumed is not None and not candidate_matches(source, consumed):
+            # The bytes that ran are no longer the bytes the receipt binds, so
+            # this Gate's evidence cannot describe one candidate.
+            gate.update(status="STALE", failures=gate["failures"] + ["CANDIDATE_IDENTITY_CHANGED"])
         if lease is not None:
             # A windowed gate must SHOW its window. The engine cannot observe when
             # the child held the flock, so the child states it and this decides

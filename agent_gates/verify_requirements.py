@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import api_types as api
+from . import dynamic_target
 from .evidence import EvidenceStore
 from .manifest import ManifestError
 from .registry import Registry
@@ -32,7 +33,7 @@ def _now():
 
 
 def _result(*, workspace, adapter, required_gates, run_id, failures, status,
-            matched=None, identity=None, satisfied=False):
+            matched=None, identity=None, satisfied=False, target=None, candidate=None):
     return api.RequirementVerificationResult(
         satisfied=satisfied,
         status=status,
@@ -44,6 +45,8 @@ def _result(*, workspace, adapter, required_gates, run_id, failures, status,
         workspace=workspace,
         adapter=adapter,
         required_gates=list(required_gates),
+        target=target,
+        candidate=candidate,
     )
 
 
@@ -62,11 +65,13 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     adapter_id = requirement.adapter
     required = list(requirement.required_gates)
     run_id = requirement.run_id
+    target, candidate = requirement.target, requirement.candidate
 
     def refuse(failures, status=api.GateStatus.INVALID_EVIDENCE, matched=None, identity=None):
         return _result(workspace=workspace_id, adapter=adapter_id, required_gates=required,
                        run_id=run_id, failures=failures, status=status,
-                       matched=matched, identity=identity, satisfied=False)
+                       matched=matched, identity=identity, satisfied=False,
+                       target=target, candidate=candidate)
 
     # ── request shape ────────────────────────────────────────────────────────
     if not required:
@@ -74,6 +79,14 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     if not run_id or not isinstance(run_id, str):
         # The explicit run id is the whole point; "latest" is not accepted.
         return refuse(["RUN_ID_REQUIRED"], api.GateStatus.NOT_RUN)
+    if (target is None) != (candidate is None):
+        return refuse(["TARGET_CANDIDATE_PAIR_REQUIRED"], api.GateStatus.NOT_RUN)
+    if target is not None:
+        try:
+            dynamic_target.validate_target(target)
+            dynamic_target.validate_candidate(candidate)
+        except dynamic_target.TargetRequestError as exc:
+            return refuse([f"INVALID_TARGET_REQUEST: {exc}"], api.GateStatus.NOT_RUN)
 
     registry = registry or Registry()
     store = store or EvidenceStore(config.evidence_root)
@@ -114,6 +127,18 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     recorded_adapter = receipt.get("adapter", {}).get("id")
     if recorded_adapter != adapter_id:
         return refuse([f"ADAPTER_MISMATCH: receipt={recorded_adapter} required={adapter_id}"])
+
+    # ── (4) the receipt executed the target and candidate the task names ────
+    if target is not None:
+        bound = receipt.get("dynamicTarget")
+        if not isinstance(bound, dict):
+            return refuse(["TARGET_NOT_BOUND"])
+        if bound.get("target") != target:
+            return refuse([f"TARGET_MISMATCH: receipt={bound.get('target')} required={target}"])
+        recorded_candidate = bound.get("candidate")
+        recorded_path = recorded_candidate.get("relativePath") if isinstance(recorded_candidate, dict) else None
+        if recorded_path != candidate:
+            return refuse([f"CANDIDATE_MISMATCH: receipt={recorded_path} required={candidate}"])
 
     # ── (3) receipt-bound source root matches the CURRENT configuration ─────
     recorded_root = receipt.get("source", {}).get("root")
@@ -169,4 +194,5 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     # explicit for a reader rather than implied by a function call.
     return _result(workspace=workspace_id, adapter=adapter_id, required_gates=required,
                    run_id=run_id, failures=[], status=api.GateStatus.PASS,
-                   matched=matched, identity=identity, satisfied=True)
+                   matched=matched, identity=identity, satisfied=True,
+                   target=target, candidate=candidate)

@@ -240,12 +240,28 @@ class DoctorReport(_Model):
 # ── execution ────────────────────────────────────────────────────────────────
 
 class ExecutionRequest(_Model):
-    """What a caller asked for. Every machine parameter was resolved by config."""
+    """What a caller asked for. Every machine parameter was resolved by config.
+
+    `target` and `candidate` are the typed request a promotion route accepts:
+    a canonical workload name and a source-relative file path. They are data,
+    never argv. A required route (`dynamicTarget: true`) refuses to run without
+    them; an optional route accepts them or resolves its own managed fixed
+    target; any other route refuses them.
+
+    `device_id` names one NPU card the caller explicitly chooses for this run.
+    It is not an arbitrary machine setting: the local configuration still owns
+    the authorized set (`devices.allowed_npu_devices`) and the bounded 0-63 id
+    space, so this field can only pick among cards the operator already allowed.
+    Omitting it keeps the deterministic configured default.
+    """
 
     workspace: str
     adapter: str
     gates: list[str]
     request_id: str | None = None
+    target: str | None = None
+    candidate: str | None = None
+    device_id: str | None = None
 
 
 class GateResult(_Model):
@@ -274,6 +290,9 @@ class ExecutionStatus(_Model):
     completed_gates: list[str] = Field(default_factory=list)
     message: str | None = None
     exit_reason: str | None = None
+    target: str | None = None
+    candidate: str | None = None
+    device_id: str | None = None
 
 
 class ExecutionResult(_Model):
@@ -297,6 +316,9 @@ class ExecutionResult(_Model):
     finished_at: str | None = None
     exit_reason: str | None = None
     message: str | None = None
+    target: str | None = None
+    candidate: str | None = None
+    device_id: str | None = None
 
 
 # ── evidence verification ────────────────────────────────────────────────────
@@ -325,6 +347,11 @@ class VerificationRequirement(_Model):
     # verifier refusal (RUN_ID_REQUIRED) the policy can report precisely,
     # rather than a schema error that never reaches the verifier.
     run_id: str | None = None
+    # When present, the receipt must have executed exactly this target and
+    # candidate. Both-or-neither is enforced by the verifier, not by the schema,
+    # so the refusal token can name which half was missing.
+    target: str | None = None
+    candidate: str | None = None
 
 
 class RequirementVerificationResult(_Model):
@@ -345,6 +372,8 @@ class RequirementVerificationResult(_Model):
     workspace: str
     adapter: str
     required_gates: list[str] = Field(default_factory=list)
+    target: str | None = None
+    candidate: str | None = None
 
 
 # ── wait ─────────────────────────────────────────────────────────────────────

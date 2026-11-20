@@ -14,8 +14,11 @@ always reads the configuration its request was bound to.
 
 Objective C2 forbids an agent from naming any machine parameter. That rule is
 enforced by *shape*: the tool input models simply have no field for a source
-directory, an interpreter, a container or a device. Everything they cannot name
-lives here, written by an operator.
+directory, an interpreter, a container or a device setting. The one device
+selector an execution request may carry (`device_id`) is not a machine setting:
+it must name a card from `devices.allowed_npu_devices`, so it can choose among
+cards the operator already authorized but cannot widen that set. Everything the
+models cannot name lives here, written by an operator.
 
 ## Full example
 

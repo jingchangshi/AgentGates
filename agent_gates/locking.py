@@ -43,6 +43,28 @@ def lock_root(root: Path | None = None) -> Path:
     return Path(root) if root else Path.home() / ".local/state/agent-gates/locks"
 
 
+DEVICE_LOCK_ROOT_ENV = "AGENT_GATES_DEVICE_LOCK_ROOT"
+
+
+def device_lock_root(environ=None) -> Path:
+    """The one lease namespace for a physical card, shared by V1 and V2.
+
+    Source and build leases follow the selected state directory, but a card does
+    not move with it: a V1 process using the default evidence root and a V2
+    worker using `<state_root>/locks` must still block each other on `npu:<id>`.
+    This root is therefore independent of configuration, with one explicit
+    operator override for tests and unusual deployments.
+    """
+    source = os.environ if environ is None else environ
+    explicit = (source.get(DEVICE_LOCK_ROOT_ENV) or "").strip()
+    if not explicit:
+        return lock_root(None)
+    path = Path(explicit).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{DEVICE_LOCK_ROOT_ENV} must be an absolute path")
+    return path
+
+
 def lock_path(resource: str, root: Path | None = None) -> Path:
     """The file one resource's lease lives in.
 

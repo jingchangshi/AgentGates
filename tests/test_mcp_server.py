@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from agent_gates import api_types as api
 from agent_gates.manifest import digest
 
 EXPECTED_TOOLS = [
@@ -34,14 +37,19 @@ evidence_root = "{evidence}"
 
 [adapters.test-pack]
 
+[adapters.test-npu]
+
 [workspaces.ws]
 source_root = "{source}"
-adapters = ["test-pack"]
+adapters = ["test-pack", "test-npu"]
 
 [worker]
 backend = "systemd"
 max_concurrent = 2
 python = "{python}"
+
+[devices]
+allowed_npu_devices = [0, 1, 2]
 """
 
 
@@ -75,6 +83,21 @@ class McpFixture(unittest.TestCase):
                        "observationChecks": {"ok": True}}],
         }
         (self.pack / "manifest.json").write_text(json.dumps(manifest))
+        # A second adapter exists only to prove that submit carries an explicit
+        # card into the same allowlist check configuration uses. It never runs:
+        # the protocol test names a device outside allowed_npu_devices.
+        npu_pack = self.root / "adapters/test-npu"
+        npu_pack.mkdir(parents=True)
+        (npu_pack / "manifest.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "test-npu", "version": "1",
+            "files": {},
+            "permissions": {"sourceWrite": False, "hostExecution": True},
+            "recipes": [{"id": "npu.run", "cwd": "source", "timeout": 60,
+                         "argv": [PYTHON, "-I", "-c", "print(1)"]}],
+            "gates": [{"id": "npu", "recipeId": "npu.run",
+                       "gateType": "deterministic-test",
+                       "observationChecks": {"exitCodeZero": True}}],
+        }))
         (self.root / "state").mkdir()
         (self.root / "evidence").mkdir()
         self.config_path = self.root / "config.toml"
@@ -159,6 +182,48 @@ class ProtocolTests(McpFixture):
         result = self.call(action)
         self.assertTrue(result.is_error)
         self.assertIn("shell_command", str(result.content))
+
+    def test_submit_declares_and_checks_an_explicit_device(self):
+        async def schema_action(session):
+            return (await session.list_tools()).tools
+
+        submit = next(tool for tool in self.call(schema_action)
+                      if tool.name == "submit")
+        self.assertIn("device_id", submit.input_schema["properties"])
+        self.assertNotIn("device_id", submit.input_schema.get("required", []))
+
+        # A card outside the configured authorized set is refused before any
+        # worker starts, which proves the field reached the manager rather than
+        # being declared and dropped by the transport.
+        async def action(session):
+            return await session.call_tool(
+                "submit", {"workspace": "ws", "adapter": "test-npu",
+                           "gates": ["npu"], "device_id": "9"})
+
+        result = self.call(action)
+        self.assertTrue(result.is_error)
+        # The stdio transport renders a handler exception opaquely; the readable
+        # code is asserted against the handler itself below.
+
+    def test_submit_passes_an_explicit_device_to_the_manager(self):
+        """The MCP schema is not enough: the handler must not drop the field."""
+        from agent_gates.mcp_server import build_server
+
+        with patch.dict(os.environ, {
+                "AGENT_GATES_CONFIG": str(self.config_path),
+                "AGENT_GATES_ADAPTERS_ROOT": str(self.root / "adapters")}):
+            server = build_server()
+            tool = next(tool for tool in server._tool_manager.list_tools()
+                        if tool.name == "submit")
+
+            async def call():
+                with self.assertRaises(api.APIError) as caught:
+                    await tool.fn(workspace="ws", adapter="test-npu",
+                                  gates=["npu"], device_id="9")
+                return caught.exception
+
+            error = anyio.run(call)
+        self.assertIs(error.code, api.ErrorCode.DEVICE_NOT_AUTHORIZED)
 
     def test_status_of_unknown_execution_is_an_error(self):
         async def action(session):

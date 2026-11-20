@@ -46,7 +46,9 @@ class CoreFixture(unittest.TestCase):
         self.write_manifest()
         self.registry = Registry(self.root / "adapters")
         self.store = EvidenceStore(self.root / "evidence")
-        self.engine = Engine(registry=self.registry, store=self.store, lock_root=self.root / "locks")
+        self.engine = Engine(registry=self.registry, store=self.store,
+                             lock_root=self.root / "locks",
+                             device_lock_root=self.root / "locks")
 
     def write_manifest(self):
         self.manifest["files"] = {"scripts/gate.py": digest(self.script)}

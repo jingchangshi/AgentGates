@@ -57,8 +57,24 @@ class ManifestAndParityCase(unittest.TestCase):
         self.assertEqual(prep_recipe.device_window, 60.0)
         self.assertTrue(bench_recipe.uses_device)
         self.assertEqual(bench_recipe.device_window, 60.0)
+        # The L4 prep and official gates accept the managed target/candidate
+        # pair so the two recipes stay bound to one target, while an unmanaged
+        # invocation still runs the configured targets file.
+        self.assertFalse(prep_recipe.dynamic_target)
+        self.assertTrue(prep_recipe.dynamic_target_optional)
+        self.assertFalse(bench_recipe.dynamic_target)
+        self.assertTrue(bench_recipe.dynamic_target_optional)
         self.assertFalse(remote_recipe.uses_device)
         self.assertIsNone(remote_recipe.device_window)
+        # L3 and L4 prep/official control processes must not load project
+        # sitecustomize or inherited PYTHON* hooks.
+        for recipe in (prep_recipe, bench_recipe):
+            self.assertEqual(recipe.argv[0], "bash")
+            self.assertTrue(recipe.argv[2].endswith("/scripts/host_control.sh"))
+            self.assertTrue(recipe.config_check[2].endswith("/scripts/host_control.sh"))
+        wrapper = (ADAPTER / "scripts/host_control.sh").read_text(encoding="utf-8")
+        self.assertIn("-S", wrapper)
+        self.assertIn("-E", wrapper)
 
     def test_key_and_engine_wiring_parity(self):
         self.assertEqual(tuple(sorted(GATE.TOOLCHAIN_KEYS)), tuple(sorted(machine_env.TILEFOUNDRY_NPU_KEYS)))
@@ -380,6 +396,145 @@ class CannbenchIntegrationCase(unittest.TestCase):
         self.assertEqual(origin2, "repo-file")
         self.assertEqual(targets2, (("level4/mla", "examples/ascend950pr_ops/mla/kernels.py"),))
 
+    def test_managed_request_narrows_l4_to_the_requested_pair(self):
+        values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+        requested_candidate = "examples/ascend950pr_ops/attention_residual/kernels_v2.py"
+        (self.src / requested_candidate).write_text("# candidate v2\n", encoding="utf-8")
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_GATES_TARGET": "level4/attention_residual",
+                "AGENT_GATES_CANDIDATE": requested_candidate,
+            },
+            clear=False,
+        ):
+            origin, narrowed = GATE.resolve_cannbench_targets(
+                values, self.src, self.repo, allow_request=True
+            )
+        self.assertEqual(origin, "dynamic-request")
+        self.assertEqual(narrowed, (("level4/attention_residual", requested_candidate),))
+
+    def test_managed_request_accepts_a_task_outside_the_targets_file(self):
+        values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+        (self.repo / "tasks/level4/mla").mkdir(parents=True)
+        for fname in ("proto.yaml", "cases.yaml", "golden.py"):
+            (self.repo / "tasks/level4/mla" / fname).write_text(f"# {fname}\n", encoding="utf-8")
+        (self.src / "examples/ascend950pr_ops/mla").mkdir(parents=True)
+        (self.src / "examples/ascend950pr_ops/mla/kernels.py").write_text("# mla\n", encoding="utf-8")
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_GATES_TARGET": "level4/mla",
+                "AGENT_GATES_CANDIDATE": "examples/ascend950pr_ops/mla/kernels.py",
+            },
+            clear=False,
+        ):
+            origin, narrowed = GATE.resolve_cannbench_targets(
+                values, self.src, self.repo, allow_request=True
+            )
+        self.assertEqual(origin, "dynamic-request")
+        self.assertEqual(narrowed, (("level4/mla", "examples/ascend950pr_ops/mla/kernels.py"),))
+
+    def test_managed_request_keeps_the_targets_file_without_a_pair(self):
+        values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+        with patch.dict(os.environ, {}, clear=True):
+            origin, targets = GATE.resolve_cannbench_targets(
+                values, self.src, self.repo, allow_request=True
+            )
+        self.assertEqual(origin, "env-file")
+        self.assertEqual(
+            targets,
+            (("level4/attention_residual", "examples/ascend950pr_ops/attention_residual/kernels.py"),),
+        )
+
+    def test_a_partial_managed_request_is_refused(self):
+        values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+        with patch.dict(os.environ, {"AGENT_GATES_TARGET": "level4/attention_residual"}, clear=True):
+            with self.assertRaises(GATE.BridgeError):
+                GATE.resolve_cannbench_targets(
+                    values, self.src, self.repo, allow_request=True
+                )
+        with patch.dict(
+            os.environ,
+            {"AGENT_GATES_CANDIDATE": "examples/ascend950pr_ops/attention_residual/kernels.py"},
+            clear=True,
+        ):
+            with self.assertRaises(GATE.BridgeError):
+                GATE.resolve_cannbench_targets(
+                    values, self.src, self.repo, allow_request=True
+                )
+
+    def test_prep_uses_only_the_requested_pair_not_the_machine_target(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            values = GATE._parse_env_file(
+                self.env_file.read_text(encoding="utf-8"), self.env_file
+            )
+            info = {
+                "missing": [],
+                "pythonVersion": "3.12.16",
+                "torchVersion": "2.13.0+cpu",
+                "torchNpuVersion": "2.13.0",
+                "torchCmakeDir": "/tmp/Torch",
+                "torchNpuDir": "/tmp/torch_npu",
+            }
+            (self.repo / "tasks/level4/mla").mkdir(parents=True)
+            for fname in ("proto.yaml", "cases.yaml", "golden.py"):
+                (self.repo / "tasks/level4/mla" / fname).write_text(
+                    f"# {fname}\n", encoding="utf-8"
+                )
+            (self.src / "examples/ascend950pr_ops/mla").mkdir(parents=True)
+            mla_candidate = "examples/ascend950pr_ops/mla/kernels.py"
+            (self.src / mla_candidate).write_text("# mla\n", encoding="utf-8")
+            # Force a prebuilt ABI slot: prep then performs only its common
+            # cann_bench_utils probe, never target inspection or execution.
+            _, slot_dir, utils_dir = GATE._abi_slot(
+                values, self.src, self.repo, self.work_root, info
+            )
+            (utils_dir / "cann_bench_utils").mkdir(parents=True)
+            (utils_dir / "cann_bench_utils" / "_C.so").write_bytes(b"ELF")
+            (slot_dir / "build_meta.json").write_text("{}", encoding="utf-8")
+            lease = self.root / "locks" / "npu.lock"
+            env = {
+                "TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file),
+                "TILEFOUNDRY_NPU_DEVICE_ID": "1",
+                "AGENT_GATES_DEVICE_LEASE_PATH": str(lease),
+                "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:1",
+                "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "2",
+                "AGENT_GATES_TARGET": "level4/mla",
+                "AGENT_GATES_CANDIDATE": mla_candidate,
+            }
+            commands: list[str] = []
+
+            def fake_run_host_bash(cmd, *, cwd, env, **kwargs):
+                commands.append(cmd)
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout='{"cannBenchUtilsCallable": true}\n',
+                    stderr="",
+                )
+
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(GATE, "_inspect_conda_cannbench_env", return_value=info), \
+                    patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                    patch.object(
+                        GATE.adapter_runtime, "run_host_bash", side_effect=fake_run_host_bash
+                    ):
+                rc, obs = GATE.run_cannbench_prep(values, 60.0)
+            self.assertEqual(rc, 0, obs)
+            self.assertEqual(obs["targetsSource"], "dynamic-request")
+            self.assertEqual(obs["targets"], [{
+                "task": "level4/mla",
+                "candidate": mla_candidate,
+            }])
+            rendered = json.dumps(obs, sort_keys=True) + "\n" + "\n".join(commands)
+            self.assertNotIn("attention_residual", rendered)
+            for command in commands:
+                self.assertNotIn("tasks/level4/", command)
+        finally:
+            os.chdir(old_cwd)
+
     def test_work_root_cannot_overlap_source_or_cannbench_repo(self):
         for bad_root in (str(self.src / "work"), str(self.repo / ".cannbench-build")):
             self.write_env(TILEFOUNDRY_NPU_WORK_ROOT=bad_root)
@@ -430,6 +585,10 @@ class CannbenchIntegrationCase(unittest.TestCase):
                 "AGENT_GATES_DEVICE_LEASE_PATH": str(lease),
                 "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:1",
                 "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "2",
+                "PYTHONPATH": "/project/src",
+                "PYTHONHOME": "/project/python",
+                "PYTHONSTARTUP": "/project/sitecustomize.py",
+                "PYTHONUSERBASE": "/project/userbase",
             }
             prep_res = types.SimpleNamespace(returncode=0, stdout='{"cannBenchUtilsCallable": true}\n', stderr="")
             with patch.dict(os.environ, env, clear=True), \
@@ -440,6 +599,8 @@ class CannbenchIntegrationCase(unittest.TestCase):
             self.assertEqual(rc_p, 0)
             self.assertTrue(obs_p["utilsReused"])
             self.assertTrue(obs_p["cannBenchUtilsCallable"])
+            self.assertEqual(obs_p["targetsSource"], "managed")
+            self.assertEqual(obs_p["targets"], [])
             self.assertEqual(obs_p["deviceWindow"]["occupancy"], "free")
 
             bench_payload = {
@@ -481,9 +642,63 @@ class CannbenchIntegrationCase(unittest.TestCase):
             self.assertEqual(obs_b["score"], 81.25)
             self.assertEqual(obs_b["targetsSource"], "env-file")
             self.assertEqual(obs_b["deviceWindow"]["resource"], "npu:1")
-            self.assertEqual(captured_bench_envs[0][1].get("PYTHONNOUSERSITE"), "1")
+            captured_env = captured_bench_envs[0][1]
+            self.assertEqual(captured_env.get("PYTHONNOUSERSITE"), "1")
+            for hook in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+                self.assertNotIn(hook, captured_env)
+            self.assertIn("-E -s", captured_bench_envs[0][0])
+            self.assertIn('AGENT_GATES_ACTIVATION_PYTHONPATH="${PYTHONPATH:-}"', captured_bench_envs[0][0])
             self.assertIn('env["PYTHONNOUSERSITE"] = "1"', GATE.CANNBENCH_RUNNER)
+            self.assertIn('for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):', GATE.CANNBENCH_RUNNER)
+            self.assertIn('env.pop("AGENT_GATES_ACTIVATION_PYTHONPATH", "")', GATE.CANNBENCH_RUNNER)
+            self.assertNotIn('pp_entries.append(env["PYTHONPATH"])', GATE.CANNBENCH_RUNNER)
             self.assertTrue((self.root / "locks" / ".msprof.lock").is_file())
+
+            # A managed request narrows the official run to its pair; the runner
+            # config proves exactly one task/candidate reaches the workload.
+            managed_candidate = "examples/ascend950pr_ops/attention_residual/kernels_v2.py"
+            (self.src / managed_candidate).write_text("# candidate v2\n", encoding="utf-8")
+            stage = self.root / "runner-stage"
+            stage.mkdir()
+
+            class KeepStage:
+                def __enter__(self):
+                    return str(stage)
+
+                def __exit__(self, *exc_info):
+                    return False
+
+            managed_env = dict(env)
+            managed_env["AGENT_GATES_TARGET"] = "level4/attention_residual"
+            managed_env["AGENT_GATES_CANDIDATE"] = managed_candidate
+            with patch.dict(os.environ, managed_env, clear=True), \
+                    patch.object(GATE, "_inspect_conda_cannbench_env", return_value=info), \
+                    patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                    patch.object(GATE.locking, "lock_root", return_value=self.root / "locks"), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_bench_bash), \
+                    patch.object(GATE.tempfile, "TemporaryDirectory", return_value=KeepStage()):
+                rc_m, obs_m = GATE.run_cannbench(values, 60.0)
+            self.assertEqual(rc_m, 0)
+            self.assertEqual(obs_m["targetsSource"], "dynamic-request")
+            runner_cfg = json.loads((stage / "runner_cfg.json").read_text(encoding="utf-8"))
+            self.assertEqual(runner_cfg["targets"], [{
+                "task": "level4/attention_residual",
+                "candidate": managed_candidate,
+            }])
+
+            # Prep accepts the same pair and binds itself to it before the
+            # official recipe runs.
+            with patch.dict(os.environ, managed_env, clear=True), \
+                    patch.object(GATE, "_inspect_conda_cannbench_env", return_value=info), \
+                    patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", return_value=prep_res):
+                rc_pm, obs_pm = GATE.run_cannbench_prep(values, 60.0)
+            self.assertEqual(rc_pm, 0)
+            self.assertEqual(obs_pm["targetsSource"], "dynamic-request")
+            self.assertEqual(obs_pm["targets"], [{
+                "task": "level4/attention_residual",
+                "candidate": managed_candidate,
+            }])
         finally:
             os.chdir(old_cwd)
 

@@ -16,8 +16,10 @@ The host-local TileFoundry-on-Ascend Adapter (`scripts/tilefoundry_host_gate.py`
 | --- | --- | --- | --- |
 | `tilefoundry-npu-cpu` | Conda CPU `pytest` suite (`TORCH_DEVICE_BACKEND_AUTOLOAD=0`, `TILELANG_DISABLE_CACHE=1`, `PYTHONPATH=src:targets/ascend:targets/apple:targets/nvidia`) with JUnit XML verification | **Not sourced** (avoids `ortools`/CANN native library collision) | None |
 | `tilefoundry-npu-device` | Depends on `tilefoundry-npu-cpu`; sources CANN `set_env.sh` + Conda `tilefoundry-npu`, runs in-process NPU probe (`import tilefoundry`, FP32 vector add, BF16 Cube `matmul`, memory > 0, `torch.npu.synchronize()`), and optionally runs `TILEFOUNDRY_NPU_DEVICE_TESTS` via `pytest` | Sourced (`TILEFOUNDRY_NPU_CANN_SETUP`) | Windowed (`deviceWindow`: 60 s) |
-| `tilefoundry-npu-cannbench-prep` | Verifies pure-Python CANNBench dependencies (`PyYAML`, `expecttest`, `ruamel.yaml`, `build`, `safetensors`), builds ABI-isolated `cann_bench_utils/_C.so` under `TILEFOUNDRY_NPU_WORK_ROOT`, and verifies `cann_bench_clone` on NPU | Sourced | Windowed (`deviceWindow`: 60 s) |
-| `tilefoundry-npu-cannbench` | **Local testing mode**: depends on `tilefoundry-npu-cannbench-prep`; injects `--source` TileFoundry `PYTHONPATH`, runs official `cann-bench` `kernel_eval.staged_eval` against `tasks/<levelN>/<op>`, persists reports under `TILEFOUNDRY_NPU_WORK_ROOT/reports`, and records `score` / `avgSpeedup` | Sourced | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-device-fast` | Same NPU activation and window as `tilefoundry-npu-device`, but runs only the configured `TILEFOUNDRY_NPU_DEVICE_TESTS` (no built-in probe); when both are empty it exits `BLOCKED_ENV` instead of publishing a zero-test pass | Sourced | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-l3-promotion` | L3 promotion profile: one `dynamicTarget` recipe takes a canonical CANNBench task and a source-relative candidate, activates CANN/Conda/TileLang itself, runs a cache/import/device preflight, then executes the whole `tests/ascend/benchmarks/test_npu_acceptance.py` suite under the target interpreter on an authorized (possibly shared) card; records interpreter, module sources, candidate digest, per-phase timings, JUnit rows, reference-cache counters, and coverage | Sourced | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-cannbench-prep` | Verifies pure-Python CANNBench dependencies (`PyYAML`, `expecttest`, `ruamel.yaml`, `build`, `safetensors`), builds ABI-isolated `cann_bench_utils/_C.so` under `TILEFOUNDRY_NPU_WORK_ROOT`, and verifies `cann_bench_clone` on NPU; takes the device lease and requires an idle card before inspection/build | Sourced | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-cannbench` | **Local testing mode**: depends on `tilefoundry-npu-cannbench-prep`; takes the host msprof lock, then an idle device lease, injects the `--source` TileFoundry `PYTHONPATH`, runs official `cann-bench` `kernel_eval.staged_eval` against `tasks/<levelN>/<op>`, persists reports under `TILEFOUNDRY_NPU_WORK_ROOT/reports`, and records `score` / `avgSpeedup`; preserves report evidence and phases on failure/timeout. Declares an optional `dynamicTarget`: a managed V2 request narrows the run to its canonical task and workspace-relative candidate, while an unmanaged invocation evaluates the configured targets file | Sourced | Windowed (`deviceWindow`: 60 s) |
 | `tilefoundry-npu-cannbench-remote` | **Remote submission mode**: validates `SUB-BEH` / `EVAL-CANN` compliance, packages a compliant `cann_bench` ZIP under `TILEFOUNDRY_NPU_WORK_ROOT/submissions`, and submits via BenchSite MCP (`submit_kernel` per `https://cannbench.com/docs/mcp`) | Not sourced | None (`device`: `none`) |
 
 One-time non-Torch dependency helper (run before first CANNBench gate if `expecttest`/`ruamel.yaml`/`build` are missing):
@@ -65,6 +67,32 @@ conflicting exports in the launching environment):
 - `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` / `TILEFOUNDRY_NPU_CANNBENCH_TARGETS`:
   in-repo JSON target manifest (default `examples/ascend950pr_ops/cannbench_targets.json`) or
   `env.sh` fallback list (`levelN/op:relative/candidate.py`).
+- `TILEFOUNDRY_NPU_L3_TIMEOUT_SEC`: optional L3 workload budget in seconds
+  (positive, at most 1800; empty means 1200). The recipe's outer bound is 1920
+  seconds and its configCheck has an independent bound. The L3 preflight, lock
+  wait, compile, and acceptance run all spend from this one monotonic deadline.
+  L4 keeps its existing 840/900 prep and 3300/3600 official bounds.
+- L3 is a `dynamicTarget` gate: the engine publishes only
+  `AGENT_GATES_TARGET` (canonical task such as `level4/attention_residual`) and
+  `AGENT_GATES_CANDIDATE` (canonical source-relative `.py` path) to that recipe
+  and its configCheck. Never export the pair from a parent shell. The adapter
+  independently validates both, binds the candidate bytes by SHA-256, and
+  records that digest in the receipt.
+- Both L4 recipes (`tilefoundry-npu.cannbench-prep` and
+  `tilefoundry-npu.cannbench`) accept the same optional managed pair so prep and
+  official measurement stay bound to one target; without a pair they keep the
+  managed fixed-target behavior from
+  `TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE` / `TILEFOUNDRY_NPU_CANNBENCH_TARGETS`.
+- `TILEFOUNDRY_NPU_WORK_ROOT` also holds `<work-root>/l3/cache/<operator>/`
+  (`tilelang/`, `reference/`, and a legacy `reference-warm.json`) and
+  `<work-root>/l3/runs/<operator>/...`. L3 never writes the shared TileLang or
+  CANNBench caches. The ordinary gate always runs with
+  `TF_L3_CACHE_EXPECTATION=any`, never reads the marker, and never writes it;
+  only an explicit strict cold/warm acceptance may use the marker.
+- L4 prep and official measurement take the device lease and require an idle
+  card before inspection/build/workload; shared or unknown occupancy exits
+  `BLOCKED_ENV` (75) before device work. The msprof host lock is still acquired
+  separately (official run) and both waits come from the recipe deadline.
 - `TILEFOUNDRY_NPU_CANNBENCH_MCP_URL` / `TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN` /
   `TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE` / `TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION` /
   `TILEFOUNDRY_NPU_CANNBENCH_POOL_ID` / `TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN` /
@@ -112,13 +140,156 @@ independently of the shell that submits the run.
 per-run launch/config parameters supplied via `--device-id` or
 `~/.config/agent-gates/config.toml`, never stored in `env.sh`.
 
-## Verification commands
+## L3 promotion and L4 evidence
+
+The L3 recipe activates once and reuses that activation for its preflight and
+the acceptance run. The pinned `scripts/host_control.sh` wrapper starts the
+bridge with `-S -E -B` so no project `sitecustomize`, inherited `PYTHON*`
+variable, user-site hook, or bytecode cache loads into the control process;
+project and benchmark paths are handed only to the target interpreter, whose
+`PYTHONPATH` is rebuilt from the TileFoundry source root and the CANNBench
+checkout's `src` directory (which provides the official
+`kernel_eval.utils.compare` fallback comparator). No `npu_compare` shim or
+`sitecustomize` is generated: the suite imports an installed `npu_compare` when
+available and otherwise uses the checkout's comparator with unchanged thresholds
+and native-reference semantics.
+The preflight runs before the device lease and checks, in
+the target interpreter, that CANN/NumPy/torch/torch_npu/TileLang/TileFoundry and
+the CANNBench comparator import, that torch↔NumPy interop and comparator
+semantics work, that both dedicated cache directories accept a write/read/delete
+probe, and that the task's `cases.yaml` declares unique case IDs. It records the
+interpreter, TileLang effective cache directory, module sources, and build
+identity. The workload then runs the whole
+`tests/ascend/benchmarks/test_npu_acceptance.py` file under the adapter-published
+card; L3 may share an authorized card unless `REQUIRE_EXCLUSIVE_DEVICE` is set.
+
+The acceptance suite writes `tilefoundry-l3-evidence/v1` to
+`TF_L3_EVIDENCE_PATH`. The adapter consumes its target/case identity, candidate
+digest and module path, interpreter match, reference-cache counters, and
+coverage. Promotion requires every expected JUnit test to pass and the evidence
+`coverage.qualified` to be true; missing, duplicated, failed, or skipped expected
+tests set `coverageComplete=false` and never promote. Unknown test counts stay
+`null`; they are never coerced to zero. Phase reports and JUnit rows are kept in
+the observation for diagnosis. Only a producer-explicit candidate numeric
+comparison failure is a candidate failure: the selected failure must have
+`kind="candidate"`, `category="numeric"`, `role="candidate"`,
+`stage="comparison"`, a non-empty comparator/comparison result, a node and case
+whose evidence status is failed, and a failed JUnit row for that same node. A
+bare JUnit `failed` row, a missing producer marker, an unclassified kernel
+exception, or a marker whose role/node/case does not line up is never numeric;
+those become `coverage`, `environment`, or `infra` blocks instead. Coverage gaps
+(missing, duplicated, or skipped expected tests), write errors, environment,
+occupancy, deadline, signal, and infrastructure failures restore the original
+candidate upstream. The observation keeps the producer `failure`/`failures`
+rows and each node's `cases`/`failure` so the classification can be audited.
+
+The ordinary promotion gate accepts `any` cache state, so legal mixed hits,
+partial entries, and missing entries that are rebuilt during the run still
+promote. The observation still records the signed pre-run cache directories and
+tree sizes (`cache.before`), and the producer's per-kind
+hits/misses/writes/errors (`referenceCache.byKind`) are preserved verbatim. A
+reference-cache write failure remains an environment block.
+
+The receipt observation keeps the evidence summary under `evidence`, including
+the producer's nested `target` (`operator`, `task`, `taskDir`, producer-observed
+`modulePath`, and case IDs), the producer `candidate` block (`modulePath`,
+`sha256`, and `declaredPath` when present), `writeErrors`, interpreter identity,
+coverage, and reference-cache hit/miss/write counters. The adapter adds an
+engine-signed `candidate.relativePath` from the validated request and a separate
+`expectedIdentity` block holding the request-derived target/candidate module
+path, relative path, and digest. Producer fields stay unmodified: a missing or
+mismatched producer `target.modulePath`, `candidate.modulePath`, or
+`candidate.sha256` makes coverage incomplete and blocks promotion rather than
+being backfilled from the request.
+A top-level `failureCategory` mirrors `errorCategory`; only `numeric` is a
+candidate failure. `coverage`, `environment`, `occupancy`, `deadline`, `signal`,
+and `infra` are infrastructure blocks that preserve the candidate, so a
+promotion client can distinguish them without parsing the adapter's diagnostics.
+
+L4 prep and official runs first take the lease and confirm `free` occupancy. A
+shared or unknown card reports `BLOCKED_ENV` before inspection, build, or
+workload. The prep and official recipes are optional `dynamicTarget` routes: a
+managed V2 request supplies the canonical task and workspace-relative candidate
+to both, and the adapter validates that pair itself. The official run then
+evaluates exactly that pair (`targetsSource: "dynamic-request"`); without a
+request the configured targets file is evaluated unchanged. The official run then takes the host msprof lock,
+inspects the isolated `cann_bench_utils` slot, and runs
+`kernel_eval.staged_eval`. Its observation records phase start/end, the
+monotonic phase durations, the device window, and a snapshot of report files
+(including `official_final.json`) even when the runner times out or fails. Prep
+and official recipes start their bridge through the same `host_control.sh`
+wrapper, so the control process loads no project Python startup hook. The
+official workload runs with `-E -s` and rebuilds the target `PYTHONPATH` from
+activation-derived CANN paths plus the adapter-known staging, CANNBench,
+TileLang, and TileFoundry source paths; inherited project paths and `PYTHON*`
+startup hooks never reach the benchmark child. The official gate still requires
+`officialReportValid`, `allCasesPassed`, and `allTimingsValid`; upstream
+`verify-requirements` remains responsible for the `satisfied: true` check.
+
+## Runtime health and device-residue supervision
+
+Every L3/L4 host workload runs through `_run_host_bash_monitored`, which keeps
+the existing `adapter_runtime.run_host_bash` process-group supervision as the
+outer backstop and adds bounded health/occupancy sampling in the adapter. The
+workload environment receives an opaque `AGENT_GATES_RUN_HEALTH_TOKEN`; only
+processes carrying that token belong to this run and are ever signalled. Other
+tenants, including processes sharing an L3 card, are never killed, and the
+adapter never resets a card.
+
+| Signal | Budget and action |
+| --- | --- |
+| `npu-smi info -m`, `npu-smi info -t health -i <npu>`, and `npu-smi info -t proc-mem -i <npu>` probes | Each probe has its own 5 s wall clock, runs in its own session, and is SIGKILLed on timeout. Probes run every 2 s while this run has live processes; one probe never extends the recipe deadline. |
+| Probe self-hang or unreapable probe | A probe that survives SIGKILL is tracked by PID and start time. While it exists, no new probe is launched, so a wedged driver cannot accumulate probes. Each suppressed interval counts toward the failure limit; 3 intervals abort with `probe_unavailable` and report `stuckProbePids`. Probe cleanup only signals these adapter-owned probe children, never token/workload descendants. |
+| Fatal health value (`ERROR`, `FAULT`, `OFFLINE`, `CRITICAL`, ...) | 2 consecutive probes abort with `device_error`. A single unknown/garbled health row is not a fault. |
+| Parsed non-OK health (for example `Warning`) | Recorded as `health="non_ok"`, `nonOkHealthStreak`, and `unknownSignals=["device_health_non_ok"]`; it is not a confirmed fatal fault and does not kill a possibly long kernel. |
+| Target card disappears | 2 consecutive `npu-smi info -m` results with no mapping for the requested device abort with `device_missing` (category `environment`, `deviceOccupancy="missing"`). A failed/unreadable mapping command stays `probe_unavailable` instead. Mid-run health failures trigger one bounded mapping recheck so a disappeared card is distinguished from a probe error. |
+| Health/mapping probe unavailable | 3 consecutive command failures abort with `probe_unavailable` and `healthUnknown=true`; the receipt does not claim hardware damage. |
+| L4 external occupancy after the lease | 2 consecutive `proc-mem` observations containing processes without this run's token abort L4 with `external_occupancy` (category `occupancy`). This is the loss-of-exclusivity signal; L3 legal sharing is recorded as `shared(N)` and never aborts. |
+| L4 occupancy not observable | 3 consecutive unreadable `proc-mem` probes abort with `occupancy_unknown` (category `occupancy`) because exclusivity cannot be confirmed. |
+| Liveness | There is no CPU-time, log-silence, or progress-file stall heuristic. A silent long NPU kernel on a healthy card is indistinguishable from a hang, so it is left to the existing recipe deadline; this layer never invents an earlier kill. |
+| Recipe deadline with an escaped pipe holder | `run_host_bash` enforces the recipe timeout, but a descendant that escaped its process group can keep the stdout/stderr pipes open and delay its final `communicate()` beyond the deadline. Once the deadline plus a 0.25 s grace passes, the adapter sweeps only processes carrying this run's token, which closes the pipes and lets the existing runner return its `TimeoutExpired`. This is deadline enforcement, not a stall heuristic; the sweep is recorded as `cleanup.deadlineSweep`. |
+| Cleanup and lease ordering | On abort or completion, token processes get SIGTERM with a 2 s grace, then SIGKILL with a 10 s wait and periodic token rescans. The worker is joined (8 s bound) before `finally` releases the device window. |
+| Unreclaimable device residue | D-state work cannot be guaranteed to die or be reaped in finite time. When the bounded sweep still finds this run's token processes, their `{pid, startTime, comm}` identities and the failure reason/phase/card are atomically written to `<device-lease>.quarantine.json` (mode 0600) before the flock is released. A successor takes the same per-card lock, then checks the marker before occupancy or workload: any live or indeterminate identity returns `BLOCKED_ENV` (75) with `occupancy="quarantined"`. Once every recorded identity is confirmed exited, the marker is removed and the card becomes usable again. Pid reuse is rejected by `startTime`. No global disable is used and other tenants are never touched. |
+
+A marker with no process identity, invalid JSON, an unexpected schema, or an
+unreadable file is treated as indeterminate and stays blocking rather than
+guessing that the card is clear.
+
+Host-simulated acceptance (no live card, no real fault injection) measured a
+simulated fatal health fault from first bad probe to process exit/lease release
+in 4.79 s, L4 external occupancy in 4.82 s, a probe self-hang in 1.61 s, a
+disappeared card in 1.75 s, a 1.0 s recipe deadline with an escaped
+pipe-holding descendant in 1.74 s, and an unreapable escaped descendant
+returning a bounded quarantined result in 0.82 s. These runs shortened some
+probe intervals and probe timeouts;
+every phase remains independently bounded by the 5 s per-probe timeout, 2 s
+SIGTERM grace, 10 s SIGKILL wait, and 8 s worker join above, so a stuck probe or
+reap cannot consume the 1200 s L3 or 3300 s L4 budget.
+
+The observation's `healthMonitoring` block records `health`, `healthUnknown`,
+`occupancy`, own/external/unknown PIDs, `probeFailures`, `fatalHealthStreak`,
+`nonOkHealthStreak`, `missingMappingStreak`, `stuckProbePids`,
+`stuckProbePidsObserved`, the last probe
+and mapping check, `unknownSignals`, `abort` (kind, reason, phase, device, NPU
+ID, occupancy, stuck probe PIDs), and `cleanup` (PIDs, SIGTERM/SIGKILL,
+`survivingProcesses`, `quarantine`, `probeCleanup`, `deadlineSweep`,
+`incomplete`, `workerJoined`). L4 internal fault
+counters are not exposed by the host SMI interface, so every L4 snapshot lists
+`l4_internal_fault_counters_unavailable` in `unknownSignals` instead of
+inferring a card state. Aborts preserve the phase that was active and any
+partial L3 evidence/JUnit/workload facts already written; an aborted run never
+promotes and never reports a fabricated hardware diagnosis.
+
+
 
 ```bash
 agent-gates doctor --adapter tilefoundry-npu --source /abs/path/to/TileFoundry --device-id 1 --json
+agent-gates doctor --adapter tilefoundry-npu --source /abs/path/to/TileFoundry --device-id 1 --gate tilefoundry-npu-l3-promotion --target level4/attention_residual --candidate examples/ascend950pr_ops/attention_residual/kernels.py --json
 agent-gates submit --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-device --json
+agent-gates submit --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-l3-promotion --target level4/attention_residual --candidate examples/ascend950pr_ops/attention_residual/kernels.py --json
 agent-gates submit --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-cannbench --json
 agent-gates submit --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-cannbench-remote --json
 agent-gates wait --execution-id <EXECUTION_ID> --timeout 660 --json
+agent-gates verify-requirements --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-l3-promotion --run-id <RUN_ID> --target level4/attention_residual --candidate examples/ascend950pr_ops/attention_residual/kernels.py --json
 agent-gates verify-requirements --workspace tilefoundry --adapter tilefoundry-npu --gate tilefoundry-npu-cannbench --run-id <RUN_ID> --json
 ```

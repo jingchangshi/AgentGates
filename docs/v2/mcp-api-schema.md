@@ -21,8 +21,11 @@ DSH exposes the tools as `mcp__agentgates__<tool>`.
 4. **Undeclared arguments are refused.** The SDK would silently drop them, which
    would let a caller believe a machine parameter had been honoured. AgentGates
    rejects them by name.
-5. **No tool accepts a machine parameter.** There is no field for a command, a
-   container, an interpreter, an env file, a source directory or a device id.
+5. **No tool accepts an arbitrary machine parameter.** There is no field for a
+   command, a container, an interpreter, an env file, a source directory, or a
+   free device setting. The one device selector is `submit.device_id`: it must be
+   one id from the operator's `devices.allowed_npu_devices`, so it can pick among
+   authorized cards but cannot widen the set or change the default policy.
 
 ## Tools
 
@@ -62,14 +65,17 @@ exit_code }], failures }`
 | `adapter` | string | must be registered for that workspace |
 | `gates` | string[] | dependencies are added automatically |
 | `request_id` | string? | idempotency key |
+| `device_id` | string? | explicit NPU card; must be in `devices.allowed_npu_devices`; omit for the configured default |
 
 Returns immediately with an `execution_id`. `request_id` semantics: same request
 + same id → the original execution; same id + different request → `CONFLICT`; new
-id → new execution.
+id → new execution. The resolved card is part of the request identity, so the
+same id on a different card is a `CONFLICT` even when every other field matches.
 
 `structuredContent`: `ExecutionStatus` — `{ execution_id, state, workspace,
 adapter, gates, request_id, run_id, submitted_at, started_at, finished_at,
-current_gate, completed_gates, message, exit_reason }`
+current_gate, completed_gates, message, exit_reason, target, candidate,
+device_id }`
 
 ### `status` / `cancel`
 

@@ -9,16 +9,20 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from typing import NoReturn
+from typing import Callable, NoReturn
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -70,6 +74,7 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_DEVICE_TESTS",
     "TILEFOUNDRY_NPU_MSPROF_LOCK",
     "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE",
+    "TILEFOUNDRY_NPU_L3_TIMEOUT_SEC",
     "TILEFOUNDRY_NPU_BUILD_SUBDIR",
     "TILEFOUNDRY_NPU_CANNBENCH_REPO",
     "TILEFOUNDRY_NPU_WORK_ROOT",
@@ -148,6 +153,40 @@ DEFAULT_DEVICE_TIMEOUT = 600.0
 DEFAULT_PREP_TIMEOUT = 840.0
 DEFAULT_CANNBENCH_TIMEOUT = 3300.0
 DEFAULT_REMOTE_TIMEOUT = 840.0
+DEFAULT_L3_TIMEOUT = 1200.0
+MAX_L3_TIMEOUT = 1800.0
+# The engine publishes the dynamic target/candidate pair to a dynamicTarget
+# recipe only; these names mirror agent_gates.dynamic_target.
+L3_TARGET_REQUEST_ENV = "AGENT_GATES_TARGET"
+L3_CANDIDATE_REQUEST_ENV = "AGENT_GATES_CANDIDATE"
+L3_EVIDENCE_ENV = "TF_L3_EVIDENCE_PATH"
+L3_PROFILE_ENV = "TF_L3_PROFILE"
+L3_TARGET_OPERATOR_ENV = "TF_L3_TARGET_OPERATOR"
+L3_TARGET_MODULE_ENV = "TF_L3_TARGET_MODULE_PATH"
+L3_EXPECTED_PYTHON_ENV = "TF_L3_EXPECTED_PYTHON"
+L3_CANNBENCH_REPO_ENV = "TF_L3_CANNBENCH_REPO"
+L3_CACHE_EXPECTATION_ENV = "TF_L3_CACHE_EXPECTATION"
+L3_CACHE_MODE_ENV = "CANNBENCH_CACHE_MODE"
+L3_EVIDENCE_SCHEMA = "tilefoundry-l3-evidence/v1"
+L3_PROFILE = "l3-promotion"
+L3_ACCEPTANCE_TEST = "tests/ascend/benchmarks/test_npu_acceptance.py"
+L3_GENERIC_TEST = "test_target_operator_full_cannbench_contract"
+# The promotion profile fixes the acceptance tests that must pass for a target.
+# AR and MLA each have their own case suite and dynamic-cache proof; every other
+# canonical target uses the generic full-contract test.
+L3_PROFILE_TESTS = {
+    "attention_residual": (
+        "test_attention_residual_cannbench_cases",
+        "test_attention_residual_baseline_vs_tuned_parity",
+        "test_dynamic_shape_kernel_cache_reuse",
+    ),
+    "mla": (
+        "test_mla_cannbench_cases",
+        "test_mla_supplemental_cases",
+        "test_dynamic_shape_kernel_cache_reuse",
+    ),
+}
+L3_CACHE_COMPONENTS = ("tilelang", "reference")
 DEFAULT_CANNBENCH_MCP_URL = "https://cannbench.com/mcp"
 MCP_CONSENT_VERSION_RE = re.compile(r"v[1-9][0-9]*")
 
@@ -345,9 +384,15 @@ for index, item in enumerate(cfg["targets"]):
         (pkg / "__init__.py").write_text(f"from .candidate import {function}\n", encoding="utf-8")
 
         env = os.environ.copy()
+        # The adapter exports only the activation-derived PYTHONPATH (CANN
+        # toolkit paths). Everything else from the parent shell is dropped so
+        # a project hook cannot reach the official workload.
+        activation_pythonpath = env.pop("AGENT_GATES_ACTIVATION_PYTHONPATH", "")
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(cfg["device"])
         env["TILELANG_DISABLE_CACHE"] = "1"
         env["PYTHONNOUSERSITE"] = "1"
+        for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+            env.pop(name, None)
         tl_src = (cfg.get("tilelang_source") or "").strip()
         if tl_src:
             env.setdefault("USE_CUDA", "0")
@@ -355,8 +400,8 @@ for index, item in enumerate(cfg["targets"]):
         if tl_src:
             pp_entries.append(tl_src)
         pp_entries.extend(tf_paths)
-        if env.get("PYTHONPATH"):
-            pp_entries.append(env["PYTHONPATH"])
+        if activation_pythonpath:
+            pp_entries.append(activation_pythonpath)
         env["PYTHONPATH"] = os.pathsep.join(pp_entries)
 
         cmd = [
@@ -457,8 +502,276 @@ sys.exit(0 if (bool(results) and all_valid and all_passed and all_timed) else 1)
 """
 
 
+# Preflight runs in the target interpreter BEFORE the device lease is opened:
+# it proves the CANN/torch/TileLang comparator stack imports, the comparator
+# agrees on equal tensors, and the two dedicated cache roots accept a real
+# write/read/delete.  It performs no device work.
+L3_PREFLIGHT = r'''
+import importlib
+import importlib.metadata as metadata
+import json
+import os
+import pathlib
+import platform
+import sys
+import traceback
+
+
+def _module_facts(name, distribution=None):
+    module = importlib.import_module(name)
+    version = getattr(module, "__version__", "") or ""
+    if not version and distribution:
+        try:
+            version = metadata.version(distribution)
+        except Exception:
+            version = ""
+    return {
+        "name": name,
+        "file": str(getattr(module, "__file__", "") or ""),
+        "version": str(version),
+    }
+
+
+def _cache_probe(name, raw):
+    if not raw:
+        raise RuntimeError(f"{name} cache directory was not supplied by the adapter")
+    root = pathlib.Path(raw)
+    if not root.is_absolute():
+        raise RuntimeError(f"{name} cache directory must be absolute: {raw!r}")
+    root.mkdir(parents=True, exist_ok=True)
+    payload = b"agent-gates-l3-cache-probe"
+    probe = root / f".agent_gates_probe_{os.getpid()}"
+    try:
+        probe.write_bytes(payload)
+        read_back = probe.read_bytes()
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+    return {
+        "path": str(root),
+        "writable": read_back == payload,
+        "probeBytes": len(payload),
+    }
+
+
+facts = {
+    "ok": False,
+    "python": sys.executable,
+    "pythonVersion": platform.python_version(),
+    "cannSetup": os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP", ""),
+    "modules": {},
+    "cache": {},
+}
+try:
+    import numpy
+    import torch
+
+    facts["modules"]["torch"] = _module_facts("torch", "torch")
+    facts["modules"]["numpy"] = _module_facts("numpy", "numpy")
+    # Importing torch_npu loads the CANN runtime libraries.  No device work is
+    # performed here; ASCEND_RT_VISIBLE_DEVICES is empty for this process.
+    facts["modules"]["torch_npu"] = _module_facts("torch_npu", "torch-npu")
+    facts["modules"]["tilelang"] = _module_facts("tilelang", "tilelang")
+
+    vector = torch.arange(8, dtype=torch.float32)
+    facts["torchNumpyInterop"] = bool(vector.numpy().tolist() == list(range(8)))
+
+    try:
+        from npu_compare import compare_case_result
+        facts["modules"]["npu_compare"] = _module_facts("npu_compare")
+        verdict = compare_case_result(
+            case_id="preflight",
+            actual=vector,
+            golden=vector.clone(),
+            accuracy_mode="cann-bench",
+        )
+        facts["comparator"] = {
+            "module": "npu_compare",
+            "callable": callable(compare_case_result),
+            "passedOnEqual": bool(verdict.passed),
+        }
+    except ImportError:
+        # The acceptance suite falls back to the same CANNBench comparator
+        # when the official npu_compare module is not installed. The adapter
+        # passes the checkout's src directory on PYTHONPATH, so import it here
+        # without generating any shim module.
+        facts["modules"]["npu_compare"] = None
+        from kernel_eval.utils.compare import compare_tensors
+        facts["modules"]["kernel_eval.utils.compare"] = _module_facts(
+            "kernel_eval.utils.compare"
+        )
+        verdict = compare_tensors(
+            vector, vector.clone(), dtype="float32", native_output=None
+        )
+        facts["comparator"] = {
+            "module": "kernel_eval.utils.compare",
+            "callable": callable(compare_tensors),
+            "passedOnEqual": bool(verdict.passed),
+        }
+
+    import tilelang.env as tilelang_env
+
+    facts["tilelangCacheDir"] = tilelang_env.env.get_cache_write_dir()
+    facts["cache"]["tilelang"] = _cache_probe(
+        "tilelang", os.environ.get("TILELANG_CACHE_DIR", "")
+    )
+    facts["cache"]["reference"] = _cache_probe(
+        "reference", os.environ.get("CANNBENCH_CACHE_DIR", "")
+    )
+
+    import yaml
+
+    task = sys.argv[2]
+    repo = pathlib.Path(sys.argv[3])
+    cases = yaml.safe_load(
+        (repo / "tasks" / task / "cases.yaml").read_text(encoding="utf-8")
+    )["cases"]
+    facts["caseIds"] = [str(case.get("case_id")) for case in cases]
+    facts["ok"] = (
+        facts["torchNumpyInterop"]
+        and facts["comparator"]["callable"]
+        and facts["comparator"]["passedOnEqual"]
+        and all(root["writable"] for root in facts["cache"].values())
+        and bool(facts["caseIds"])
+    )
+except Exception as exc:  # noqa: BLE001 - the fact is the failure, not a trace
+    facts["error"] = f"{type(exc).__name__}: {exc}"
+    facts["traceback"] = traceback.format_exc()[-2000:]
+
+pathlib.Path(sys.argv[1]).write_text(json.dumps(facts, sort_keys=True), encoding="utf-8")
+sys.exit(0 if facts["ok"] else 1)
+'''
+
+
+# The actual promotion run executes pytest in the SAME target interpreter that
+# records its own identity.  Facts are written before pytest starts so they are
+# available even when pytest is killed by the deadline.
+L3_PYTEST_WRAPPER = r'''
+import importlib
+import importlib.metadata as metadata
+import json
+import os
+import pathlib
+import platform
+import sys
+import traceback
+
+
+def _module_facts(name, distribution=None):
+    module = importlib.import_module(name)
+    version = getattr(module, "__version__", "") or ""
+    if not version and distribution:
+        try:
+            version = metadata.version(distribution)
+        except Exception:
+            version = ""
+    return {
+        "name": name,
+        "file": str(getattr(module, "__file__", "") or ""),
+        "version": str(version),
+    }
+
+
+facts = {
+    "python": sys.executable,
+    "pythonVersion": platform.python_version(),
+    "sysPathHead": [str(item) for item in sys.path[:6]],
+    "modules": {},
+}
+try:
+    facts["modules"]["torch"] = _module_facts("torch", "torch")
+    facts["modules"]["numpy"] = _module_facts("numpy", "numpy")
+    facts["modules"]["torch_npu"] = _module_facts("torch_npu", "torch-npu")
+    facts["modules"]["tilelang"] = _module_facts("tilelang", "tilelang")
+    try:
+        facts["modules"]["npu_compare"] = _module_facts("npu_compare")
+    except ImportError:
+        facts["modules"]["npu_compare"] = None
+    try:
+        facts["modules"]["kernel_eval.utils.compare"] = _module_facts(
+            "kernel_eval.utils.compare"
+        )
+    except ImportError:
+        facts["modules"]["kernel_eval.utils.compare"] = None
+    expected_source = (os.environ.get("TILEFOUNDRY_EXPECTED_TILELANG_SOURCE") or "").strip()
+    tilelang_file = facts["modules"]["tilelang"]["file"]
+    facts["tilelangSourceMatches"] = (
+        None
+        if not expected_source
+        else pathlib.Path(tilelang_file).resolve().is_relative_to(pathlib.Path(expected_source).resolve())
+    )
+    facts["tilelangCacheDir"] = os.environ.get("TILELANG_CACHE_DIR", "")
+    facts["referenceCacheDir"] = os.environ.get("CANNBENCH_CACHE_DIR", "")
+except Exception as exc:  # noqa: BLE001 - pytest still runs and reports
+    facts["importError"] = f"{type(exc).__name__}: {exc}"
+    facts["traceback"] = traceback.format_exc()[-2000:]
+
+facts_path = pathlib.Path(sys.argv[1])
+facts_path.write_text(json.dumps(facts, sort_keys=True), encoding="utf-8")
+
+import pytest
+
+report = sys.argv[2]
+test_file = sys.argv[3]
+sys.exit(int(pytest.main([
+    "-p", "no:cacheprovider",
+    "-q",
+    f"--junit-xml={report}",
+    test_file,
+])))
+'''
+
+
+ERROR_CATEGORIES = (
+    "environment",
+    "occupancy",
+    "deadline",
+    "numeric",
+    "coverage",
+    "signal",
+    "infra",
+    "none",
+)
+
+
 class BridgeError(RuntimeError):
     EXIT = adapter_runtime.BLOCKED_ENV
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "environment",
+        occupancy: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category if category in ERROR_CATEGORIES else "infra"
+        self.occupancy = occupancy
+
+
+class _Deadline:
+    """One monotonic deadline paid by every step of a recipe."""
+
+    def __init__(self, seconds: float) -> None:
+        self.started = time.monotonic()
+        self.deadline = self.started + max(0.0, float(seconds))
+
+    def elapsed(self) -> float:
+        return round(time.monotonic() - self.started, 3)
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def cap(self, limit: float) -> float:
+        return max(0.0, min(float(limit), self.remaining()))
+
+    def require(self, label: str) -> None:
+        if self.remaining() <= 0:
+            raise BridgeError(
+                f"{label} exceeded the recipe deadline", category="deadline"
+            )
 
 
 def _die(code: int, message: str) -> NoReturn:
@@ -657,8 +970,21 @@ def _validate_target_pair(task: str, candidate_rel: str, source: Path, repo: Pat
 
 
 def resolve_cannbench_targets(
-    values: dict[str, str], source: Path, repo: Path
+    values: dict[str, str], source: Path, repo: Path, *, allow_request: bool = False
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Resolve the configured target list, or the one pair a managed request names.
+
+    The prep and official recipes declare an optional dynamic target, so an
+    unmanaged invocation keeps evaluating the configured targets file. A managed
+    V2 request names exactly one canonical task and workspace-relative
+    candidate; the adapter validates that pair itself, never evaluates other
+    targets alongside it, and does not depend on unrelated targets-file entries.
+    """
+    if allow_request:
+        request = _read_cannbench_request()
+        if request is not None:
+            pair = _validate_target_pair(request[0], request[1], source, repo)
+            return "dynamic-request", (pair,)
     rel_file = cannbench_targets_file_rel(values)
     repo_manifest = (source / rel_file).resolve()
     if not repo_manifest.is_relative_to(source.resolve()):
@@ -699,6 +1025,20 @@ def resolve_cannbench_targets(
             pairs.append(_validate_target_pair(task, cand, source, repo))
         origin = "env-file"
     return origin, tuple(pairs)
+
+
+def _read_cannbench_request() -> tuple[str, str] | None:
+    """Read the optional L4 pair the engine publishes for a managed request."""
+    target = (os.environ.get(L3_TARGET_REQUEST_ENV) or "").strip()
+    candidate = (os.environ.get(L3_CANDIDATE_REQUEST_ENV) or "").strip()
+    if not target and not candidate:
+        return None
+    if not target or not candidate:
+        raise BridgeError(
+            f"{L3_TARGET_REQUEST_ENV} and {L3_CANDIDATE_REQUEST_ENV} "
+            "must be supplied together"
+        )
+    return target, candidate
 
 
 def _utils_source_digest(repo: Path) -> str:
@@ -983,21 +1323,279 @@ def _device_occupancy(device: str) -> str:
     return "free" if not processes else f"shared({len(processes)})"
 
 
+def _quarantine_path(lease_path: str | Path) -> Path:
+    return Path(f"{lease_path}{QUARANTINE_SUFFIX}")
+
+
+def _process_identity(pid: int) -> dict | None:
+    """Snapshot a process identity that stays meaningful across pid reuse."""
+    stat = _read_proc_stat(pid)
+    if stat is None or stat["state"] == "Z":
+        return None
+    return {
+        "pid": int(pid),
+        "startTime": int(stat["startTime"]),
+        "state": stat["state"],
+        "comm": _read_proc_comm(pid),
+    }
+
+
+def _identity_status(identity: object) -> str:
+    """Return alive/gone/unknown for a recorded process identity."""
+    if not isinstance(identity, dict):
+        return "unknown"
+    pid = identity.get("pid")
+    started = identity.get("startTime")
+    if not isinstance(pid, int) or not isinstance(started, int):
+        return "unknown"
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return "gone"
+    except OSError:
+        return "unknown"
+    try:
+        fields = raw.rsplit(")", 1)[1].split()
+        state, start_time = fields[0], int(fields[19])
+    except (IndexError, ValueError):
+        return "unknown"
+    if state == "Z":
+        return "gone"
+    if start_time != started:
+        # The pid now belongs to an unrelated process; the recorded one exited.
+        return "gone"
+    return "alive"
+
+
+def _read_quarantine(lease_path: str | Path) -> dict | None:
+    """Check the per-card quarantine marker and clear it once every identity is gone."""
+    path = _quarantine_path(lease_path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as exc:
+        return {
+            "path": str(path),
+            "blocked": True,
+            "reason": f"quarantine marker is unreadable: {exc}",
+            "processes": [],
+            "alive": [],
+            "unknown": [],
+        }
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        return {
+            "path": str(path),
+            "blocked": True,
+            "reason": f"quarantine marker is not valid JSON: {exc}",
+            "processes": [],
+            "alive": [],
+            "unknown": [],
+        }
+    if not isinstance(payload, dict) or payload.get("schema") != QUARANTINE_SCHEMA:
+        return {
+            "path": str(path),
+            "blocked": True,
+            "reason": "quarantine marker has an unexpected schema",
+            "processes": [],
+            "alive": [],
+            "unknown": [],
+        }
+    processes = payload.get("processes")
+    if not isinstance(processes, list) or not processes:
+        # Without a process identity no successor can confirm that the residue
+        # exited, so this stays blocked rather than guessing.
+        return {
+            "path": str(path),
+            "blocked": True,
+            "reason": "quarantine marker records no process identity",
+            "payload": payload,
+            "processes": [],
+            "alive": [],
+            "unknown": [],
+        }
+    alive: list[dict] = []
+    unknown: list[dict] = []
+    for item in processes:
+        status = _identity_status(item)
+        if status == "alive":
+            alive.append(item)
+        elif status == "unknown":
+            unknown.append(item)
+    if alive or unknown:
+        return {
+            "path": str(path),
+            "blocked": True,
+            "reason": payload.get("reason") or "an earlier run left device processes",
+            "payload": payload,
+            "processes": processes,
+            "alive": alive,
+            "unknown": unknown,
+        }
+    removed = True
+    try:
+        path.unlink()
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    except OSError as exc:
+        removed = False
+        return {
+            "path": str(path),
+            "blocked": True,
+            "reason": f"quarantine marker became unreadable while clearing: {exc}",
+            "payload": payload,
+            "processes": processes,
+            "alive": [],
+            "unknown": [],
+            "removed": removed,
+        }
+    return {
+        "path": str(path),
+        "blocked": False,
+        "cleared": True,
+        "removed": removed,
+        "payload": payload,
+        "processes": processes,
+        "alive": [],
+        "unknown": [],
+    }
+
+
+def _quarantine_cleanup(
+    cleanup: dict,
+    *,
+    lease_path: str | None,
+    resource: str,
+    device: str,
+    token: str,
+    phase: str | None,
+    reason: str,
+) -> dict:
+    """Persist surviving device work before the lease is released.
+
+    A successor must not reuse the same physical card while these identities
+    are still alive or cannot be inspected. The marker is per-card because the
+    lease path is per-card.
+    """
+    if not lease_path:
+        return {"written": False, "skipped": "no device lease path in this run"}
+    candidates: list[dict] = [
+        item for item in (cleanup.get("survivingProcesses") or [])
+        if isinstance(item, dict)
+    ]
+    known_pids = {item.get("pid") for item in candidates}
+    for pid in cleanup.get("surviving") or []:
+        if not isinstance(pid, int) or pid in known_pids:
+            continue
+        identity = _process_identity(pid)
+        if identity is not None:
+            candidates.append(identity)
+    identities: list[dict] = []
+    for item in candidates:
+        status = _identity_status(item)
+        if status in {"alive", "unknown"}:
+            entry = dict(item)
+            entry["status"] = status
+            identities.append(entry)
+    path = _quarantine_path(lease_path)
+    if not identities:
+        # Every survivor observed during cleanup is confirmed exited.
+        cleanup["surviving"] = []
+        return {"path": str(path), "written": False, "cleared": True, "processes": []}
+    payload = {
+        "schema": QUARANTINE_SCHEMA,
+        "resource": resource,
+        "device": device,
+        "leasePath": str(lease_path),
+        "token": token,
+        "phase": phase,
+        "reason": reason,
+        "recordedAt": _timestamp(),
+        "processes": identities,
+        "cleanup": {
+            "pids": cleanup.get("pids"),
+            "sigterm": cleanup.get("sigterm"),
+            "sigkill": cleanup.get("sigkill"),
+            "seconds": cleanup.get("seconds"),
+        },
+    }
+    record = {
+        "path": str(path),
+        "written": False,
+        "schema": QUARANTINE_SCHEMA,
+        "reason": reason,
+        "phase": phase,
+        "processes": identities,
+    }
+    tmp_path: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+        tmp_path = None
+        record["written"] = True
+    except OSError as exc:
+        record["writeError"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return record
+
+
+def _quarantine_block_message(lease_resource: str, quarantine: dict) -> str:
+    unresolved = [
+        f"pid={item.get('pid')}({item.get('comm') or '?'},{item.get('status', 'unknown')})"
+        for item in (quarantine.get("alive") or []) + (quarantine.get("unknown") or [])
+    ]
+    raw_payload = quarantine.get("payload")
+    payload: dict = raw_payload if isinstance(raw_payload, dict) else {}
+    detail = f"reason={quarantine.get('reason')}"
+    if payload.get("phase"):
+        detail += f", phase={payload.get('phase')}"
+    if payload.get("recordedAt"):
+        detail += f", recordedAt={payload.get('recordedAt')}"
+    if unresolved:
+        detail += f", unresolved={', '.join(unresolved[:8])}"
+    return (
+        f"device lease {lease_resource} is quarantined by an earlier run "
+        f"({detail}); marker {quarantine.get('path')}"
+    )
+
+
 @contextmanager
-def _open_device_window(device: str, *, warmup_seconds: float | None = None):
+def _open_device_window(
+    device: str,
+    *,
+    warmup_seconds: float | None = None,
+    wait_seconds: float | None = None,
+    require_idle: bool = False,
+):
     lease_path = os.environ.get("AGENT_GATES_DEVICE_LEASE_PATH", "").strip()
     lease_resource = os.environ.get("AGENT_GATES_DEVICE_LEASE_RESOURCE", f"npu:{device}").strip()
     if not lease_path:
         raise BridgeError("AGENT_GATES_DEVICE_LEASE_PATH is required for windowed device runs")
-    try:
-        wait_seconds = float(os.environ.get("AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS", "60"))
-    except ValueError as exc:
-        raise BridgeError("invalid AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS") from exc
+    if wait_seconds is None:
+        try:
+            wait_seconds = float(os.environ.get("AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS", "60"))
+        except ValueError as exc:
+            raise BridgeError("invalid AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS") from exc
+    wait_seconds = max(0.0, float(wait_seconds))
 
     Path(lease_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     started = time.monotonic()
-    deadline = started + max(0.0, wait_seconds)
+    deadline = started + wait_seconds
     try:
         while True:
             try:
@@ -1007,18 +1605,39 @@ def _open_device_window(device: str, *, warmup_seconds: float | None = None):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise BridgeError(
-                        f"device lease {lease_resource} did not open within {wait_seconds}s"
+                        f"device lease {lease_resource} did not open within {wait_seconds}s",
+                        category="occupancy",
+                        occupancy="unknown",
                     ) from exc
                 time.sleep(min(0.05, remaining))
+
+        # The marker is written by the previous lease holder before it releases
+        # the flock. Checking it here, before occupancy and before any workload,
+        # keeps residue on this physical card from being reused by a successor.
+        quarantine = _read_quarantine(lease_path)
+        if quarantine is not None and quarantine.get("blocked"):
+            raise BridgeError(
+                _quarantine_block_message(lease_resource, quarantine),
+                category="occupancy",
+                occupancy="quarantined",
+            )
 
         opened = time.monotonic()
         window_started = _timestamp()
         occ = _device_occupancy(device)
         probe_seconds = round(time.monotonic() - opened, 3)
-        if exclusive_requested() and occ.startswith("shared("):
-            raise BridgeError(
-                f"device {lease_resource} is {occ} and TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE is set"
-            )
+        if require_idle or exclusive_requested():
+            if occ != "free":
+                reason = (
+                    "requires an idle device"
+                    if require_idle
+                    else "TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE is set"
+                )
+                raise BridgeError(
+                    f"device {lease_resource} is {occ} and {reason}",
+                    category="occupancy",
+                    occupancy=occ,
+                )
         work_started = time.monotonic()
 
         def finalize_window() -> tuple[str, dict]:
@@ -1034,11 +1653,1141 @@ def _open_device_window(device: str, *, warmup_seconds: float | None = None):
             }
             if warmup_seconds is not None:
                 win["warmupSeconds"] = round(float(warmup_seconds), 3)
+            if require_idle:
+                win["requiredIdle"] = True
+            if quarantine is not None:
+                win["quarantine"] = {
+                    "path": quarantine.get("path"),
+                    "cleared": bool(quarantine.get("cleared")),
+                    "removed": quarantine.get("removed"),
+                    "reason": quarantine.get("reason"),
+                    "processes": quarantine.get("processes") or [],
+                }
             return occ, win
 
         yield finalize_window
     finally:
         os.close(fd)
+
+
+# Runtime health supervision. This is deliberately not another process
+# supervisor: every host command still runs through adapter_runtime.run_host_bash
+# and the engine-owned process supervisor remains the outer backstop. This layer
+# only samples card health/occupancy, and on a confirmed fault signals the
+# processes carrying this run's opaque token so the existing runner can reap its
+# direct child and release the window. Liveness is not guessed from CPU time or
+# log silence: a silent NPU kernel is left to the recipe deadline. An
+# unreclaimable token process is recorded in a per-card quarantine marker so the
+# next worker blocks before using that card.
+HEALTH_TOKEN_ENV = "AGENT_GATES_RUN_HEALTH_TOKEN"
+HEALTH_POLL_SECONDS = 0.5
+HEALTH_PROBE_INTERVAL_SECONDS = 2.0
+HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
+HEALTH_PROBE_FAILURE_LIMIT = 3
+HEALTH_FATAL_CONFIRMATIONS = 2
+HEALTH_EXTERNAL_CONFIRMATIONS = 2
+HEALTH_MISSING_CONFIRMATIONS = 2
+HEALTH_PID_RESCAN_SECONDS = 1.0
+HEALTH_CLEANUP_GRACE_SECONDS = 2.0
+HEALTH_CLEANUP_SECONDS = 10.0
+HEALTH_WORKER_JOIN_SECONDS = 8.0
+HEALTH_DEADLINE_SWEEP_GRACE_SECONDS = 0.25
+HEALTH_DEADLINE_EXIT_SECONDS = 5.0
+QUARANTINE_SUFFIX = ".quarantine.json"
+QUARANTINE_SCHEMA = "agent-gates-device-quarantine/v1"
+
+_PROC_MEM_LINE = re.compile(
+    r"Process id\s*:\s*(\d+)\s+Process name\s*:\s*(.*?)\s+Process memory\(MB\)\s*:\s*(\d+)"
+)
+_PROC_MEM_NPU = re.compile(r"^\s*NPU ID\s*:\s*(\d+)\s*$", re.MULTILINE)
+_HEALTH_STATUS = re.compile(r"Health(?:\s+Status)?\s*:\s*([A-Za-z][A-Za-z _-]*)", re.IGNORECASE)
+
+
+def _bounded_host_command(argv: list[str], timeout: float) -> dict:
+    """Run a small probe command with a hard wall-clock bound.
+
+    The caller gets ``unreaped`` and ``wchan`` when even SIGKILL cannot make the
+    probe exit (typically D-state in the driver). The probe process is put in its
+    own session and is never allowed to become an unbounded wait.
+    """
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return {
+            "argv": list(argv),
+            "pid": None,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "seconds": round(time.monotonic() - started, 3),
+            "timedOut": False,
+            "unreaped": False,
+            "wchan": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    try:
+        stdout, stderr = proc.communicate(timeout=max(0.1, float(timeout)))
+        return {
+            "argv": list(argv),
+            "pid": proc.pid,
+            "returncode": proc.returncode,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            "seconds": round(time.monotonic() - started, 3),
+            "timedOut": False,
+            "unreaped": False,
+            "wchan": None,
+            "error": None,
+        }
+    except subprocess.TimeoutExpired:
+        wchan = _read_proc_wchan(proc.pid)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        unreaped = False
+        stdout = stderr = ""
+        try:
+            stdout, stderr = proc.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            unreaped = True
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except OSError:
+                    pass
+        return {
+            "argv": list(argv),
+            "pid": proc.pid,
+            "returncode": proc.returncode,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            "seconds": round(time.monotonic() - started, 3),
+            "timedOut": True,
+            "unreaped": unreaped,
+            "wchan": wchan,
+            "error": "probe timed out",
+        }
+
+
+def _npu_id_from_mapping(text: str, device: str) -> tuple[int | None, str | None]:
+    matches: list[int] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and all(field.isdigit() for field in fields[:4]):
+            if int(fields[3]) == int(device):
+                matches.append(int(fields[0]))
+        elif len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
+            if int(fields[2]) == int(device):
+                matches.append(int(fields[0]))
+    unique = sorted(set(matches))
+    if not unique:
+        return None, f"no Ascend NPU mapped for device index {device} in `npu-smi info -m`"
+    if len(unique) > 1:
+        return None, f"physical device {device} is claimed by multiple npu-smi NPU IDs {unique}"
+    return unique[0], None
+
+
+def _probe_npu_mapping(device: str, timeout: float) -> dict:
+    smi = adapter_runtime.smi_command()
+    result = _bounded_host_command([smi, "info", "-m"], timeout)
+    base = {
+        "kind": "mapping",
+        "command": f"{smi} info -m",
+        "probePid": result["pid"],
+        "seconds": result["seconds"],
+        "timedOut": result["timedOut"],
+        "unreaped": result["unreaped"],
+        "wchan": result["wchan"],
+        "returncode": result["returncode"],
+        "npuId": None,
+    }
+    if result["error"] is not None or result["timedOut"] or result["unreaped"]:
+        return {
+            **base,
+            "ok": False,
+            "missing": False,
+            "error": result["error"] or "mapping probe did not complete",
+            "stderrTail": (result["stderr"] or "")[-500:],
+        }
+    if result["returncode"] != 0:
+        return {
+            **base,
+            "ok": False,
+            "missing": False,
+            "error": f"mapping probe exited {result['returncode']}",
+            "stderrTail": (result["stderr"] or result["stdout"] or "")[-500:],
+        }
+    npu_id, error = _npu_id_from_mapping(result["stdout"], device)
+    missing = bool(npu_id is None and error and error.startswith("no Ascend NPU mapped"))
+    return {
+        **base,
+        "ok": npu_id is not None,
+        "missing": missing,
+        "npuId": npu_id,
+        "error": error,
+    }
+
+
+def _health_kind(value: object) -> str:
+    if value is None:
+        return "unknown"
+    token = re.sub(r"[^A-Za-z_]+", "_", str(value).strip()).strip("_").upper()
+    if token in {"OK", "NORMAL", "HEALTHY", "GOOD"}:
+        return "ok"
+    if token in {
+        "ERROR", "FAULT", "FAULTY", "FAIL", "FAILED", "OFFLINE", "DOWN",
+        "CRITICAL", "UNHEALTHY", "ABNORMAL", "NOT_OK", "NOTOK",
+    }:
+        return "fatal"
+    return "unknown"
+
+
+def _health_value_from_health_output(text: str) -> str | None:
+    match = _HEALTH_STATUS.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _health_value_from_info(text: str, npu_id: int) -> str | None:
+    health: dict[int, str] = {}
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) >= 4 and cells[1].isdigit() and cells[2].startswith("Ascend"):
+            health[int(cells[1])] = cells[3]
+            continue
+        if len(cells) >= 3:
+            match = re.fullmatch(r"(\d+)\s+\S+", cells[1])
+            if match and cells[2]:
+                health.setdefault(int(match.group(1)), cells[2])
+    return health.get(npu_id)
+
+
+def _probe_device_health(npu_id: int, timeout: float) -> dict:
+    smi = adapter_runtime.smi_command()
+    command = [smi, "info", "-t", "health", "-i", str(npu_id)]
+    result = _bounded_host_command(command, timeout)
+    base = {
+        "kind": "health",
+        "command": " ".join(command),
+        "probePid": result["pid"],
+        "seconds": result["seconds"],
+        "timedOut": result["timedOut"],
+        "unreaped": result["unreaped"],
+        "wchan": result["wchan"],
+        "returncode": result["returncode"],
+        "healthValue": None,
+        "healthKind": "unavailable",
+        "source": "health",
+    }
+    if result["timedOut"] or result["unreaped"]:
+        return {
+            **base,
+            "ok": False,
+            "error": "device health probe timed out",
+            "stderrTail": (result["stderr"] or "")[-500:],
+        }
+    if result["error"] is None and result["returncode"] == 0:
+        value = _health_value_from_health_output(result["stdout"])
+        if value is not None:
+            return {
+                **base,
+                "ok": True,
+                "healthValue": value,
+                "healthKind": _health_kind(value),
+            }
+
+    # Older npu-smi builds do not support `-t health`; fall back to the health
+    # table in the full dump. Missing/ambiguous rows remain unknown.
+    fallback = _bounded_host_command([smi, "info"], timeout)
+    fallback_base = {
+        **base,
+        "command": f"{smi} info",
+        "probePid": fallback["pid"],
+        "source": "info-table",
+        "seconds": round(result["seconds"] + fallback["seconds"], 3),
+        "timedOut": fallback["timedOut"],
+        "unreaped": fallback["unreaped"],
+        "wchan": fallback["wchan"],
+        "returncode": fallback["returncode"],
+    }
+    if fallback["error"] is not None or fallback["timedOut"] or fallback["unreaped"]:
+        return {
+            **fallback_base,
+            "ok": False,
+            "error": fallback["error"] or "device health probe did not complete",
+            "stderrTail": (fallback["stderr"] or "")[-500:],
+        }
+    if fallback["returncode"] != 0:
+        return {
+            **fallback_base,
+            "ok": False,
+            "error": f"device health probe exited {fallback['returncode']}",
+            "stderrTail": (fallback["stderr"] or fallback["stdout"] or "")[-500:],
+        }
+    value = _health_value_from_info(fallback["stdout"], npu_id)
+    if value is None:
+        return {
+            **fallback_base,
+            "ok": False,
+            "error": f"device health table did not report NPU ID {npu_id}",
+        }
+    return {
+        **fallback_base,
+        "ok": True,
+        "healthValue": value,
+        "healthKind": _health_kind(value),
+    }
+
+
+def _probe_device_processes(npu_id: int, timeout: float) -> dict:
+    smi = adapter_runtime.smi_command()
+    command = [smi, "info", "-t", "proc-mem", "-i", str(npu_id)]
+    result = _bounded_host_command(command, timeout)
+    base = {
+        "kind": "occupancy",
+        "command": " ".join(command),
+        "probePid": result["pid"],
+        "seconds": result["seconds"],
+        "timedOut": result["timedOut"],
+        "unreaped": result["unreaped"],
+        "wchan": result["wchan"],
+        "returncode": result["returncode"],
+        "processTableSeen": False,
+    }
+    if result["error"] is not None or result["timedOut"] or result["unreaped"]:
+        return {
+            **base,
+            "ok": False,
+            "error": result["error"] or "occupancy probe did not complete",
+            "stderrTail": (result["stderr"] or "")[-500:],
+        }
+    if result["returncode"] != 0:
+        return {
+            **base,
+            "ok": False,
+            "error": f"occupancy probe exited {result['returncode']}",
+            "stderrTail": (result["stderr"] or result["stdout"] or "")[-500:],
+        }
+    if _PROC_MEM_NPU.search(result["stdout"]) is None:
+        return {
+            **base,
+            "ok": False,
+            "error": f"proc-mem output did not report NPU ID {npu_id}",
+        }
+    seen = "Process id" in result["stdout"] or "No process" in result["stdout"]
+    processes = [
+        {"pid": match.group(1), "name": match.group(2), "memoryMb": match.group(3)}
+        for match in _PROC_MEM_LINE.finditer(result["stdout"])
+    ]
+    return {
+        **base,
+        "ok": seen,
+        "processTableSeen": seen,
+        "processes": processes,
+        "error": None if seen else "proc-mem output had no process table",
+    }
+
+
+def _read_proc_stat(pid: int) -> dict | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        fields = raw.rsplit(")", 1)[1].split()
+        return {
+            "state": fields[0],
+            "startTime": int(fields[19]),
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_proc_wchan(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/wchan").read_text(encoding="utf-8", errors="replace").strip() or None
+    except OSError:
+        return None
+
+
+def _read_proc_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _pid_has_token(pid: int, token: str) -> bool | None:
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return None
+    needle = f"{HEALTH_TOKEN_ENV}={token}".encode("utf-8")
+    return needle in environ.split(b"\0")
+
+
+def _pid_owner_matches(pid: int) -> bool | None:
+    try:
+        return Path(f"/proc/{pid}").stat().st_uid == os.geteuid()
+    except OSError:
+        return None
+
+
+def _scan_token_pids(token: str) -> set[int]:
+    found: set[int] = set()
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return found
+    own_pid = os.getpid()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == own_pid:
+            continue
+        try:
+            if entry.stat().st_uid != os.geteuid():
+                continue
+        except OSError:
+            continue
+        if _pid_has_token(pid, token) is True:
+            found.add(pid)
+    return found
+
+
+def _classify_device_processes(processes: list[dict], token: str) -> dict:
+    own: list[int] = []
+    external: list[int] = []
+    unknown: list[int] = []
+    stale: list[int] = []
+    for row in processes:
+        try:
+            pid = int(row.get("pid", ""))
+        except (TypeError, ValueError):
+            continue
+        if pid == os.getpid():
+            continue
+        stat = _read_proc_stat(pid)
+        if stat is None:
+            stale.append(pid)
+            continue
+        if stat["state"] == "Z":
+            continue
+        if _read_proc_comm(pid) in {"npu-smi", "npu_smi"}:
+            # A concurrent SMI query is not a device workload.
+            continue
+        has_token = _pid_has_token(pid, token)
+        if has_token is True:
+            own.append(pid)
+        elif has_token is False:
+            external.append(pid)
+        elif _pid_owner_matches(pid) is False:
+            external.append(pid)
+        else:
+            unknown.append(pid)
+    return {
+        "own": sorted(set(own)),
+        "external": sorted(set(external)),
+        "unknown": sorted(set(unknown)),
+        "stale": sorted(set(stale)),
+    }
+
+
+def _kill_token_processes(token: str) -> dict:
+    """Signal only processes carrying this run's token, bounded and targeted."""
+    started = time.monotonic()
+    seen: set[int] = set()
+    sigterm: set[int] = set()
+    sigkill: set[int] = set()
+
+    def _alive() -> list[int]:
+        alive: list[int] = []
+        for pid in sorted(seen):
+            stat = _read_proc_stat(pid)
+            if stat is None or stat["state"] == "Z":
+                continue
+            if _pid_has_token(pid, token) is not True:
+                continue
+            alive.append(pid)
+        return alive
+
+    grace_end = started + max(0.0, HEALTH_CLEANUP_GRACE_SECONDS)
+    while True:
+        seen.update(_scan_token_pids(token))
+        alive = _alive()
+        if not alive:
+            break
+        now = time.monotonic()
+        if now >= grace_end:
+            break
+        for pid in alive:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                sigterm.add(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(0.1)
+
+    kill_end = time.monotonic() + max(0.0, HEALTH_CLEANUP_SECONDS)
+    while True:
+        seen.update(_scan_token_pids(token))
+        alive = _alive()
+        if not alive:
+            break
+        now = time.monotonic()
+        if now >= kill_end:
+            break
+        for pid in alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                sigkill.add(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(0.1)
+
+    surviving = _alive()
+    return {
+        "attempted": bool(seen),
+        "seconds": round(time.monotonic() - started, 3),
+        "pids": sorted(seen)[:20],
+        "sigterm": sorted(sigterm)[:20],
+        "sigkill": sorted(sigkill)[:20],
+        "surviving": surviving[:20],
+        "survivingProcesses": [
+            identity
+            for pid in surviving[:20]
+            if (identity := _process_identity(pid)) is not None
+        ],
+        "incomplete": bool(surviving),
+    }
+
+
+def _retire_stuck_probe(pid: int) -> None:
+    """Reap our own exited probe child without ever blocking on a D-state probe."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
+class _RunHealthMonitor:
+    """Sample one run's card health and occupancy without owning it."""
+
+    def __init__(
+        self,
+        *,
+        device: str,
+        mode: str,
+        token: str,
+        phase_getter: Callable[[], str | None] | None = None,
+    ) -> None:
+        self.device = device
+        self.mode = mode
+        self.token = token
+        self.phase_getter = phase_getter
+        self.started = time.monotonic()
+        self.probe_interval = max(0.01, float(HEALTH_PROBE_INTERVAL_SECONDS))
+        self.probe_timeout = max(0.05, float(HEALTH_PROBE_TIMEOUT_SECONDS))
+        self.failure_limit = max(1, int(HEALTH_PROBE_FAILURE_LIMIT))
+        self.fatal_limit = max(1, int(HEALTH_FATAL_CONFIRMATIONS))
+        self.external_limit = max(1, int(HEALTH_EXTERNAL_CONFIRMATIONS))
+        self.missing_limit = max(1, int(HEALTH_MISSING_CONFIRMATIONS))
+        self.started_at = _timestamp()
+        self.last_scan = 0.0
+        self.known_pids: set[int] = set()
+        self.last_probe_at = 0.0
+        self.last_probe: dict | None = None
+        self.last_mapping_check: dict | None = None
+        self.npu_id: int | None = None
+        self.health = "not_probed"
+        self.health_unknown = False
+        self.probe_failures = 0
+        self.occupancy_failures = 0
+        self.fatal_streak = 0
+        self.non_ok_streak = 0
+        self.missing_streak = 0
+        self.external_streak = 0
+        self.occupancy = "not_checked"
+        self.own_pids: list[int] = []
+        self.external_pids: list[int] = []
+        self.unknown_pids: list[int] = []
+        self.stuck_probes: dict[int, dict] = {}
+        self.stuck_probe_history: set[int] = set()
+        self.unknown_signals: set[str] = set()
+        if mode == "l4":
+            # L4's internal device-fault counters are not exposed by the host
+            # SMI interface; record that limitation instead of inferring health.
+            self.unknown_signals.add("l4_internal_fault_counters_unavailable")
+        self.abort: dict | None = None
+        self.cleanup_result: dict | None = None
+        self.outcome = "running"
+
+    def _phase_name(self) -> str | None:
+        if self.phase_getter is None:
+            return None
+        try:
+            return self.phase_getter()
+        except Exception:
+            return None
+
+    def _refresh_processes(self, now: float) -> None:
+        if now - self.last_scan >= max(0.05, float(HEALTH_PID_RESCAN_SECONDS)):
+            current = _scan_token_pids(self.token)
+            self.last_scan = now
+        else:
+            current = {
+                pid for pid in self.known_pids
+                if _pid_has_token(pid, self.token) is True
+            }
+        self.known_pids = current
+
+    def _abort_run(
+        self,
+        kind: str,
+        reason: str,
+        *,
+        occupancy: str | None = None,
+        health_unknown: bool = False,
+    ) -> dict:
+        if self.abort is None:
+            self.abort = {
+                "kind": kind,
+                "reason": reason,
+                "at": _timestamp(),
+                "phase": self._phase_name(),
+                "device": self.device,
+                "npuId": self.npu_id,
+                "occupancy": occupancy,
+                "healthUnknown": bool(health_unknown),
+                "stuckProbePids": sorted(self.stuck_probes)[:20],
+            }
+            self.health_unknown = self.health_unknown or health_unknown
+        return self.abort
+
+    def _note_stuck_probe(self, probe: dict) -> None:
+        """Track a probe that survived SIGKILL so new probes are not stacked on it."""
+        if not probe.get("unreaped"):
+            return
+        pid = probe.get("probePid")
+        if not isinstance(pid, int):
+            return
+        identity = _process_identity(pid)
+        if identity is None:
+            # The probe exited (or is a zombie) between SIGKILL and this check.
+            _retire_stuck_probe(pid)
+            return
+        self.stuck_probes[pid] = identity
+        self.stuck_probe_history.add(pid)
+        self.unknown_signals.add("device_probe_unreaped")
+
+    def _stuck_probe_alive(self) -> bool:
+        active: dict[int, dict] = {}
+        for pid, identity in self.stuck_probes.items():
+            status = _identity_status(identity)
+            if status in {"alive", "unknown"}:
+                # Indeterminate is treated like alive: never stack more probes
+                # on a driver that may be wedged.
+                active[pid] = identity
+            else:
+                _retire_stuck_probe(pid)
+        self.stuck_probes = active
+        return bool(active)
+
+    def _count_probe_failure(self, reason: str) -> None:
+        self.probe_failures += 1
+        if self.probe_failures >= self.failure_limit:
+            self._abort_run(
+                "probe_unavailable",
+                f"device probe unavailable for {self.probe_failures} "
+                f"consecutive attempts: {reason}",
+                health_unknown=True,
+            )
+
+    def _note_missing_mapping(self, *, detail: str) -> None:
+        self.missing_streak += 1
+        self.probe_failures = 0
+        self.health = "missing"
+        if self.missing_streak >= self.missing_limit:
+            self._abort_run(
+                "device_missing",
+                f"target device {self.device} is no longer mapped by "
+                f"`npu-smi info -m` on {self.missing_streak} consecutive probes "
+                f"({detail}); this run's work cannot be scheduled there",
+                occupancy="missing",
+            )
+
+    def _recheck_mapping_after_failure(self) -> bool:
+        """Distinguish a disappeared card from an unreadable health probe."""
+        mapping = _probe_npu_mapping(self.device, self.probe_timeout)
+        self.last_mapping_check = mapping
+        self._note_stuck_probe(mapping)
+        if mapping.get("ok"):
+            self.npu_id = int(mapping["npuId"])
+            self.missing_streak = 0
+            return False
+        if mapping.get("missing"):
+            self._note_missing_mapping(detail=str(mapping.get("error")))
+            return True
+        self.missing_streak = 0
+        return False
+
+    def _probe(self) -> None:
+        probe_timeout = self.probe_timeout
+        if self._stuck_probe_alive():
+            self.last_probe = {
+                "at": _timestamp(),
+                "kind": "probe_stuck",
+                "probePids": sorted(self.stuck_probes)[:20],
+                "error": "a previous probe did not exit after SIGKILL; "
+                "new probes are suppressed",
+            }
+            self.health = "unknown"
+            self._count_probe_failure(
+                f"probe process(es) {sorted(self.stuck_probes)[:8]} did not exit"
+            )
+            return
+
+        if self.npu_id is None:
+            mapping = _probe_npu_mapping(self.device, probe_timeout)
+            self.last_mapping_check = mapping
+            self._note_stuck_probe(mapping)
+            if not mapping.get("ok"):
+                self.last_probe = {
+                    "at": _timestamp(),
+                    "npuId": None,
+                    "healthKind": "missing" if mapping.get("missing") else "unavailable",
+                    "mapping": mapping,
+                    "error": mapping.get("error"),
+                }
+                if mapping.get("missing"):
+                    self._note_missing_mapping(detail=str(mapping.get("error")))
+                else:
+                    self.missing_streak = 0
+                    self._count_probe_failure(str(mapping.get("error")))
+                return
+            self.npu_id = int(mapping["npuId"])
+            self.missing_streak = 0
+
+        health = _probe_device_health(self.npu_id, probe_timeout)
+        self._note_stuck_probe(health)
+        row: dict = {
+            "at": _timestamp(),
+            "npuId": self.npu_id,
+            "health": health,
+        }
+        self.last_probe = row
+        kind = health.get("healthKind")
+        if kind == "ok":
+            self.probe_failures = 0
+            self.fatal_streak = 0
+            self.non_ok_streak = 0
+            self.missing_streak = 0
+            self.health = "ok"
+        elif kind == "fatal":
+            self.fatal_streak += 1
+            self.probe_failures = 0
+            self.non_ok_streak = 0
+            self.missing_streak = 0
+            self.health = "fatal"
+            if self.fatal_streak >= self.fatal_limit:
+                self._abort_run(
+                    "device_error",
+                    "device health reports "
+                    f"{health.get('healthValue')!r} for NPU {self.npu_id} "
+                    f"on {self.fatal_streak} consecutive probes",
+                )
+                return
+        elif health.get("ok") and health.get("healthValue") is not None:
+            # Parsed but not a recognised healthy value (e.g. Warning). Record
+            # it as non-OK; it is not a confirmed fatal fault and never a
+            # reason to kill a possibly long-running kernel.
+            self.probe_failures = 0
+            self.fatal_streak = 0
+            self.missing_streak = 0
+            self.non_ok_streak += 1
+            self.health = "non_ok"
+            self.unknown_signals.add("device_health_non_ok")
+        else:
+            self.fatal_streak = 0
+            self.non_ok_streak = 0
+            self.health = "unknown"
+            if health.get("unreaped"):
+                # Do not launch another probe against a wedged driver; the
+                # stuck-probe check at the top of the next interval takes over.
+                self._count_probe_failure(str(health.get("error")))
+                return
+            if self._recheck_mapping_after_failure():
+                return
+            self._count_probe_failure(
+                str(health.get("error") or health.get("healthValue"))
+            )
+            return
+
+        occupancy = _probe_device_processes(self.npu_id, probe_timeout)
+        self._note_stuck_probe(occupancy)
+        row["occupancy"] = occupancy
+        if not occupancy.get("ok"):
+            self.occupancy = "unknown"
+            self.occupancy_failures += 1
+            self.unknown_signals.add("device_occupancy_unavailable")
+            if self.mode == "l4" and self.occupancy_failures >= self.failure_limit:
+                self._abort_run(
+                    "occupancy_unknown",
+                    "L4 occupancy could not be observed for "
+                    f"{self.occupancy_failures} consecutive attempts: "
+                    f"{occupancy.get('error')}",
+                    occupancy="unknown",
+                    health_unknown=True,
+                )
+            return
+
+        self.occupancy_failures = 0
+        classes = _classify_device_processes(
+            list(occupancy.get("processes") or []), self.token
+        )
+        self.own_pids = classes["own"]
+        self.external_pids = classes["external"]
+        self.unknown_pids = classes["unknown"]
+        if self.unknown_pids:
+            self.unknown_signals.add("device_process_environ_unreadable")
+        if self.external_pids:
+            self.occupancy = f"shared({len(self.external_pids)})"
+        elif self.unknown_pids:
+            self.occupancy = "unknown"
+        elif self.own_pids:
+            self.occupancy = "own"
+        else:
+            self.occupancy = "free"
+
+        if self.external_pids:
+            self.external_streak += 1
+            if self.mode == "l4" and self.external_streak >= self.external_limit:
+                self._abort_run(
+                    "external_occupancy",
+                    "L4 lost exclusivity after the lease opened: external device "
+                    f"process(es) {self.external_pids[:8]} remained on NPU {self.npu_id} "
+                    f"for {self.external_streak} consecutive probes",
+                    occupancy=f"shared({len(self.external_pids)})",
+                )
+        else:
+            self.external_streak = 0
+
+    def poll(self) -> dict | None:
+        now = time.monotonic()
+        self._refresh_processes(now)
+        if self.known_pids and now - self.last_probe_at >= self.probe_interval:
+            self.last_probe_at = now
+            self._probe()
+        return self.abort
+
+    def cleanup_probes(self) -> dict:
+        """Stop and reap our own stuck probes; never touches workload processes."""
+        started = time.monotonic()
+        pids = sorted(self.stuck_probes)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = started + 1.0
+        while time.monotonic() < deadline:
+            if not self._stuck_probe_alive():
+                break
+            time.sleep(0.05)
+        remaining = sorted(self.stuck_probes)
+        for pid in remaining:
+            _retire_stuck_probe(pid)
+        return {
+            "pids": pids[:20],
+            "remaining": remaining[:20],
+            "seconds": round(time.monotonic() - started, 3),
+        }
+
+    def cleanup(self, *, aborted: bool) -> dict:
+        result = _kill_token_processes(self.token)
+        result["probeCleanup"] = self.cleanup_probes()
+        self.cleanup_result = result
+        if aborted:
+            self.outcome = "aborted"
+        elif result.get("surviving"):
+            self.outcome = "cleanup_incomplete"
+        return result
+
+    def finish(self, outcome: str, *, force: bool = False) -> None:
+        if force or self.outcome == "running":
+            self.outcome = outcome
+
+    def snapshot(self) -> dict:
+        data: dict = {
+            "enabled": True,
+            "mode": self.mode,
+            "device": self.device,
+            "npuId": self.npu_id,
+            "startedAt": self.started_at,
+            "probeIntervalSeconds": self.probe_interval,
+            "probeTimeoutSeconds": self.probe_timeout,
+            "health": self.health,
+            "healthUnknown": bool(self.health_unknown),
+            "occupancy": self.occupancy,
+            "probeFailures": self.probe_failures,
+            "occupancyFailures": self.occupancy_failures,
+            "fatalHealthStreak": self.fatal_streak,
+            "nonOkHealthStreak": self.non_ok_streak,
+            "missingMappingStreak": self.missing_streak,
+            "externalOccupancyStreak": self.external_streak,
+            "ownProcessCount": len(self.known_pids),
+            "ownPids": sorted(self.known_pids)[:20],
+            "externalProcessCount": len(self.external_pids),
+            "externalPids": list(self.external_pids)[:20],
+            "unknownProcessCount": len(self.unknown_pids),
+            "unknownPids": list(self.unknown_pids)[:20],
+            "stuckProbePids": sorted(self.stuck_probes)[:20],
+            "stuckProbePidsObserved": sorted(self.stuck_probe_history)[:20],
+            "lastProbe": self.last_probe,
+            "lastMappingCheck": self.last_mapping_check,
+            "unknownSignals": sorted(self.unknown_signals),
+            "outcome": self.outcome,
+        }
+        if self.abort is not None:
+            data["abort"] = dict(self.abort)
+        if self.cleanup_result is not None:
+            data["cleanup"] = dict(self.cleanup_result)
+        return data
+
+
+def _run_host_bash_monitored(
+    command: str,
+    *,
+    mode: str,
+    device: str,
+    monitor_sink: dict,
+    phase_getter: Callable[[], str | None] | None = None,
+    lease_path: str | None = None,
+    **kwargs,
+) -> subprocess.CompletedProcess[str]:
+    """Run one existing host command while sampling this run's health.
+
+    The command and its timeout/cleanup semantics are unchanged: it still runs
+    through adapter_runtime.run_host_bash. The monitor only adds (a) bounded
+    health/occupancy probes and (b) a targeted signal sweep over processes that
+    inherited this run's opaque token when a confirmed fault must end the run.
+    Surrendered device work that survives that sweep is recorded in the
+    per-card quarantine marker before the caller releases the lease.
+    """
+    token = secrets.token_hex(16)
+    child_env = dict(kwargs.pop("env", None) or os.environ)
+    child_env[HEALTH_TOKEN_ENV] = token
+    kwargs["env"] = child_env
+    monitor = _RunHealthMonitor(
+        device=device,
+        mode=mode,
+        token=token,
+        phase_getter=phase_getter,
+    )
+    resolved_lease = lease_path
+    if resolved_lease is None:
+        resolved_lease = os.environ.get("AGENT_GATES_DEVICE_LEASE_PATH", "").strip() or None
+    lease_resource = os.environ.get(
+        "AGENT_GATES_DEVICE_LEASE_RESOURCE", f"npu:{device}"
+    ).strip()
+    result: dict = {}
+    started = time.monotonic()
+    run_timeout = kwargs.get("timeout")
+    deadline = (
+        started + float(run_timeout)
+        if isinstance(run_timeout, (int, float)) and float(run_timeout) > 0
+        else None
+    )
+    deadline_sweep: dict | None = None
+    deadline_exit_at: float | None = None
+    deadline_unreapable = False
+
+    def _runner() -> None:
+        try:
+            result["completed"] = adapter_runtime.run_host_bash(command, **kwargs)
+        except BaseException as exc:  # re-raised in the calling thread
+            result["error"] = exc
+
+    thread = threading.Thread(
+        target=_runner,
+        name=f"tilefoundry-health-run-{os.getpid()}",
+        daemon=True,
+    )
+    thread.start()
+
+    def _cleanup(aborted: bool, reason: str) -> dict:
+        if monitor.cleanup_result is not None:
+            return monitor.cleanup_result
+        cleanup = monitor.cleanup(aborted=aborted)
+        cleanup["workerJoined"] = not thread.is_alive()
+        cleanup["quarantine"] = _quarantine_cleanup(
+            cleanup,
+            lease_path=resolved_lease,
+            resource=lease_resource,
+            device=device,
+            token=token,
+            phase=monitor._phase_name(),
+            reason=reason,
+        )
+        if deadline_sweep is not None:
+            cleanup["deadlineSweep"] = deadline_sweep
+        monitor.cleanup_result = cleanup
+        return cleanup
+
+    def _quarantine_note(cleanup: dict) -> str:
+        quarantine = cleanup.get("quarantine") or {}
+        if quarantine.get("written"):
+            return (
+                f"; card quarantined for successors: {quarantine.get('path')} "
+                f"(reason={quarantine.get('reason')})"
+            )
+        if quarantine.get("writeError"):
+            return f"; quarantine marker could not be written: {quarantine.get('writeError')}"
+        return ""
+
+    try:
+        while True:
+            thread.join(timeout=max(0.01, float(HEALTH_POLL_SECONDS)))
+            if not thread.is_alive():
+                break
+            if (
+                deadline is not None
+                and deadline_sweep is None
+                and time.monotonic()
+                >= deadline + max(0.0, float(HEALTH_DEADLINE_SWEEP_GRACE_SECONDS))
+            ):
+                # run_host_bash has already applied its own timeout. An escaped
+                # descendant can still hold the stdout/stderr pipes open and
+                # make its final communicate() wait for that descendant, so the
+                # recipe deadline alone would not bound this call. Sweep only
+                # processes carrying this run's opaque token; this is the same
+                # bounded cleanup, applied at the deadline instead of after it.
+                deadline_sweep = _kill_token_processes(token)
+                deadline_exit_at = (
+                    time.monotonic()
+                    + max(0.0, float(HEALTH_DEADLINE_EXIT_SECONDS))
+                )
+            if (
+                deadline_exit_at is not None
+                and thread.is_alive()
+                and time.monotonic() >= deadline_exit_at
+            ):
+                # A D-state descendant can survive SIGKILL and keep the runner
+                # blocked on its inherited pipes. Do not wait for the recipe's
+                # outer bound: return a bounded result and fence the card with
+                # the surviving identities recorded by the quarantine marker.
+                abort_reason = (
+                    "recipe deadline exceeded and this run's process cleanup "
+                    "could not complete within "
+                    f"{HEALTH_DEADLINE_EXIT_SECONDS}s after the deadline sweep"
+                )
+                cleanup = _cleanup(True, abort_reason)
+                cleanup["workerJoined"] = False
+                monitor.finish("deadline_unreclaimable", force=True)
+                monitor_sink.update(monitor.snapshot())
+                quarantine = cleanup.get("quarantine") or {}
+                deadline_unreapable = True
+                raise BridgeError(
+                    f"host command did not exit within {run_timeout}s and its "
+                    f"remaining processes could not be reaped: "
+                    f"{cleanup.get('surviving')}"
+                    + _quarantine_note(cleanup),
+                    category="infra",
+                    occupancy=(
+                        "quarantined" if quarantine.get("written") else None
+                    ),
+                )
+            if monitor.poll() is not None:
+                if not thread.is_alive():
+                    break
+                abort = monitor.abort or {}
+                cleanup = _cleanup(
+                    True,
+                    f"runtime health abort ({abort.get('kind')}) in phase "
+                    f"{abort.get('phase') or 'unknown'}",
+                )
+                thread.join(timeout=max(0.0, float(HEALTH_WORKER_JOIN_SECONDS)))
+                cleanup["workerJoined"] = not thread.is_alive()
+                monitor_sink.update(monitor.snapshot())
+                completed = result.get("completed")
+                tail = ""
+                if completed is not None:
+                    tail = (getattr(completed, "stderr", "") or "")[-1500:]
+                category = (
+                    "occupancy"
+                    if abort.get("kind") in {"external_occupancy", "occupancy_unknown"}
+                    else "environment"
+                )
+                message = (
+                    f"runtime health abort ({abort.get('kind')}) in phase "
+                    f"{abort.get('phase') or 'unknown'} on device {device} "
+                    f"(npu {monitor.npu_id}): {abort.get('reason')}"
+                )
+                if cleanup.get("surviving"):
+                    message += (
+                        f"; process cleanup incomplete: {cleanup.get('surviving')}"
+                    )
+                message += _quarantine_note(cleanup)
+                if tail.strip():
+                    message += f"; last stderr: {tail.strip()}"
+                raise BridgeError(
+                    message,
+                    category=category,
+                    occupancy=abort.get("occupancy"),
+                )
+    except KeyboardInterrupt:
+        _cleanup(True, "interrupted by KeyboardInterrupt")
+        thread.join(timeout=max(0.0, float(HEALTH_WORKER_JOIN_SECONDS)))
+        monitor_sink.update(monitor.snapshot())
+        raise
+    except BaseException:
+        # The explicit abort below raises BridgeError from inside this try;
+        # its cleanup result must not be replaced by an empty second sweep.
+        _cleanup(True, "run ended by an exception")
+        if not deadline_unreapable:
+            thread.join(timeout=max(0.0, float(HEALTH_WORKER_JOIN_SECONDS)))
+        monitor_sink.update(monitor.snapshot())
+        raise
+
+    if "error" in result:
+        error = result["error"]
+        if not isinstance(error, KeyboardInterrupt):
+            cleanup = _cleanup(False, f"runner error ({type(error).__name__})")
+            cleanup["workerJoined"] = not thread.is_alive()
+        monitor.finish("runner_error")
+        monitor_sink.update(monitor.snapshot())
+        raise error
+    completed = result["completed"]
+    cleanup = _cleanup(
+        False, f"host command finished (exit {completed.returncode})"
+    )
+    cleanup["workerJoined"] = not thread.is_alive()
+    if cleanup.get("surviving"):
+        monitor.finish("cleanup_incomplete")
+        monitor_sink.update(monitor.snapshot())
+        raise BridgeError(
+            "host command finished but this run's processes could not be "
+            f"terminated before releasing the device window: {cleanup.get('surviving')}"
+            + _quarantine_note(cleanup),
+            category="infra",
+            occupancy="quarantined" if (cleanup.get("quarantine") or {}).get("written") else None,
+        )
+    monitor.finish("completed")
+    monitor_sink.update(monitor.snapshot())
+    return completed
 
 
 @contextmanager
@@ -1116,11 +2865,26 @@ def _host_child_env(values: dict[str, str], *, include_llm_credential: bool = Fa
     return env
 
 
-def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
+def _scrub_python_startup(env: dict[str, str]) -> None:
+    """Drop parent-shell Python hooks so only adapter-built paths reach a child."""
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "AGENT_GATES_ACTIVATION_PYTHONPATH",
+    ):
+        env.pop(name, None)
+
+
+def _inspect_conda_cannbench_env(
+    values: dict[str, str], source: Path, *, timeout: float = 60.0
+) -> dict:
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
     run_env = _host_child_env(values)
+    _scrub_python_startup(run_env)
     envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
     if envs_path:
         run_env["CONDA_ENVS_PATH"] = envs_path
@@ -1134,7 +2898,7 @@ def _inspect_conda_cannbench_env(values: dict[str, str], source: Path) -> dict:
         cann_setup=None,
         conda_sh=conda_sh,
         conda_env=conda_env,
-        timeout=60.0,
+        timeout=max(1.0, timeout),
         isolate_temp=True,
     )
     info = _extract_last_json(completed.stdout, "missing")
@@ -1176,11 +2940,29 @@ def _validate_optional_agent_keys(values: dict[str, str]) -> None:
             raise BridgeError(f"{key} must be an absolute path when set: {val!r}")
 
 
+def l3_timeout(values: dict[str, str]) -> float:
+    raw = (values.get("TILEFOUNDRY_NPU_L3_TIMEOUT_SEC") or "").strip()
+    if not raw:
+        return DEFAULT_L3_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_L3_TIMEOUT_SEC must be a number: {raw!r}"
+        ) from exc
+    if not 0 < value <= MAX_L3_TIMEOUT:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_L3_TIMEOUT_SEC must be in (0, {MAX_L3_TIMEOUT:g}]: {raw!r}"
+        )
+    return value
+
+
 def check_config(
     *,
     check_device: bool = False,
     check_cannbench: bool = False,
     check_cannbench_remote: bool = False,
+    check_l3: bool = False,
 ) -> int:
     try:
         values = machine_values()
@@ -1190,6 +2972,7 @@ def check_config(
         _validate_optional_agent_keys(values)
         _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK")
         _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
+        l3_timeout(values)
         cann = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
         if not cann.is_file():
             raise BridgeError(f"TILEFOUNDRY_NPU_CANN_SETUP does not exist: {cann}")
@@ -1212,9 +2995,20 @@ def check_config(
             work_root(values, source, repo)
             if check_cannbench:
                 cannbench_arch(values)
-            resolve_cannbench_targets(values, source, repo)
+            resolve_cannbench_targets(
+                values, source, repo, allow_request=check_cannbench
+            )
         if check_cannbench_remote:
             _resolve_mcp_config(values)
+        if check_l3:
+            request = _read_l3_request()
+            repo = cannbench_repo(values)
+            wroot = work_root(values, source, repo)
+            task, _candidate = _validate_target_pair(
+                request["task"], request["candidate"], source, repo
+            )
+            operator = _l3_operator(task)
+            _l3_cache_layout(wroot, operator)
         if check_device:
             dev = device_id()
             if dev is not None:
@@ -1321,6 +3115,261 @@ def _window_evidence(occupancy: str, window: dict) -> dict:
         "windowReleased": True,
         "occupancyRecorded": occupancy in {"free", "unknown"} or occupancy.startswith("shared("),
         "deviceWindow": window,
+    }
+
+
+@contextmanager
+def _phase(phases: list[dict], name: str):
+    """Record one adapter-controlled phase, including its failure."""
+    entry: dict[str, object] = {"name": name, "startedAt": _timestamp(), "status": "running"}
+    phases.append(entry)
+    started = time.monotonic()
+    try:
+        yield entry
+    except BaseException as exc:
+        entry["status"] = "failed"
+        entry["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    else:
+        entry["status"] = "ok"
+    finally:
+        entry["endedAt"] = _timestamp()
+        entry["seconds"] = round(time.monotonic() - started, 3)
+
+
+def _as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: object) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _read_json_file(path: Path, *, limit: int = 1 << 20) -> dict | None:
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(data) > limit:
+        return None
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _read_l3_request() -> dict:
+    """Read the engine-published L3 request: canonical target and candidate."""
+    target = (os.environ.get(L3_TARGET_REQUEST_ENV) or "").strip()
+    candidate = (os.environ.get(L3_CANDIDATE_REQUEST_ENV) or "").strip()
+    if not target or not candidate:
+        raise BridgeError(
+            f"{L3_TARGET_REQUEST_ENV} and {L3_CANDIDATE_REQUEST_ENV} "
+            "must be supplied together by the engine for --l3-promotion"
+        )
+    return {"task": target, "candidate": candidate}
+
+
+def _l3_operator(task: str) -> str:
+    operator = task.rsplit("/", 1)[-1]
+    if operator not in L3_PROFILE_TESTS and not re.fullmatch(r"[a-z][a-z0-9_]*", operator):
+        raise BridgeError(f"cannot derive an L3 operator from target {task!r}")
+    return operator
+
+
+def _l3_expected_tests(operator: str) -> tuple[str, ...]:
+    return L3_PROFILE_TESTS.get(operator, (L3_GENERIC_TEST,))
+
+
+def _l3_cache_layout(wroot: Path, operator: str) -> dict[str, Path]:
+    base = wroot / "l3" / "cache" / operator
+    return {
+        "base": base,
+        "tilelang": base / "tilelang",
+        "reference": base / "reference",
+        "warmMarker": base / "reference-warm.json",
+    }
+
+
+def _tree_stats(root: Path) -> dict:
+    files = 0
+    total = 0
+    try:
+        for current, _dirs, names in os.walk(root):
+            for name in names:
+                item = Path(current) / name
+                try:
+                    if item.is_file():
+                        files += 1
+                        total += item.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return {"path": str(root), "files": files, "bytes": total}
+
+
+def _l3_expectation(
+    reference: Path, marker: Path, *, task: str, operator: str
+) -> tuple[str, str]:
+    """Ordinary promotion accepts any legal mix of cache hits and rebuilds.
+
+    A marker is not authoritative here: only the Lead-owned strict cold/warm
+    acceptance may read or write it. The observed directory state is still
+    reported below so the receipt keeps the pre-run cache identity.
+    """
+    _ = (marker, task, operator)
+    entries = _tree_stats(reference / "operators")["files"]
+    if entries == 0:
+        return "any", "ordinary-gate-empty-cache-allows-cold-rebuild"
+    return "any", "ordinary-gate-observed-entries-allow-legal-mixed-rebuild"
+
+
+def _l3_junit(path: Path) -> dict | None:
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = [root] if root.tag == "testsuite" else list(root.findall(".//testsuite"))
+    rows: list[dict] = []
+    for case in root.iter("testcase"):
+        name = str(case.attrib.get("name", ""))
+        if case.find("failure") is not None:
+            status = "failed"
+        elif case.find("error") is not None:
+            status = "error"
+        elif case.find("skipped") is not None:
+            status = "skipped"
+        else:
+            status = "passed"
+        try:
+            seconds = float(case.attrib.get("time", "0") or 0)
+        except ValueError:
+            seconds = 0.0
+        rows.append({
+            "name": name.split("[", 1)[0],
+            "fullName": name,
+            "className": str(case.attrib.get("classname", "")),
+            "status": status,
+            "seconds": round(seconds, 3),
+        })
+    if not suites and not rows:
+        return None
+    collected = sum(int(s.attrib.get("tests", 0)) for s in suites) if suites else len(rows)
+    errors = sum(int(s.attrib.get("errors", 0)) for s in suites) if suites else 0
+    failures = sum(int(s.attrib.get("failures", 0)) for s in suites) if suites else 0
+    skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites) if suites else 0
+    failed = errors + failures
+    return {
+        "collected": collected,
+        "passed": max(0, collected - failed - skipped),
+        "failed": failed,
+        "errors": errors,
+        "failures": failures,
+        "skipped": skipped,
+        "rows": rows,
+    }
+
+
+def _l3_expected_rows(junit: dict | None, expected: tuple[str, ...]) -> tuple[list[dict], list[str], list[str]]:
+    """Return expected rows plus missing/duplicate test names."""
+    if junit is None:
+        return [], list(expected), []
+    rows = [row for row in junit["rows"] if row["name"] in expected]
+    names = [row["name"] for row in rows]
+    missing = [name for name in expected if name not in names]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    return rows, missing, duplicates
+
+
+def _l3_evidence_summary(
+    evidence: dict | None,
+    *,
+    expected_module: Path,
+    candidate_relative: str,
+    candidate_digest: str,
+) -> dict | None:
+    if evidence is None:
+        return None
+    target = _as_dict(evidence.get("target"))
+    candidate = dict(_as_dict(evidence.get("candidate")))
+    # relativePath is not a producer field. It is the canonical path this
+    # adapter accepted from the engine request and bound to the candidate
+    # bytes, so keep it engine-signed. Producer modulePath/digest fields stay
+    # exactly as observed; missing identity is handled by _l3_classify.
+    candidate["relativePath"] = candidate_relative
+    nodes = _as_list(evidence.get("nodes"))
+    # Keep the nested target block, including only the module path the
+    # producer recorded. A downstream promotion client binds the receipt to
+    # that observed path; the request-derived value is reported separately
+    # under expectedIdentity and never substituted into this field.
+    return {
+        "schema": evidence.get("schema"),
+        "profile": evidence.get("profile"),
+        "task": target.get("task"),
+        "operator": target.get("operator"),
+        "target": {
+            "operator": target.get("operator"),
+            "task": target.get("task"),
+            "taskDir": target.get("taskDir"),
+            "modulePath": target.get("modulePath"),
+            "cases": list(target.get("cases") or []),
+        },
+        "targetCaseCount": len(_as_list(target.get("cases"))),
+        "candidate": candidate,
+        "expectedIdentity": {
+            "target": {"modulePath": str(expected_module)},
+            "candidate": {
+                "modulePath": str(expected_module),
+                "relativePath": candidate_relative,
+                "sha256": candidate_digest,
+            },
+        },
+        "interpreter": _as_dict(evidence.get("interpreter")),
+        "coverage": _as_dict(evidence.get("coverage")),
+        "referenceCache": _as_dict(evidence.get("referenceCache")),
+        "writeErrors": list(_as_list(evidence.get("writeErrors"))),
+        "interruption": _as_dict(evidence.get("interruption")),
+        "phase": evidence.get("phase"),
+        # Producer-structured failure classification. Only a candidate/numeric
+        # comparison failure may become a candidate verdict; everything else
+        # stays an infrastructure block.
+        "failure": _as_dict(evidence.get("failure")) or None,
+        "failures": [row for row in _as_list(evidence.get("failures")) if isinstance(row, dict)],
+        "nodes": [
+            {
+                "name": node.get("name"),
+                "status": node.get("status"),
+                "nodeId": node.get("nodeId"),
+                "requiredCases": list(_as_list(node.get("requiredCases"))),
+                "cases": _as_dict(node.get("cases")),
+                "failure": _as_dict(node.get("failure")) or None,
+                "caseCount": len(_as_dict(node.get("cases"))),
+                "error": node.get("error"),
+            }
+            for node in nodes
+            if isinstance(node, dict)
+        ],
     }
 
 
@@ -1485,299 +3534,1272 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                 return (0 if ok else (completed.returncode or 1)), obs
 
 
+def _lease_wait_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS", "60")))
+    except ValueError as exc:
+        raise BridgeError("invalid AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS") from exc
+
+
+def _l3_child_env(
+    values: dict[str, str],
+    *,
+    source: Path,
+    device: str,
+    task: str,
+    candidate: Path,
+    python: Path,
+    repo: Path,
+    run_dir: Path,
+    caches: dict[str, Path],
+    tl_identity: dict[str, str] | None,
+    expectation: str,
+    workload: bool,
+) -> dict[str, str]:
+    """Build the one activation environment shared by preflight and pytest."""
+    env = _host_child_env(values)
+    envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+    if envs_path:
+        env["CONDA_ENVS_PATH"] = envs_path
+    for name in list(env):
+        if (
+            name.startswith(("TF_L3_", "TILELANG_", "CANNBENCH_CACHE_"))
+            or name in {
+                "PYTHONPATH",
+                "PYTHONHOME",
+                "PYTHONSTARTUP",
+                "ASCEND_RT_VISIBLE_DEVICES",
+                "TORCH_DEVICE_BACKEND_AUTOLOAD",
+                "AGENT_GATES_TARGET",
+                "AGENT_GATES_CANDIDATE",
+            }
+        ):
+            env.pop(name, None)
+    # The target interpreter gets the adapter-resolved source root and the
+    # CANNBench checkout's official comparator path. No shim module is
+    # generated: the acceptance suite imports npu_compare when installed and
+    # otherwise falls back to kernel_eval.utils.compare from this checkout.
+    parts = [str(source.resolve()), str(repo.resolve() / "src")]
+    if tl_identity is not None:
+        parts.append(tl_identity["source"])
+    parts.append(DEFAULT_PYTHONPATH)
+    env.update({
+        "PYTHONPATH": ":".join(parts),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "TILELANG_CACHE_DIR": str(caches["tilelang"]),
+        "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1",
+        "TILELANG_DISABLE_CACHE": "0",
+        "CANNBENCH_CACHE_DIR": str(caches["reference"]),
+        L3_CACHE_MODE_ENV: "required",
+        L3_CACHE_EXPECTATION_ENV: expectation,
+    })
+    if workload:
+        env.update({
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "1",
+            "ASCEND_RT_VISIBLE_DEVICES": device,
+            L3_EVIDENCE_ENV: str(run_dir / "evidence.json"),
+            L3_PROFILE_ENV: L3_PROFILE,
+            L3_TARGET_OPERATOR_ENV: task,
+            L3_TARGET_MODULE_ENV: str(candidate),
+            L3_EXPECTED_PYTHON_ENV: str(python.resolve()),
+            L3_CANNBENCH_REPO_ENV: str(repo),
+        })
+        if tl_identity is not None:
+            env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
+    else:
+        # Preflight imports and probes only; it must not touch the granted card.
+        env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+        env["ASCEND_RT_VISIBLE_DEVICES"] = ""
+    return env
+
+
+def _l3_preflight_errors(
+    facts: dict | None, python: Path, caches: dict[str, Path]
+) -> list[str]:
+    if not isinstance(facts, dict):
+        return ["preflight produced no facts"]
+    errors: list[str] = []
+    if facts.get("ok") is not True:
+        errors.append(str(facts.get("error") or "preflight reported failure"))
+    try:
+        if Path(str(facts.get("python", ""))).resolve() != python.resolve():
+            errors.append("preflight interpreter differs from the adapter-resolved Python")
+    except OSError:
+        errors.append("preflight interpreter path is unusable")
+    cache = facts.get("cache") if isinstance(facts.get("cache"), dict) else {}
+    for name in L3_CACHE_COMPONENTS:
+        row = cache.get(name) if isinstance(cache, dict) else None
+        if not isinstance(row, dict) or row.get("writable") is not True:
+            errors.append(f"{name} cache probe failed")
+            continue
+        try:
+            if Path(str(row.get("path", ""))).resolve() != caches[name].resolve():
+                errors.append(f"{name} cache path differs from the dedicated directory")
+        except OSError:
+            errors.append(f"{name} cache path is unusable")
+    tilelang_cache = str(facts.get("tilelangCacheDir") or "").strip()
+    try:
+        if not tilelang_cache or Path(tilelang_cache).resolve() != caches["tilelang"].resolve():
+            errors.append("TileLang effective cache directory differs from the dedicated directory")
+    except OSError:
+        errors.append("TileLang cache directory is unusable")
+    case_ids = facts.get("caseIds")
+    if not isinstance(case_ids, list) or not case_ids:
+        errors.append("CANNBench task declares no case IDs")
+    elif len(set(case_ids)) != len(case_ids):
+        errors.append("CANNBench task declares duplicate case IDs")
+    return errors
+
+
+def _l3_failure_rows(evidence: dict | None) -> list[dict]:
+    """Collect the producer's structured failure rows without inventing any."""
+    if not isinstance(evidence, dict):
+        return []
+    rows: list[dict] = []
+    for key in ("failure",):
+        item = evidence.get(key)
+        if isinstance(item, dict):
+            rows.append(item)
+    for item in _as_list(evidence.get("failures")):
+        if isinstance(item, dict):
+            rows.append(item)
+    for node in _as_list(evidence.get("nodes")):
+        if isinstance(node, dict) and isinstance(node.get("failure"), dict):
+            rows.append(node["failure"])
+    cases = evidence.get("cases")
+    if isinstance(cases, dict):
+        for item in cases.values():
+            if isinstance(item, dict) and isinstance(item.get("failure"), dict):
+                rows.append(item["failure"])
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        try:
+            key = json.dumps(row, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
+
+
+def _l3_producer_block_kind(rows: list[dict]) -> str | None:
+    """Producer's own precedence: infrastructure/coverage outrank candidate."""
+    kinds = {str(row.get("kind") or "").strip().lower() for row in rows}
+    if "infrastructure" in kinds:
+        return "infrastructure"
+    if "coverage" in kinds:
+        return "coverage"
+    return None
+
+
+def _l3_candidate_numeric_failure(
+    evidence: dict | None, junit_rows: list[dict]
+) -> dict | None:
+    """Return the only producer-explicit candidate numeric comparison failure.
+
+    A bare JUnit ``failed`` row, a missing field, or a marker whose role,
+    applicable node, case or comparison does not line up is never numeric.
+    """
+    if not isinstance(evidence, dict):
+        return None
+    failures = _l3_failure_rows(evidence)
+    if _l3_producer_block_kind(failures) is not None:
+        return None
+    node_records = {
+        str(node.get("name")): node
+        for node in _as_list(evidence.get("nodes"))
+        if isinstance(node, dict) and node.get("name")
+    }
+    for marker in failures:
+        if str(marker.get("kind") or "").strip().lower() != "candidate":
+            continue
+        if str(marker.get("category") or "").strip().lower() != "numeric":
+            continue
+        if str(marker.get("role") or "").strip().lower() != "candidate":
+            continue
+        if str(marker.get("stage") or "").strip().lower() != "comparison":
+            continue
+        if not marker.get("comparator"):
+            continue
+        comparisons = marker.get("comparisons")
+        if not isinstance(comparisons, list) or not comparisons:
+            continue
+        if not any(
+            isinstance(row, dict) and row.get("passed") is False
+            for row in comparisons
+        ):
+            continue
+        node_name = marker.get("node")
+        case_id = marker.get("case")
+        if not isinstance(node_name, str) or not node_name or case_id is None:
+            continue
+        node = node_records.get(node_name)
+        if not isinstance(node, dict):
+            continue
+        cases = node.get("cases")
+        if not isinstance(cases, dict):
+            continue
+        if str(cases.get(str(case_id)) or "").strip().lower() not in {"failed", "error"}:
+            continue
+        # The matching JUnit row must be a failure of the same node. A failed
+        # row for another node/case does not transfer the candidate verdict.
+        if not any(
+            row.get("status") == "failed" and row.get("name") == node_name
+            for row in junit_rows
+        ):
+            continue
+        return {
+            "kind": "candidate",
+            "category": "numeric",
+            "role": "candidate",
+            "stage": "comparison",
+            "node": node_name,
+            "case": str(case_id),
+            "comparator": marker.get("comparator"),
+            "detail": marker.get("detail"),
+            "exceptionType": marker.get("exceptionType"),
+        }
+    return None
+
+
+def _l3_classify(
+    *,
+    rc: int,
+    expected: tuple[str, ...],
+    junit: dict | None,
+    evidence: dict | None,
+    task: str,
+    operator: str,
+    candidate: Path,
+    candidate_digest: str,
+    python: Path,
+) -> tuple[str, bool, bool, list[str]]:
+    """Classify a finished L3 pytest run without turning gaps into zeros."""
+    notes: list[str] = []
+    rows, missing, duplicates = _l3_expected_rows(junit, expected)
+    if junit is None:
+        notes.append("junit report missing")
+    if missing:
+        notes.append(f"expected tests missing: {', '.join(missing)}")
+    if duplicates:
+        notes.append(f"expected tests duplicated: {', '.join(duplicates)}")
+    junit_ok = (
+        junit is not None
+        and bool(rows)
+        and not missing
+        and not duplicates
+        and all(row["status"] == "passed" for row in rows)
+    )
+
+    ev = _as_dict(evidence) if evidence is not None else None
+    ev_target = _as_dict(ev.get("target")) if ev else {}
+    ev_coverage = _as_dict(ev.get("coverage")) if ev else {}
+    ev_candidate = _as_dict(ev.get("candidate")) if ev else {}
+    ev_interpreter = _as_dict(ev.get("interpreter")) if ev else {}
+    ev_cache = _as_dict(ev.get("referenceCache")) if ev else {}
+    ev_interruption = _as_dict(ev.get("interruption")) if ev else {}
+    ev_write_errors = _as_list(ev.get("writeErrors")) if ev else []
+    ev_timing = _as_dict(ev.get("timing")) if ev else {}
+    target_cases = _as_list(ev_target.get("cases"))
+    identity_ok = bool(
+        ev
+        and ev.get("schema") == L3_EVIDENCE_SCHEMA
+        and ev.get("profile") == L3_PROFILE
+        and ev_target.get("task") == task
+        and ev_target.get("operator") == operator
+        and target_cases
+        and len(set(str(case) for case in target_cases)) == len(target_cases)
+    )
+    candidate_ok = bool(
+        ev_candidate.get("sha256") == candidate_digest
+        and ev_candidate.get("modulePath") is not None
+        and str(ev_candidate.get("modulePath")) == str(candidate)
+    )
+    # The producer records the module it actually imported as the target.
+    # That observed path is required identity for promotion; the adapter's
+    # request-derived expectation is reported separately and never substituted
+    # here.
+    declared_target_module = ev_target.get("modulePath")
+    target_module_ok = (
+        declared_target_module is not None
+        and str(declared_target_module) == str(candidate)
+    )
+    try:
+        interpreter_ok = bool(
+            ev_interpreter.get("match") is True
+            and Path(str(ev_interpreter.get("sysExecutable") or "")).resolve() == python.resolve()
+        )
+    except OSError:
+        interpreter_ok = False
+    cache_ok = bool(
+        ev_cache.get("required") is True
+        and ev_cache.get("usable") is True
+        and not (ev_cache.get("errors") or [])
+    )
+    coverage_problem = ev_coverage.get("referenceCacheProblem")
+    evidence_qualified = ev_coverage.get("qualified") is True
+    # A snapshot is authoritative for this run only when the producer reached
+    # its strict final write. A failed final write leaves the previous
+    # intermediate payload (possibly without writeErrors), so phase and
+    # finishedAt are the trusted terminal state for promotion.
+    evidence_terminal = bool(ev and ev.get("phase") == "finished" and ev_timing.get("finishedAt"))
+    if ev_write_errors:
+        notes.append(f"evidence write errors: {len(ev_write_errors)}")
+    if ev is not None and not evidence_terminal:
+        notes.append("evidence did not reach a finished terminal state")
+    failure_rows = _l3_failure_rows(ev)
+    producer_block = _l3_producer_block_kind(failure_rows)
+    numeric_failure = _l3_candidate_numeric_failure(ev, rows)
+    junit_failed = [row for row in rows if row["status"] == "failed"]
+    if junit_failed and numeric_failure is None:
+        notes.append(
+            "JUnit failure(s) have no matching producer candidate/numeric "
+            "comparison failure: "
+            + ", ".join(sorted({str(row["name"]) for row in junit_failed}))
+        )
+    if numeric_failure is not None:
+        notes.append(
+            "producer candidate numeric failure: "
+            f"{numeric_failure.get('node')}:{numeric_failure.get('case')}"
+        )
+    interrupted_category = str(ev_interruption.get("errorCategory") or "").strip()
+    coverage_complete = bool(
+        junit_ok
+        and identity_ok
+        and candidate_ok
+        and target_module_ok
+        and interpreter_ok
+        and cache_ok
+        and evidence_qualified
+        and evidence_terminal
+        and not ev_write_errors
+    )
+    promotion_eligible = bool(
+        coverage_complete and rc == 0 and not interrupted_category and not coverage_problem
+    )
+    if promotion_eligible:
+        return "none", True, True, notes
+
+    category = "infra"
+    if interrupted_category:
+        category = "environment"
+    elif not interpreter_ok or not candidate_ok or not target_module_ok:
+        category = "environment"
+    elif not cache_ok or coverage_problem in {"reference_cache_unavailable", "reference_cache_error"}:
+        category = "environment"
+    elif rc < 0:
+        category = "signal"
+    elif ev is not None and not evidence_terminal:
+        # A stale or unfinalized snapshot is insufficient evidence, not a
+        # candidate verdict, even if it happens to contain a numeric marker.
+        category = "environment"
+    elif numeric_failure is not None and rc != 0:
+        # An explicit producer-marked candidate comparison failure is a real
+        # candidate verdict; an unrelated evidence write error cannot mask it.
+        category = "numeric"
+    elif ev_write_errors:
+        category = "environment"
+    elif missing or duplicates:
+        category = "coverage"
+    elif coverage_problem:
+        category = "coverage"
+    elif any(row["status"] in {"skipped"} for row in rows):
+        category = "coverage"
+    elif any(row["status"] == "error" for row in rows):
+        category = "infra"
+    elif junit_failed:
+        # No valid producer marker binds this failure to the candidate. Use
+        # the producer's structured kind; an unclassified failure is infra.
+        if producer_block == "coverage":
+            category = "coverage"
+        elif producer_block == "infrastructure":
+            category = "environment"
+        else:
+            category = "infra"
+    elif not coverage_complete:
+        category = "coverage" if ev is not None else "infra"
+    return category, coverage_complete, False, notes
+
+
+def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+    """Run the L3 promotion acceptance profile under adapter-owned activation."""
+    timeout = max(1.0, min(float(timeout), MAX_L3_TIMEOUT))
+    deadline = _Deadline(timeout)
+    phases: list[dict] = []
+    obs: dict = {
+        "profile": L3_PROFILE,
+        "exitCodeZero": False,
+        "task": None,
+        "operator": None,
+        "candidate": None,
+        "sourceRoot": None,
+        "sourceGitHead": None,
+        "tilelang": None,
+        "dependencies": None,
+        "cachePolicy": None,
+        "cachePreflight": {"ok": False},
+        "cachePreflightOk": False,
+        "cache": {},
+        "referenceCache": None,
+        "phases": phases,
+        "elapsedSeconds": 0.0,
+        "testsCollected": None,
+        "testsPassed": None,
+        "testsFailed": None,
+        "testsSkipped": None,
+        "testsCollectedPositive": None,
+        "notAllSkipped": None,
+        "expectedTests": [],
+        "testRows": [],
+        "caseCount": None,
+        "passedCases": None,
+        "coverage": None,
+        "coverageComplete": False,
+        "promotionEligible": False,
+        "candidateDigestRecorded": False,
+        "errorCategory": "environment",
+        "windowOpened": False,
+        "windowReleased": False,
+        "occupancyRecorded": False,
+        "healthMonitoring": {},
+    }
+    source = None
+    repo = None
+    caches: dict[str, Path] | None = None
+    run_dir: Path | None = None
+    junit: dict | None = None
+    evidence: dict | None = None
+    evidence_path: Path | None = None
+    workload_facts_path: Path | None = None
+    report: Path | None = None
+    candidate_abs: Path | None = None
+    candidate_rel = ""
+    health_sink: dict = obs["healthMonitoring"]
+    rc = 1
+    try:
+        with _phase(phases, "config"):
+            source = _source_root()
+            device = require_device()
+            repo = cannbench_repo(values)
+            wroot = work_root(values, source, repo)
+            python = python_path(values)
+            if not python.is_file():
+                raise BridgeError(f"TileFoundry Python interpreter does not exist: {python}")
+            cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
+            conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
+            conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
+            tl_identity = tilelang_reuse_identity(values)
+            obs["sourceRoot"] = str(source)
+            obs["sourceGitHead"] = _git_head_pure(source)
+            obs["tilelang"] = tl_identity
+
+        with _phase(phases, "request"):
+            request = _read_l3_request()
+            task, candidate_rel = _validate_target_pair(
+                request["task"], request["candidate"], source, repo
+            )
+            candidate = (source / candidate_rel).resolve()
+            candidate_abs = candidate
+            digest = _sha256_file(candidate)
+            size = candidate.stat().st_size
+            operator = _l3_operator(task)
+            expected = _l3_expected_tests(operator)
+            obs.update({
+                "task": task,
+                "operator": operator,
+                "candidate": {
+                    "path": candidate_rel,
+                    "absolutePath": str(candidate),
+                    "sha256": digest,
+                    "sizeBytes": size,
+                },
+                "expectedTests": list(expected),
+                "candidateDigestRecorded": True,
+            })
+
+        with _phase(phases, "activation"):
+            assert caches is None
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            run_dir = wroot / "l3" / "runs" / operator / (
+                f"{stamp}_{os.getpid()}_{time.time_ns() % 1_000_000_000:09d}"
+            )
+            run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+            caches = _l3_cache_layout(wroot, operator)
+            for name in ("tilelang", "reference"):
+                caches[name].mkdir(parents=True, exist_ok=True, mode=0o700)
+            expectation, basis = _l3_expectation(
+                caches["reference"],
+                caches["warmMarker"],
+                task=task,
+                operator=operator,
+            )
+            preflight_py = run_dir / "preflight.py"
+            preflight_py.write_text(L3_PREFLIGHT, encoding="utf-8")
+            wrapper_py = run_dir / "pytest_l3.py"
+            wrapper_py.write_text(L3_PYTEST_WRAPPER, encoding="utf-8")
+            facts_path = run_dir / "preflight_facts.json"
+            workload_facts_path = run_dir / "workload_facts.json"
+            report = run_dir / "junit.xml"
+            evidence_path = run_dir / "evidence.json"
+            obs["cachePolicy"] = {
+                "scope": "dedicated",
+                "tilelangDir": str(caches["tilelang"]),
+                "referenceDir": str(caches["reference"]),
+                "referenceMode": "required",
+                "expectation": expectation,
+                "expectationBasis": basis,
+                "strictMode": None,
+                "warmMarkerRead": False,
+                "warmMarkerWritten": False,
+                "sharedCacheTouched": None,
+            }
+            obs["cache"]["before"] = {
+                "tilelang": _tree_stats(caches["tilelang"]),
+                "reference": _tree_stats(caches["reference"]),
+            }
+            obs["paths"] = {
+                "runDir": str(run_dir),
+                "junit": str(report),
+                "evidence": str(evidence_path),
+            }
+            preflight_env = _l3_child_env(
+                values, source=source, device=device, task=task, candidate=candidate,
+                python=python, repo=repo, run_dir=run_dir, caches=caches,
+                tl_identity=tl_identity, expectation=expectation, workload=False,
+            )
+
+        with _phase(phases, "preflight"):
+            deadline.require("preflight")
+            preflight_cmd = " ".join([
+                shlex.quote(str(python)), "-B", shlex.quote(str(preflight_py)),
+                shlex.quote(str(facts_path)), shlex.quote(task), shlex.quote(str(repo)),
+            ])
+            try:
+                checked = adapter_runtime.run_host_bash(
+                    preflight_cmd,
+                    cwd=source,
+                    env=preflight_env,
+                    cann_setup=cann_setup,
+                    conda_sh=conda_sh,
+                    conda_env=conda_env,
+                    timeout=max(1.0, deadline.cap(300.0)),
+                    isolate_temp=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                if exc.stderr:
+                    sys.stderr.write(str(exc.stderr)[-4000:])
+                raise BridgeError(
+                    "L3 preflight exceeded its time budget",
+                    category="deadline" if deadline.remaining() <= 0 else "environment",
+                ) from exc
+            facts = _read_json_file(facts_path)
+            obs["dependencies"] = facts
+            errors = _l3_preflight_errors(facts, python, caches)
+            obs["cachePreflight"] = {
+                "ok": not errors,
+                "probeBytes": ((facts or {}).get("cache") or {}).get("tilelang", {}).get("probeBytes"),
+                "errors": errors,
+            }
+            obs["cachePreflightOk"] = not errors
+            if checked.returncode != 0 or errors:
+                sys.stderr.write((checked.stderr or checked.stdout or "")[-4000:])
+                raise BridgeError(
+                    "L3 preflight failed: " + "; ".join(errors or [f"exit {checked.returncode}"])
+                )
+
+        with _phase(phases, "device-workload"):
+            deadline.require("device lease")
+            lease_wait = deadline.cap(_lease_wait_seconds())
+            with _open_device_window(device, wait_seconds=lease_wait) as finalize_window:
+                try:
+                    if deadline.remaining() <= 0:
+                        raise BridgeError(
+                            "L3 workload exceeded the recipe deadline", category="deadline"
+                        )
+                    workload_env = _l3_child_env(
+                        values, source=source, device=device, task=task, candidate=candidate,
+                        python=python, repo=repo, run_dir=run_dir, caches=caches,
+                        tl_identity=tl_identity, expectation=expectation, workload=True,
+                    )
+                    workload_cmd = " ".join([
+                        shlex.quote(str(python)), "-B", shlex.quote(str(wrapper_py)),
+                        shlex.quote(str(workload_facts_path)), shlex.quote(str(report)),
+                        shlex.quote(L3_ACCEPTANCE_TEST),
+                    ])
+                    try:
+                        completed = _run_host_bash_monitored(
+                            workload_cmd,
+                            cwd=source,
+                            env=workload_env,
+                            cann_setup=cann_setup,
+                            conda_sh=conda_sh,
+                            conda_env=conda_env,
+                            timeout=max(1.0, deadline.remaining()),
+                            isolate_temp=True,
+                            mode="l3",
+                            device=device,
+                            monitor_sink=health_sink,
+                            phase_getter=lambda: phases[-1]["name"] if phases else None,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        if exc.stderr:
+                            sys.stderr.write(str(exc.stderr)[-4000:])
+                        raise BridgeError(
+                            "L3 promotion workload exceeded the recipe deadline",
+                            category="deadline",
+                        ) from exc
+                finally:
+                    occ, win = finalize_window()
+                    obs.update(_window_evidence(occ, win))
+                if completed.stderr.strip():
+                    sys.stderr.write(completed.stderr[-4000:])
+                if completed.returncode != 0:
+                    sys.stderr.write((completed.stdout or "")[-4000:])
+                obs["workloadFacts"] = _read_json_file(workload_facts_path)
+
+        with _phase(phases, "evidence"):
+            junit = _l3_junit(report)
+            evidence = _read_json_file(evidence_path)
+            candidate_abs = Path(str((obs["candidate"] or {}).get("absolutePath", "")))
+            category, coverage_complete, eligible, notes = _l3_classify(
+                rc=int(completed.returncode),
+                expected=expected,
+                junit=junit,
+                evidence=evidence,
+                task=task,
+                operator=operator,
+                candidate=candidate_abs,
+                candidate_digest=str((obs["candidate"] or {}).get("sha256", "")),
+                python=python,
+            )
+            obs.update({
+                "errorCategory": category,
+                "classificationNotes": notes,
+                "coverageComplete": coverage_complete,
+                "promotionEligible": eligible,
+                "exitCodeZero": eligible,
+            })
+            candidate_digest = str((obs["candidate"] or {}).get("sha256", ""))
+            evidence_summary = _l3_evidence_summary(
+                evidence,
+                expected_module=candidate_abs,
+                candidate_relative=candidate_rel,
+                candidate_digest=candidate_digest,
+            )
+            obs["evidence"] = evidence_summary
+            rc = 0 if eligible else 1
+    except BridgeError as exc:
+        obs["errorCategory"] = exc.category
+        obs["error"] = str(exc)
+        obs["exitCodeZero"] = False
+        obs["promotionEligible"] = False
+        obs["coverageComplete"] = False
+        if exc.occupancy:
+            obs["deviceOccupancy"] = exc.occupancy
+            obs["occupancyRecorded"] = (
+                obs["occupancyRecorded"]
+                or exc.occupancy in {"free", "unknown"}
+                or exc.occupancy.startswith("shared(")
+            )
+    except subprocess.TimeoutExpired as exc:
+        obs["errorCategory"] = "deadline" if deadline.remaining() <= 0 else "infra"
+        obs["error"] = f"subprocess timeout: {exc}"
+    except Exception as exc:  # noqa: BLE001 - the observation is the report
+        obs["errorCategory"] = "infra"
+        obs["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if evidence is None and evidence_path is not None:
+            evidence = _read_json_file(evidence_path)
+        if junit is None and report is not None:
+            junit = _l3_junit(report)
+        if workload_facts_path is not None:
+            partial_facts = _read_json_file(workload_facts_path)
+            if partial_facts is not None:
+                obs.setdefault("workloadFacts", partial_facts)
+        if (
+            isinstance(evidence, dict)
+            and candidate_abs is not None
+            and candidate_rel
+            and "evidence" not in obs
+        ):
+            obs["evidence"] = _l3_evidence_summary(
+                evidence,
+                expected_module=candidate_abs,
+                candidate_relative=candidate_rel,
+                candidate_digest=str((obs.get("candidate") or {}).get("sha256", "")),
+            )
+        obs["healthMonitoring"] = health_sink
+        if caches is not None:
+            obs["cache"]["after"] = {
+                "tilelang": _tree_stats(caches["tilelang"]),
+                "reference": _tree_stats(caches["reference"]),
+            }
+        obs["elapsedSeconds"] = deadline.elapsed()
+        obs["phases"] = phases
+
+    if junit is not None:
+        obs["testsCollected"] = junit["collected"]
+        obs["testsPassed"] = junit["passed"]
+        obs["testsFailed"] = junit["failed"]
+        obs["testsSkipped"] = junit["skipped"]
+        obs["testsCollectedPositive"] = junit["collected"] > 0
+        obs["notAllSkipped"] = junit["collected"] > 0 and junit["passed"] > 0
+        obs["testRows"] = _l3_expected_rows(junit, tuple(obs["expectedTests"]))[0]
+    if isinstance(evidence, dict):
+        ev_coverage = _as_dict(evidence.get("coverage"))
+        ev_cache = _as_dict(evidence.get("referenceCache"))
+        ev_cases = _as_dict(ev_coverage.get("cases"))
+        obs["coverage"] = ev_coverage or None
+        obs["caseCount"] = ev_cases.get("expected")
+        obs["passedCases"] = ev_cases.get("completed")
+        if ev_cache:
+            obs["referenceCache"] = {
+                "hits": ev_cache.get("hits"),
+                "misses": ev_cache.get("misses"),
+                "writes": ev_cache.get("writes"),
+                "errors": ev_cache.get("errors"),
+                "byKind": ev_cache.get("byKind"),
+            }
+    if obs["errorCategory"] != "none":
+        rc = 1 if obs.get("windowOpened") else 75
+    # Promotion clients treat only "numeric" as a candidate failure. "coverage",
+    # "environment", "occupancy", "deadline", "signal", and "infra" are
+    # infrastructure blocks that preserve the candidate.
+    obs["failureCategory"] = (
+        None if obs["errorCategory"] in {None, "none"} else obs["errorCategory"]
+    )
+    return rc, obs
+
+
+def _report_evidence(reports_root: Path, since: float) -> dict:
+    """Preserve what the official runner already wrote before a failure."""
+    rows: list[dict] = []
+    try:
+        entries = sorted(reports_root.iterdir(), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return {"root": str(reports_root), "reports": []}
+    for entry in entries:
+        try:
+            if not entry.is_dir() or entry.stat().st_mtime < since - 2:
+                continue
+            files: list[str] = []
+            for item in sorted(entry.rglob("*")):
+                if item.is_file():
+                    files.append(item.relative_to(entry).as_posix())
+                    if len(files) >= 40:
+                        break
+            rows.append({
+                "name": entry.name,
+                "files": files,
+                "hasOfficialFinal": (entry / "official_final.json").is_file(),
+            })
+        except OSError:
+            continue
+    return {"root": str(reports_root), "reports": rows[-10:]}
+
+
 def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+    deadline = _Deadline(timeout)
+    phases: list[dict] = []
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
     device = require_device()
     repo = cannbench_repo(values)
     wroot = work_root(values, source, repo)
+    request = _read_cannbench_request()
+    request_target = (
+        _validate_target_pair(request[0], request[1], source, repo)
+        if request is not None
+        else None
+    )
     arch = cannbench_arch(values)
     cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
 
-    warmup_started = time.monotonic()
-    info = _inspect_conda_cannbench_env(values, source)
-    missing = info.get("missing") or []
-    if missing:
-        raise BridgeError(
-            "missing CANNBench Python packages in TileFoundry env "
-            f"({', '.join(missing)}); run {ADAPTER_DIR / 'scripts' / 'setup_cannbench_deps.sh'}"
-        )
-
-    abi_tag, slot_dir, utils_dir = _abi_slot(values, source, repo, wroot, info)
+    abi_tag, slot_dir, utils_dir = _abi_slot(
+        values, source, repo, wroot,
+        {"pythonVersion": "", "torchVersion": "", "torchNpuVersion": ""},
+    )
     ext_so = utils_dir / "cann_bench_utils" / "_C.so"
     meta_file = slot_dir / "build_meta.json"
-
+    info: dict = {}
     utils_built = False
     utils_reused = False
-    if ext_so.is_file() and meta_file.is_file():
-        utils_reused = True
-    else:
-        build_parent = wroot / "cannbench-utils"
-        build_parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f".tmp-{abi_tag}-", dir=str(build_parent)) as stage_tmp:
-            stage_slot = Path(stage_tmp) / "slot"
-            stage_utils = stage_slot / "cann_bench_utils"
-            stage_slot.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(repo / "src" / "cann_bench_utils", stage_utils)
-            build_cmd = " && ".join([
-                " ".join([
-                    "cmake", "-S", shlex.quote(str(stage_utils)),
-                    "-B", shlex.quote(str(stage_utils / "build")),
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    f"-DPython3_EXECUTABLE={shlex.quote(str(python))}",
-                    f"-DTorch_DIR={shlex.quote(info['torchCmakeDir'])}",
-                    f"-DTORCH_NPU_PATH={shlex.quote(info['torchNpuDir'])}",
-                    f"-DNPU_ARCH={shlex.quote(arch)}",
-                ]),
-                " ".join(["cmake", "--build", shlex.quote(str(stage_utils / "build")), "--parallel", "4"]),
-            ])
-            build_env = _host_child_env(values)
-            envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
-            if envs_path:
-                build_env["CONDA_ENVS_PATH"] = envs_path
-            build_env["PYTHONDONTWRITEBYTECODE"] = "1"
-            build_env["PYTHONNOUSERSITE"] = "1"
+    obs: dict = {
+        "exitCodeZero": False,
+        "depsReady": False,
+        "cannBenchUtilsPresent": False,
+        "cannBenchUtilsCallable": False,
+        "utilsBuilt": False,
+        "utilsReused": False,
+        "utilsRoot": str(utils_dir),
+        "arch": arch,
+        "targetsSource": "dynamic-request" if request_target else "managed",
+        "targets": (
+            [{"task": request_target[0], "candidate": request_target[1]}]
+            if request_target
+            else []
+        ),
+        "pythonVersion": None,
+        "torchVersion": None,
+        "torchNpuVersion": None,
+        "windowOpened": False,
+        "windowReleased": False,
+        "occupancyRecorded": False,
+        "healthMonitoring": {},
+        "phases": phases,
+        "elapsedSeconds": 0.0,
+        "errorCategory": "environment",
+    }
+    health_sink: dict = obs["healthMonitoring"]
+    if tl_identity is not None:
+        obs["tilelang"] = tl_identity
+    try:
+        deadline.require("device lease")
+        with _open_device_window(
+            device,
+            wait_seconds=deadline.cap(_lease_wait_seconds()),
+            require_idle=True,
+        ) as finalize_window:
             try:
-                built = adapter_runtime.run_host_bash(
-                    build_cmd,
-                    cwd=repo,
-                    env=build_env,
-                    cann_setup=cann_setup,
-                    conda_sh=conda_sh,
-                    conda_env=conda_env,
-                    timeout=min(timeout, 600.0),
-                    isolate_temp=True,
-                )
-            except subprocess.TimeoutExpired as exc:
-                if exc.stderr:
-                    sys.stderr.write(str(exc.stderr)[-4000:])
-                raise BridgeError("cann_bench_utils CMake build timed out") from exc
-            if built.stderr.strip():
-                sys.stderr.write(built.stderr[-4000:])
-            if built.returncode != 0 or not (stage_utils / "cann_bench_utils" / "_C.so").is_file():
-                sys.stderr.write((built.stdout or "")[-4000:])
-                raise BridgeError(f"cann_bench_utils CMake build failed (exit {built.returncode})")
-            (stage_slot / "build_meta.json").write_text(
-                json.dumps({
-                    "abiTag": abi_tag,
-                    "arch": arch,
-                    "python": str(python.resolve()),
-                    "cannSetup": str(cann_setup.resolve()),
-                    "pythonVersion": info["pythonVersion"],
-                    "torchVersion": info["torchVersion"],
-                    "torchNpuVersion": info["torchNpuVersion"],
-                    "builtAt": _timestamp(),
-                }, indent=2),
-                encoding="utf-8",
-            )
-            if slot_dir.exists():
-                shutil.rmtree(slot_dir)
-            shutil.move(str(stage_slot), str(slot_dir))
-        utils_built = True
+                with _phase(phases, "inspect"):
+                    if deadline.remaining() <= 0:
+                        raise BridgeError(
+                            "CANNBench prep exceeded the recipe deadline", category="deadline"
+                        )
+                    info = _inspect_conda_cannbench_env(
+                        values, source, timeout=deadline.cap(60.0)
+                    )
+                    missing = info.get("missing") or []
+                    if missing:
+                        raise BridgeError(
+                            "missing CANNBench Python packages in TileFoundry env "
+                            f"({', '.join(missing)}); run "
+                            f"{ADAPTER_DIR / 'scripts' / 'setup_cannbench_deps.sh'}"
+                        )
+                    obs.update({
+                        "depsReady": True,
+                        "pythonVersion": info.get("pythonVersion"),
+                        "torchVersion": info.get("torchVersion"),
+                        "torchNpuVersion": info.get("torchNpuVersion"),
+                    })
+                    abi_tag, slot_dir, utils_dir = _abi_slot(values, source, repo, wroot, info)
+                    ext_so = utils_dir / "cann_bench_utils" / "_C.so"
+                    meta_file = slot_dir / "build_meta.json"
+                    obs.update({
+                        "utilsRoot": str(utils_dir),
+                        "cannBenchUtilsPresent": ext_so.is_file(),
+                    })
+                    if ext_so.is_file() and meta_file.is_file():
+                        utils_reused = True
 
-    warmup_seconds = round(time.monotonic() - warmup_started, 3)
+                with _phase(phases, "build"):
+                    if not utils_reused:
+                        build_parent = wroot / "cannbench-utils"
+                        build_parent.mkdir(parents=True, exist_ok=True)
+                        with tempfile.TemporaryDirectory(
+                            prefix=f".tmp-{abi_tag}-", dir=str(build_parent)
+                        ) as stage_tmp:
+                            stage_slot = Path(stage_tmp) / "slot"
+                            stage_utils = stage_slot / "cann_bench_utils"
+                            stage_slot.mkdir(parents=True, exist_ok=True)
+                            shutil.copytree(repo / "src" / "cann_bench_utils", stage_utils)
+                            build_cmd = " && ".join([
+                                " ".join([
+                                    "cmake", "-S", shlex.quote(str(stage_utils)),
+                                    "-B", shlex.quote(str(stage_utils / "build")),
+                                    "-DCMAKE_BUILD_TYPE=Release",
+                                    f"-DPython3_EXECUTABLE={shlex.quote(str(python))}",
+                                    f"-DTorch_DIR={shlex.quote(info['torchCmakeDir'])}",
+                                    f"-DTORCH_NPU_PATH={shlex.quote(info['torchNpuDir'])}",
+                                    f"-DNPU_ARCH={shlex.quote(arch)}",
+                                ]),
+                                " ".join([
+                                    "cmake", "--build",
+                                    shlex.quote(str(stage_utils / "build")),
+                                    "--parallel", "4",
+                                ]),
+                            ])
+                            build_env = _host_child_env(values)
+                            _scrub_python_startup(build_env)
+                            envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+                            if envs_path:
+                                build_env["CONDA_ENVS_PATH"] = envs_path
+                            build_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                            build_env["PYTHONNOUSERSITE"] = "1"
+                            if deadline.remaining() <= 0:
+                                raise BridgeError(
+                                    "CANNBench prep build exceeded the recipe deadline",
+                                    category="deadline",
+                                )
+                            try:
+                                built = _run_host_bash_monitored(
+                                    build_cmd,
+                                    cwd=repo,
+                                    env=build_env,
+                                    cann_setup=cann_setup,
+                                    conda_sh=conda_sh,
+                                    conda_env=conda_env,
+                                    timeout=deadline.cap(600.0),
+                                    isolate_temp=True,
+                                    mode="l4",
+                                    device=device,
+                                    monitor_sink=health_sink,
+                                    phase_getter=(
+                                        lambda: phases[-1]["name"] if phases else None
+                                    ),
+                                )
+                            except subprocess.TimeoutExpired as exc:
+                                if exc.stderr:
+                                    sys.stderr.write(str(exc.stderr)[-4000:])
+                                raise BridgeError(
+                                    "cann_bench_utils CMake build timed out",
+                                    category=(
+                                        "deadline" if deadline.remaining() <= 0 else "infra"
+                                    ),
+                                ) from exc
+                            if built.stderr.strip():
+                                sys.stderr.write(built.stderr[-4000:])
+                            if built.returncode != 0 or not (
+                                stage_utils / "cann_bench_utils" / "_C.so"
+                            ).is_file():
+                                sys.stderr.write((built.stdout or "")[-4000:])
+                                raise BridgeError(
+                                    f"cann_bench_utils CMake build failed (exit {built.returncode})"
+                                )
+                            (stage_slot / "build_meta.json").write_text(
+                                json.dumps({
+                                    "abiTag": abi_tag,
+                                    "arch": arch,
+                                    "python": str(python.resolve()),
+                                    "cannSetup": str(cann_setup.resolve()),
+                                    "pythonVersion": info["pythonVersion"],
+                                    "torchVersion": info["torchVersion"],
+                                    "torchNpuVersion": info["torchNpuVersion"],
+                                    "builtAt": _timestamp(),
+                                }, indent=2),
+                                encoding="utf-8",
+                            )
+                            if slot_dir.exists():
+                                shutil.rmtree(slot_dir)
+                            shutil.move(str(stage_slot), str(slot_dir))
+                        utils_built = True
 
-    with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
-        run_env = _host_child_env(values)
-        envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
-        if envs_path:
-            run_env["CONDA_ENVS_PATH"] = envs_path
-        run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
-        run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        run_env["PYTHONNOUSERSITE"] = "1"
-        run_env["PYTHONPATH"] = str(utils_dir)
-        probe_cmd = f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ABI_PROBE)}"
-        try:
-            probed = adapter_runtime.run_host_bash(
-                probe_cmd,
-                cwd=source,
-                env=run_env,
-                cann_setup=cann_setup,
-                conda_sh=conda_sh,
-                conda_env=conda_env,
-                timeout=max(60.0, timeout - warmup_seconds),
-                isolate_temp=True,
-            )
-        except subprocess.TimeoutExpired as exc:
-            occ, win = finalize_window()
-            if exc.stderr:
-                sys.stderr.write(str(exc.stderr)[-4000:])
-            return 1, {
-                "exitCodeZero": False,
-                "depsReady": True,
-                "cannBenchUtilsPresent": ext_so.is_file(),
-                "cannBenchUtilsCallable": False,
-                "utilsBuilt": utils_built,
-                "utilsReused": utils_reused,
-                "utilsRoot": str(utils_dir),
-                "arch": arch,
-                "pythonVersion": info["pythonVersion"],
-                "torchVersion": info["torchVersion"],
-                "torchNpuVersion": info["torchNpuVersion"],
-                "windowOpened": True,
-                "windowReleased": True,
-                "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-                "deviceWindow": win,
-            }
+                with _phase(phases, "abi-probe"):
+                    if deadline.remaining() <= 0:
+                        raise BridgeError(
+                            "CANNBench ABI probe exceeded the recipe deadline",
+                            category="deadline",
+                        )
+                    run_env = _host_child_env(values)
+                    _scrub_python_startup(run_env)
+                    envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+                    if envs_path:
+                        run_env["CONDA_ENVS_PATH"] = envs_path
+                    run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
+                    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                    run_env["PYTHONNOUSERSITE"] = "1"
+                    run_env["PYTHONPATH"] = str(utils_dir)
+                    probe_cmd = f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ABI_PROBE)}"
+                    try:
+                        probed = _run_host_bash_monitored(
+                            probe_cmd,
+                            cwd=source,
+                            env=run_env,
+                            cann_setup=cann_setup,
+                            conda_sh=conda_sh,
+                            conda_env=conda_env,
+                            timeout=max(1.0, deadline.remaining()),
+                            isolate_temp=True,
+                            mode="l4",
+                            device=device,
+                            monitor_sink=health_sink,
+                            phase_getter=(
+                                lambda: phases[-1]["name"] if phases else None
+                            ),
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        if exc.stderr:
+                            sys.stderr.write(str(exc.stderr)[-4000:])
+                        raise BridgeError(
+                            "cann_bench_utils ABI probe timed out",
+                            category="deadline" if deadline.remaining() <= 0 else "infra",
+                        ) from exc
+                    if probed.stderr.strip():
+                        sys.stderr.write(probed.stderr[-4000:])
+                    parsed = _extract_last_json(probed.stdout, "cannBenchUtilsCallable")
+                    callable_ok = bool(parsed.get("cannBenchUtilsCallable", False))
+                    ok = probed.returncode == 0 and ext_so.is_file() and callable_ok
+                    if not ok:
+                        sys.stderr.write((probed.stdout or "")[-4000:])
+                    obs.update({
+                        "cannBenchUtilsPresent": ext_so.is_file(),
+                        "cannBenchUtilsCallable": callable_ok,
+                    })
+            finally:
+                occ, win = finalize_window()
+                obs.update(_window_evidence(occ, win))
 
-        occ, win = finalize_window()
-        if probed.stderr.strip():
-            sys.stderr.write(probed.stderr[-4000:])
-        parsed = _extract_last_json(probed.stdout, "cannBenchUtilsCallable")
-        callable_ok = bool(parsed.get("cannBenchUtilsCallable", False))
-        ok = probed.returncode == 0 and ext_so.is_file() and callable_ok
-        if not ok:
-            sys.stderr.write((probed.stdout or "")[-4000:])
-        obs = {
+        obs.update({
             "exitCodeZero": ok,
-            "depsReady": True,
-            "cannBenchUtilsPresent": ext_so.is_file(),
-            "cannBenchUtilsCallable": callable_ok,
             "utilsBuilt": utils_built,
             "utilsReused": utils_reused,
-            "utilsRoot": str(utils_dir),
-            "arch": arch,
-            "pythonVersion": info["pythonVersion"],
-            "torchVersion": info["torchVersion"],
-            "torchNpuVersion": info["torchNpuVersion"],
-            "windowOpened": True,
-            "windowReleased": True,
-            "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-            "deviceWindow": win,
-        }
-        if tl_identity is not None:
-            obs["tilelang"] = tl_identity
+            "errorCategory": "none" if ok else "infra",
+        })
         return (0 if ok else (probed.returncode or 1)), obs
+    except BridgeError as exc:
+        obs["exitCodeZero"] = False
+        obs["errorCategory"] = exc.category
+        obs["error"] = str(exc)
+        if exc.occupancy:
+            obs["deviceOccupancy"] = exc.occupancy
+            obs["occupancyRecorded"] = (
+                exc.occupancy in {"free", "unknown"} or exc.occupancy.startswith("shared(")
+            )
+        return 75, obs
+    except Exception as exc:  # noqa: BLE001 - the observation is the report
+        obs["exitCodeZero"] = False
+        obs["errorCategory"] = "infra"
+        obs["error"] = f"{type(exc).__name__}: {exc}"
+        return 75, obs
+    finally:
+        obs.update({
+            "utilsBuilt": utils_built,
+            "utilsReused": utils_reused,
+            "tests": None,
+            "healthMonitoring": health_sink,
+            "elapsedSeconds": deadline.elapsed(),
+            "phases": phases,
+        })
 
 
 def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
+    deadline = _Deadline(timeout)
+    phases: list[dict] = []
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
     device = require_device()
     repo = cannbench_repo(values)
     wroot = work_root(values, source, repo)
-    targets_source, targets = resolve_cannbench_targets(values, source, repo)
+    targets_source, targets = resolve_cannbench_targets(
+        values, source, repo, allow_request=True
+    )
     cann_setup = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
-
-    warmup_started = time.monotonic()
-    info = _inspect_conda_cannbench_env(values, source)
-    if info.get("missing"):
-        raise BridgeError(
-            "missing CANNBench Python packages in TileFoundry env "
-            f"({', '.join(info['missing'])}); run tilefoundry-npu-cannbench-prep first"
-        )
-    _, _, utils_dir = _abi_slot(values, source, repo, wroot, info)
-    if not (utils_dir / "cann_bench_utils" / "_C.so").is_file():
-        raise BridgeError(
-            f"isolated cann_bench_utils _C.so missing under {utils_dir}; run tilefoundry-npu-cannbench-prep first"
-        )
-    warmup_seconds = round(time.monotonic() - warmup_started, 3)
-
     reports_root = wroot / "reports"
-    runner_cfg = {
-        "repo": str(repo),
-        "source": str(source),
-        "utils_dir": str(utils_dir),
-        "reports_root": str(reports_root),
-        "device": device,
-        "per_op_timeout": int(max(60.0, timeout - warmup_seconds - 60.0)),
-        "pythonpath_parts": list(DEFAULT_PYTHONPATH_PARTS),
-        "tilelang_source": tl_identity["source"] if tl_identity else "",
-        "targets": [{"task": t, "candidate": c} for t, c in targets],
+    report_epoch = time.time()
+
+    obs: dict = {
+        "exitCodeZero": False,
+        "officialReportValid": False,
+        "allCasesPassed": False,
+        "allTimingsValid": False,
+        "targetCount": len(targets),
+        "targetsSource": targets_source,
+        "caseCount": None,
+        "passedCases": None,
+        "timedCases": None,
+        "score": None,
+        "avgSpeedup": None,
+        "results": [],
+        "windowOpened": False,
+        "windowReleased": False,
+        "occupancyRecorded": False,
+        "healthMonitoring": {},
+        "phases": phases,
+        "elapsedSeconds": 0.0,
+        "errorCategory": "environment",
+        "reportEvidence": {"root": str(reports_root), "reports": []},
     }
+    health_sink: dict = obs["healthMonitoring"]
+    if tl_identity is not None:
+        obs["tilelang"] = tl_identity
+    try:
+        deadline.require("official CANNBench run")
+        # Host profiler serialization comes before the device lease; the two
+        # locks protect different resources and are paid from the same budget.
+        with _phase(phases, "msprof-lock"):
+            with _open_msprof_lock(
+                locking.lock_root(),
+                timeout_seconds=max(1.0, deadline.cap(_lease_wait_seconds())),
+            ):
+                with _phase(phases, "device-lease"):
+                    with _open_device_window(
+                        device,
+                        wait_seconds=deadline.cap(_lease_wait_seconds()),
+                        require_idle=True,
+                    ) as finalize_window:
+                        try:
+                            with _phase(phases, "inspect"):
+                                if deadline.remaining() <= 0:
+                                    raise BridgeError(
+                                        "official CANNBench run exceeded the recipe deadline",
+                                        category="deadline",
+                                    )
+                                info = _inspect_conda_cannbench_env(
+                                    values, source, timeout=deadline.cap(60.0)
+                                )
+                                if info.get("missing"):
+                                    raise BridgeError(
+                                        "missing CANNBench Python packages in TileFoundry env "
+                                        f"({', '.join(info['missing'])}); run "
+                                        "tilefoundry-npu-cannbench-prep first"
+                                    )
+                                _, _, utils_dir = _abi_slot(
+                                    values, source, repo, wroot, info
+                                )
+                                if not (
+                                    utils_dir / "cann_bench_utils" / "_C.so"
+                                ).is_file():
+                                    raise BridgeError(
+                                        "isolated cann_bench_utils _C.so missing under "
+                                        f"{utils_dir}; run tilefoundry-npu-cannbench-prep first"
+                                    )
 
-    with _open_msprof_lock(locking.lock_root()):
-        with _open_device_window(device, warmup_seconds=warmup_seconds) as finalize_window:
-            with tempfile.TemporaryDirectory(prefix="tilefoundry-cannbench-") as tmp:
-                tmp_dir = Path(tmp)
-                runner_py = tmp_dir / "runner.py"
-                cfg_json = tmp_dir / "runner_cfg.json"
-                runner_py.write_text(CANNBENCH_RUNNER, encoding="utf-8")
-                cfg_json.write_text(json.dumps(runner_cfg), encoding="utf-8")
+                            runner_cfg = {
+                                "repo": str(repo),
+                                "source": str(source),
+                                "utils_dir": str(utils_dir),
+                                "reports_root": str(reports_root),
+                                "device": device,
+                                "per_op_timeout": int(
+                                    max(1.0, deadline.remaining() - 60.0)
+                                ),
+                                "pythonpath_parts": list(DEFAULT_PYTHONPATH_PARTS),
+                                "tilelang_source": (
+                                    tl_identity["source"] if tl_identity else ""
+                                ),
+                                "targets": [{"task": t, "candidate": c} for t, c in targets],
+                            }
 
-                run_env = _host_child_env(values)
-                run_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
-                envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
-                if envs_path:
-                    run_env["CONDA_ENVS_PATH"] = envs_path
-                run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-                run_env["PYTHONNOUSERSITE"] = "1"
-                cmd = f"{shlex.quote(str(python))} {shlex.quote(str(runner_py))} {shlex.quote(str(cfg_json))}"
-                try:
-                    completed = adapter_runtime.run_host_bash(
-                        cmd,
-                        cwd=source,
-                        env=run_env,
-                        cann_setup=cann_setup,
-                        conda_sh=conda_sh,
-                        conda_env=conda_env,
-                        timeout=max(60.0, timeout - warmup_seconds),
-                        isolate_temp=True,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    occ, win = finalize_window()
-                    if exc.stderr:
-                        sys.stderr.write(str(exc.stderr)[-4000:])
-                    timeout_obs = {
-                        "exitCodeZero": False,
-                        "officialReportValid": False,
-                        "allCasesPassed": False,
-                        "allTimingsValid": False,
-                        "targetCount": len(targets),
-                        "targetsSource": targets_source,
-                        "caseCount": 0,
-                        "passedCases": 0,
-                        "timedCases": 0,
-                        "score": 0.0,
-                        "avgSpeedup": 0.0,
-                        "results": [],
-                        "windowOpened": True,
-                        "windowReleased": True,
-                        "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-                        "deviceWindow": win,
-                    }
-                    if tl_identity is not None:
-                        timeout_obs["tilelang"] = tl_identity
-                    return 1, timeout_obs
+                            with _phase(phases, "workload"):
+                                with tempfile.TemporaryDirectory(
+                                    prefix="tilefoundry-cannbench-"
+                                ) as tmp:
+                                    tmp_dir = Path(tmp)
+                                    runner_py = tmp_dir / "runner.py"
+                                    cfg_json = tmp_dir / "runner_cfg.json"
+                                    runner_py.write_text(CANNBENCH_RUNNER, encoding="utf-8")
+                                    cfg_json.write_text(
+                                        json.dumps(runner_cfg), encoding="utf-8"
+                                    )
 
-            occ, win = finalize_window()
-            if completed.stderr.strip():
-                sys.stderr.write(completed.stderr[-4000:])
-            parsed = _extract_last_json(completed.stdout, "officialReportValid")
-            report_valid = bool(parsed.get("officialReportValid", False))
-            cases_passed = bool(parsed.get("allCasesPassed", False))
-            timings_valid = bool(parsed.get("allTimingsValid", False))
-            ok = completed.returncode == 0 and report_valid and cases_passed and timings_valid
-            if not ok:
-                sys.stderr.write((completed.stdout or "")[-4000:])
+                                    run_env = _host_child_env(values)
+                                    _scrub_python_startup(run_env)
+                                    run_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+                                    envs_path = (
+                                        values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or ""
+                                    ).strip()
+                                    if envs_path:
+                                        run_env["CONDA_ENVS_PATH"] = envs_path
+                                    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                                    run_env["PYTHONNOUSERSITE"] = "1"
+                                    cmd = (
+                                        'export AGENT_GATES_ACTIVATION_PYTHONPATH="${PYTHONPATH:-}"; '
+                                        f"{shlex.quote(str(python))} -E -s "
+                                        f"{shlex.quote(str(runner_py))} "
+                                        f"{shlex.quote(str(cfg_json))}"
+                                    )
+                                    if deadline.remaining() <= 0:
+                                        raise BridgeError(
+                                            "official CANNBench run exceeded the recipe deadline",
+                                            category="deadline",
+                                        )
+                                    try:
+                                        completed = _run_host_bash_monitored(
+                                            cmd,
+                                            cwd=source,
+                                            env=run_env,
+                                            cann_setup=cann_setup,
+                                            conda_sh=conda_sh,
+                                            conda_env=conda_env,
+                                            timeout=max(1.0, deadline.remaining()),
+                                            isolate_temp=True,
+                                            mode="l4",
+                                            device=device,
+                                            monitor_sink=health_sink,
+                                            phase_getter=(
+                                                lambda: phases[-1]["name"] if phases else None
+                                            ),
+                                        )
+                                    except subprocess.TimeoutExpired as exc:
+                                        if exc.stderr:
+                                            sys.stderr.write(str(exc.stderr)[-4000:])
+                                        raise BridgeError(
+                                            "official CANNBench run timed out",
+                                            category="deadline",
+                                        ) from exc
+                        finally:
+                            occ, win = finalize_window()
+                            obs.update(_window_evidence(occ, win))
 
-            obs = {
-                "exitCodeZero": ok,
-                "officialReportValid": report_valid,
-                "allCasesPassed": cases_passed,
-                "allTimingsValid": timings_valid,
-                "targetCount": int(parsed.get("targetCount", len(targets))),
-                "targetsSource": targets_source,
-                "caseCount": int(parsed.get("caseCount", 0)),
-                "passedCases": int(parsed.get("passedCases", 0)),
-                "timedCases": int(parsed.get("timedCases", 0)),
-                "score": float(parsed.get("score", 0.0)),
-                "avgSpeedup": float(parsed.get("avgSpeedup", 0.0)),
-                "results": list(parsed.get("results") or []),
-                "windowOpened": True,
-                "windowReleased": True,
-                "occupancyRecorded": occ in {"free", "unknown"} or occ.startswith("shared("),
-                "deviceWindow": win,
-            }
-            if tl_identity is not None:
-                obs["tilelang"] = tl_identity
-            return (0 if ok else (completed.returncode or 1)), obs
+        if completed.stderr.strip():
+            sys.stderr.write(completed.stderr[-4000:])
+        parsed = _extract_last_json(completed.stdout, "officialReportValid")
+        report_valid = bool(parsed.get("officialReportValid", False))
+        cases_passed = bool(parsed.get("allCasesPassed", False))
+        timings_valid = bool(parsed.get("allTimingsValid", False))
+        ok = (
+            completed.returncode == 0
+            and report_valid
+            and cases_passed
+            and timings_valid
+        )
+        if not ok:
+            sys.stderr.write((completed.stdout or "")[-4000:])
+        if ok:
+            category = "none"
+        elif report_valid and not cases_passed:
+            category = "numeric"
+        else:
+            category = "infra"
+        reported_targets = _int_or_none(parsed.get("targetCount"))
+        obs.update({
+            "exitCodeZero": ok,
+            "officialReportValid": report_valid,
+            "allCasesPassed": cases_passed,
+            "allTimingsValid": timings_valid,
+            "targetCount": len(targets) if reported_targets is None else reported_targets,
+            "caseCount": _int_or_none(parsed.get("caseCount")),
+            "passedCases": _int_or_none(parsed.get("passedCases")),
+            "timedCases": _int_or_none(parsed.get("timedCases")),
+            "score": _float_or_none(parsed.get("score")),
+            "avgSpeedup": _float_or_none(parsed.get("avgSpeedup")),
+            "results": list(parsed.get("results") or []),
+            "errorCategory": category,
+        })
+        return (0 if ok else (completed.returncode or 1)), obs
+    except BridgeError as exc:
+        obs["errorCategory"] = exc.category
+        obs["error"] = str(exc)
+        if exc.occupancy:
+            obs["deviceOccupancy"] = exc.occupancy
+            obs["occupancyRecorded"] = (
+                exc.occupancy in {"free", "unknown"}
+                or exc.occupancy.startswith("shared(")
+            )
+        # A workload timeout after the lease opened is a bounded failure with
+        # preserved partial evidence, not an environment block; the receipt
+        # keeps the deadline category so promotion can pause distinctly.
+        if exc.category == "deadline" and obs.get("windowOpened"):
+            return 1, obs
+        return 75, obs
+    except Exception as exc:  # noqa: BLE001 - the observation is the report
+        obs["errorCategory"] = "infra"
+        obs["error"] = f"{type(exc).__name__}: {exc}"
+        return 75, obs
+    finally:
+        obs["reportEvidence"] = _report_evidence(reports_root, report_epoch)
+        obs["healthMonitoring"] = health_sink
+        obs["elapsedSeconds"] = deadline.elapsed()
+        obs["phases"] = phases
 
 
 _BANNED_TORCH_DELEGATES = frozenset({
@@ -2153,6 +5175,8 @@ def main(argv: list[str] | None = None) -> int:
         return check_config(check_device=True, check_cannbench=True)
     if args == ["--check-config-cannbench-remote"]:
         return check_config(check_device=False, check_cannbench_remote=True)
+    if args == ["--check-config-l3"]:
+        return check_config(check_device=True, check_l3=True)
 
     try:
         values = machine_values()
@@ -2174,6 +5198,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             rc, obs = run_device(
                 values, DEFAULT_DEVICE_TIMEOUT if timeout is None else timeout, fast=True
+            )
+        except BridgeError as exc:
+            _die(75, str(exc))
+        print(json.dumps(obs, sort_keys=True))
+        return rc
+    if args == ["--l3-promotion"]:
+        try:
+            rc, obs = run_l3_promotion(
+                values, l3_timeout(values) if timeout is None else timeout
             )
         except BridgeError as exc:
             _die(75, str(exc))
@@ -2203,8 +5236,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _die(
         2,
-        f"usage: {PROG} (--cpu | --device | --device-fast | --cannbench-prep | --cannbench | --cannbench-remote | "
-        "--check-config | --check-config-device | --check-config-cannbench | --check-config-cannbench-remote) [--timeout SECONDS]",
+        f"usage: {PROG} (--cpu | --device | --device-fast | --l3-promotion | --cannbench-prep | "
+        "--cannbench | --cannbench-remote | --check-config | --check-config-device | "
+        "--check-config-l3 | --check-config-cannbench | --check-config-cannbench-remote) "
+        "[--timeout SECONDS]",
     )
     return 2
 

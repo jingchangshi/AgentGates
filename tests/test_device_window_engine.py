@@ -74,7 +74,8 @@ class WindowFixture(unittest.TestCase):
         self.script = self.pack / "scripts/gate.py"
         self.engine = Engine(registry=Registry(self.root / "registry"),
                              store=EvidenceStore(self.root / "evidence"),
-                             lock_root=self.root / "locks")
+                             lock_root=self.root / "locks",
+                             device_lock_root=self.root / "locks")
 
     def write(self, recipe, gate_checks=None, code=WINDOWED, blocked=None):
         self.script.write_text(code)
