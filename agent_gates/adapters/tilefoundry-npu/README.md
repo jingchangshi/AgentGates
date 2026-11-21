@@ -16,7 +16,7 @@ The host-local TileFoundry-on-Ascend Adapter (`scripts/tilefoundry_host_gate.py`
 | --- | --- | --- | --- |
 | `tilefoundry-npu-cpu` | Conda CPU `pytest` suite (`TORCH_DEVICE_BACKEND_AUTOLOAD=0`, `TILELANG_DISABLE_CACHE=1`, `PYTHONPATH=src:targets/ascend:targets/apple:targets/nvidia`) with JUnit XML verification | **Not sourced** (avoids `ortools`/CANN native library collision) | None |
 | `tilefoundry-npu-device` | Depends on `tilefoundry-npu-cpu`; sources CANN `set_env.sh` + Conda `tilefoundry-npu`, runs in-process NPU probe (`import tilefoundry`, FP32 vector add, BF16 Cube `matmul`, memory > 0, `torch.npu.synchronize()`), and optionally runs `TILEFOUNDRY_NPU_DEVICE_TESTS` via `pytest` | Sourced (`TILEFOUNDRY_NPU_CANN_SETUP`) | Windowed (`deviceWindow`: 60 s) |
-| `tilefoundry-npu-device-fast` | Same NPU activation and window as `tilefoundry-npu-device`, but runs only the configured `TILEFOUNDRY_NPU_DEVICE_TESTS` (no built-in probe); when both are empty it exits `BLOCKED_ENV` instead of publishing a zero-test pass | Sourced | Windowed (`deviceWindow`: 60 s) |
+| `tilefoundry-npu-device-fast` | Same NPU activation and window as `tilefoundry-npu-device`, but runs only the configured `TILEFOUNDRY_NPU_DEVICE_TESTS` (no built-in probe) in legacy fixed mode; when both are empty it exits `BLOCKED_ENV` instead of publishing a zero-test pass. With the typed [`tilefoundry-fast-request/v1`](#device-fast-typed-request) pair it always runs the adapter-owned harness node `tests/ascend/agent/test_surrogate_batch_npu.py::test_surrogate_anchor_batch_npu` for both `batch` and `profile`, regardless of `TILEFOUNDRY_NPU_DEVICE_TESTS`; `profile` requests take the host msprof lock automatically | Sourced | Windowed (`deviceWindow`: 60 s) |
 | `tilefoundry-npu-l3-promotion` | L3 promotion profile: one `dynamicTarget` recipe takes a canonical CANNBench task and a source-relative candidate, activates CANN/Conda/TileLang itself, runs a cache/import/device preflight, then executes the whole `tests/ascend/benchmarks/test_npu_acceptance.py` suite under the target interpreter on an authorized (possibly shared) card; records interpreter, module sources, candidate digest, per-phase timings, JUnit rows, reference-cache counters, and coverage | Sourced | Windowed (`deviceWindow`: 60 s) |
 | `tilefoundry-npu-cannbench-prep` | Verifies pure-Python CANNBench dependencies (`PyYAML`, `expecttest`, `ruamel.yaml`, `build`, `safetensors`), builds ABI-isolated `cann_bench_utils/_C.so` under `TILEFOUNDRY_NPU_WORK_ROOT`, and verifies `cann_bench_clone` on NPU; takes the device lease and requires an idle card before inspection/build | Sourced | Windowed (`deviceWindow`: 60 s) |
 | `tilefoundry-npu-cannbench` | **Local testing mode**: depends on `tilefoundry-npu-cannbench-prep`; takes the host msprof lock, then an idle device lease, injects the `--source` TileFoundry `PYTHONPATH`, runs official `cann-bench` `kernel_eval.staged_eval` against `tasks/<levelN>/<op>`, persists reports under `TILEFOUNDRY_NPU_WORK_ROOT/reports`, and records `score` / `avgSpeedup`; preserves report evidence and phases on failure/timeout. Declares an optional `dynamicTarget`: a managed V2 request narrows the run to its canonical task and workspace-relative candidate, while an unmanaged invocation evaluates the configured targets file | Sourced | Windowed (`deviceWindow`: 60 s) |
@@ -53,10 +53,17 @@ conflicting exports in the launching environment):
   pytest paths under `--source` (no leading `/`, no `..`). Leave empty for the
   5 default CPU directories:
   `tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators`.
+  The default also appends `tests/ascend/agent`, `tests/ascend/sil`, and
+  `tests/ascend/benchmarks/test_l3_contract_host.py` when those paths exist, so
+  checkouts without the newer suites keep collecting the original five. The
+  five device-only node ids under `tests/ascend/agent` and `tests/ascend/target`
+  are passed as exact `--deselect=` arguments when their files exist, so the
+  CPU gate keeps the host assertions in those files without opening a device.
 - `TILEFOUNDRY_NPU_DEVICE_TESTS`: optional comma- or whitespace-separated
   **relative** pytest paths under `--source` executed inside the NPU lease
   window after the built-in FP32/BF16 probe. Leave empty to run only the
-  built-in runtime & compute probe.
+  built-in runtime & compute probe. A typed fast request ignores this key and
+  runs only the fixed harness node described below.
 - `TILEFOUNDRY_NPU_BUILD_SUBDIR`: single relative directory name under `--source`
   used for AgentGates `build:<dir>` lease (default `build`; never set empty).
 - `TILEFOUNDRY_NPU_CANNBENCH_REPO` / `TILEFOUNDRY_NPU_WORK_ROOT` / `TILEFOUNDRY_NPU_CANNBENCH_ARCH`:
@@ -139,6 +146,150 @@ independently of the shell that submits the run.
 `TILEFOUNDRY_NPU_DEVICE_ID` and `TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE` are
 per-run launch/config parameters supplied via `--device-id` or
 `~/.config/agent-gates/config.toml`, never stored in `env.sh`.
+
+## Device-fast typed request
+
+`tilefoundry-npu-device-fast` accepts one optional typed request through the
+engine-published `dynamicTarget` pair. Submit `--target fast/<request_id>` with
+the request JSON as `--candidate`; the engine exports
+`AGENT_GATES_TARGET=fast/<request_id>` and
+`AGENT_GATES_CANDIDATE=<build>/agent_gates/fast/<request_id>.request.json`,
+and the candidate is the dynamicTarget candidate, so the usual receipt
+byte/SHA binding and `verify-requirements` re-hash apply. `TF_FAST_REQUEST` is
+never read from the parent environment; setting it there is a `BLOCKED_ENV`
+error. Without the pair the gate keeps the legacy fixed mode:
+`TF_SURROGATE_BATCH_REQUEST` and `TF_MICRO_PROBE_REQUEST` pass through
+unchanged, with no typed validation, binding, or additional msprof lock.
+
+`request_id` is 32 lowercase hexadecimal characters (a `uuid4().hex`), must
+equal the target suffix and the request filename, and selects every derived
+path. The request is a regular file of at most 4 MiB under the configured
+build subdirectory, containing one JSON object with no duplicate or unknown
+keys. Machine configuration is never read from the request: the working
+directory, CANNBench checkout, and caches come from the adapter's own machine
+values only.
+
+```json
+{
+  "schema": "tilefoundry-fast-request/v1",
+  "mode": "batch",
+  "request_id": "0123456789abcdef0123456789abcdef",
+  "response_path": "build/agent_gates/fast/0123456789abcdef0123456789abcdef.response.json",
+  "warmup": 3,
+  "repeat": 5,
+  "require_all_passed": false
+}
+```
+
+`warmup` and `repeat` are positive integers, `require_all_passed` is a boolean,
+and `response_path` must equal the derived response path exactly. The response
+file must not exist when the request is validated; its parent directory is
+created if needed. `batches` and `msprof_targets` are mutually exclusive: the
+selected mode's list must be non-empty and the other list absent or empty.
+
+Every candidate must live under
+`<build>/agent_gates/fast/<request_id>/candidates/`; absolute paths, empty or
+`.`/`..` segments, backslashes, NUL bytes, symlink components, and paths that
+escape `--source` are rejected. Only `tilefoundry-npu-device-fast` reads this
+descriptor: the canonical L3 and CANNBench config checks validate their own
+canonical target/candidate pair and reject a `fast/<request_id>` target. The
+adapter validates the whole request in `--check-config-device` and again before
+opening the device window, then snapshots the exact request bytes into the
+run's temporary directory and gives the workload:
+
+- `TF_FAST_REQUEST`: the 0400 temporary snapshot (not the workspace file)
+- `TF_FAST_SOURCE_ROOT`: the resolved `--source` checkout
+- `TILEFOUNDRY_NPU_CANNBENCH_REPO`: the adapter-resolved CANNBench checkout
+- `TILELANG_CACHE_DIR` and `CANNBENCH_CACHE_DIR`: the adapter-owned
+  `<work_root>/surrogate/{tilelang,reference}` cache roots
+
+`TF_SURROGATE_BATCH_REQUEST` and `TF_MICRO_PROBE_REQUEST` are removed from this
+child environment so a typed run cannot silently fall back to another request
+channel. The typed run always executes
+`tests/ascend/agent/test_surrogate_batch_npu.py::test_surrogate_anchor_batch_npu`
+for both modes; the request carries data only and cannot select a pytest node
+or command. `--check-config-device` applies the same fixed selection and
+requires that harness file to exist.
+
+### `batch` mode
+
+Adds a non-empty `batches` list. Each batch has `operator_name`, `entrypoint`,
+a non-empty `anchors` list, and a non-empty `candidates` list. Candidate ids are
+unique per operator, not globally; duplicate `operator_name` entries and
+duplicate `(operator_name, candidate_id)` pairs are request errors. Every
+candidate has a `candidate_id`, a staged `module_path`, and the lowercase
+SHA-256 of that module; the declared digest must match the bytes at validation
+time. Multiple operators may share one request and one device lease:
+
+```json
+{
+  "operator_name": "attention_residual",
+  "entrypoint": "main",
+  "candidates": [
+    {
+      "candidate_id": "cand_0",
+      "module_path": "build/agent_gates/fast/0123456789abcdef0123456789abcdef/candidates/cand_0.py",
+      "sha256": "<64 lowercase hex chars>"
+    }
+  ],
+  "anchors": [
+    {
+      "task": "level4/attention_residual",
+      "case_num": 1,
+      "regime_tag": "compute",
+      "ref_perf_us": 12.5,
+      "t_hw_us": 10.0
+    }
+  ]
+}
+```
+
+### `profile` mode
+
+Uses `"mode": "profile"` and a non-empty `msprof_targets` list instead of
+batches. Each target has `operator_name`, `candidate_id`, a staged
+`module_path`, its `sha256`, `case_num`, `warmup`, and `repeat`. One
+`(operator, candidate_id)` always names the same module and digest; duplicate
+`(operator, candidate_id, case_num)` triples are rejected. Profile mode always
+takes the host-wide msprof lock before the device window, without requiring
+`TILEFOUNDRY_NPU_MSPROF_LOCK`.
+
+### Response contract
+
+The workload writes one `tilefoundry-fast-response/v1` object to the derived
+response path. The envelope echoes `request_id`, `request_sha256`, `mode`, and
+`status` (`ok`, `candidate_failure`, `request_error`, or
+`infrastructure_error`). `candidates[operator][candidate_id]` must contain
+exactly `module_path`, `sha256`, `post_sha256` and match the declared identity;
+`coverage` must report nonnegative
+`expected_candidates`/`evaluated_candidates` (the declared candidate count) and
+`expected_msprof_targets`/`observed_msprof_targets` (the declared profile case
+count). Batch responses carry exactly the declared operators and candidates in
+`operators`; profile responses carry exactly the declared operators,
+candidates, and case numbers in `msprof_telemetry`.
+
+After the workload finishes, the adapter re-hashes the workspace request and
+every candidate module and compares them with the pre-run values. A missing,
+changed, or replaced request yields `REQUEST_IDENTITY_CHANGED`; a changed
+candidate yields `FAST_CANDIDATE_CHANGED:<operator>:<candidate>`. Both, a
+missing or mismatched response (`FAST_RESPONSE_UNREADABLE:<reason>`,
+`FAST_RESPONSE_REQUEST_ID`, `FAST_RESPONSE_REQUEST_SHA`,
+`FAST_RESPONSE_COVERAGE_*`), and a `request_error` or `infrastructure_error`
+status are infrastructure blocks: they fail the run and never count as a
+candidate regression. Only `status=candidate_failure` from a failing run sets
+`failureCategory=candidate`; `ok` runs pass when the configured pytest suite
+passes. The request, stable candidates, and response are recorded as gate
+artifacts with their SHA-256 digests, and the receipt observations are
+`fastRequest`, `requestStable`, `fastCandidates`, `fastResponse`,
+`fastCoverage`, `fastBindingFailures`, plus `errorCategory`/`failureCategory`.
+
+Binding diagnostics also include `FAST_RESPONSE_OPERATORS_MISSING`,
+`FAST_RESPONSE_TELEMETRY_MISSING`, `FAST_RESPONSE_OPERATOR_MISSING/EXTRA:<operator>`,
+`FAST_RESPONSE_CANDIDATE_MISSING/EXTRA:<operator>:<candidate>`, and
+`FAST_RESPONSE_CASE_MISSING/EXTRA/INVALID:<operator>:<candidate>[:<case>]`.
+Coverage is structural only; the configured pytest suite and the gate's normal
+observation checks still decide whether the measured result passes.
+
 
 ## L3 promotion and L4 evidence
 

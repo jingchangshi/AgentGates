@@ -11,18 +11,19 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from typing import Callable, NoReturn
+from typing import Callable, NamedTuple, NoReturn
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -133,6 +134,31 @@ DEFAULT_CPU_TESTS = (
     "tests/ascend/passes",
     "tests/ascend/operators",
 )
+# Collected when present so the V2 native CPU gate covers the agent and host L3
+# suites without breaking older checkouts that predate them.
+OPTIONAL_CPU_TESTS = (
+    "tests/ascend/agent",
+    "tests/ascend/sil",
+    "tests/ascend/benchmarks/test_l3_contract_host.py",
+)
+# Device-only test nodes that the CPU gate would still collect once
+# tests/ascend/agent and tests/ascend/target were added to the default suite.
+# The CPU gate runs with TORCH_DEVICE_BACKEND_AUTOLOAD=0, but an explicit
+# torch_npu import still binds a device when a driver is present, so these
+# nodes are deselected by exact id and the device gate owns them.
+CPU_DEVICE_NODE_DESELECTS = (
+    "tests/ascend/agent/test_ablation_distiller_npu.py"
+    "::test_live_flywheel_micro_probe_verification_and_kb_admission",
+    "tests/ascend/agent/test_e2e_evolution_npu.py::test_live_e2e_agent_evolution_on_npu",
+    "tests/ascend/agent/test_funnel_smoke_npu.py::test_live_one_op_funnel_stage_a_b_c_on_npu",
+    "tests/ascend/agent/test_surrogate_batch_npu.py::test_surrogate_anchor_batch_npu",
+    "tests/ascend/target/test_micro_probes_npu.py::test_ascend950_calibration_micro_probes",
+)
+# A typed fast request fixes the one harness node it runs. The request carries
+# data only; it cannot select a pytest node or command. Batch and profile share
+# this node so the device-fast gate has one stable synthetic-device workload.
+FAST_DEVICE_TEST_FILE = "tests/ascend/agent/test_surrogate_batch_npu.py"
+FAST_DEVICE_TEST_NODE = f"{FAST_DEVICE_TEST_FILE}::test_surrogate_anchor_batch_npu"
 
 DEFAULT_PYTHONPATH_PARTS = ("src", "targets/ascend", "targets/apple", "targets/nvidia")
 DEFAULT_PYTHONPATH = ":".join(DEFAULT_PYTHONPATH_PARTS)
@@ -168,6 +194,47 @@ L3_CANNBENCH_REPO_ENV = "TF_L3_CANNBENCH_REPO"
 L3_CACHE_EXPECTATION_ENV = "TF_L3_CACHE_EXPECTATION"
 L3_CACHE_MODE_ENV = "CANNBENCH_CACHE_MODE"
 L3_EVIDENCE_SCHEMA = "tilefoundry-l3-evidence/v1"
+# The dynamic fast gate consumes the V2 target/candidate pair only: the target
+# is fast/<request_id> and the candidate is the immutable request descriptor at
+# <build>/agent_gates/fast/<request_id>.request.json. The adapter snapshots its
+# bytes before the run and re-hashes the request, every candidate module, and
+# the response after the run, so a receipt can only describe inputs that did not
+# change while the device was held. Machine paths (cannbench checkout, caches)
+# come from machine_values, never from the request.
+FAST_REQUEST_ENV = "TF_FAST_REQUEST"
+FAST_REQUEST_SOURCE_ENV = "TF_FAST_SOURCE_ROOT"
+FAST_REQUEST_LEGACY_ENV = "TF_SURROGATE_BATCH_REQUEST"
+FAST_MICRO_PROBE_LEGACY_ENV = "TF_MICRO_PROBE_REQUEST"
+FAST_REQUEST_SCHEMA = "tilefoundry-fast-request/v1"
+FAST_RESPONSE_SCHEMA = "tilefoundry-fast-response/v1"
+FAST_REQUEST_MODES = ("batch", "profile")
+FAST_RESPONSE_STATUSES = (
+    "ok",
+    "candidate_failure",
+    "request_error",
+    "infrastructure_error",
+)
+FAST_REQUEST_MAX_BYTES = 4 << 20
+FAST_RESPONSE_MAX_BYTES = 64 << 20
+FAST_REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
+FAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+FAST_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+FAST_REQUEST_COMMON_KEYS = (
+    "schema",
+    "mode",
+    "request_id",
+    "response_path",
+    "warmup",
+    "repeat",
+    "require_all_passed",
+)
+FAST_ANCHOR_KEYS = ("task", "case_num", "regime_tag", "ref_perf_us", "t_hw_us")
+FAST_COVERAGE_KEYS = (
+    "expected_candidates",
+    "evaluated_candidates",
+    "expected_msprof_targets",
+    "observed_msprof_targets",
+)
 L3_PROFILE = "l3-promotion"
 L3_ACCEPTANCE_TEST = "tests/ascend/benchmarks/test_npu_acceptance.py"
 L3_GENERIC_TEST = "test_target_operator_full_cannbench_contract"
@@ -897,8 +964,33 @@ def _parse_test_list(raw: str | None, default: tuple[str, ...]) -> tuple[str, ..
     return tuple(parts)
 
 
-def cpu_tests(values: dict[str, str]) -> tuple[str, ...]:
-    return _parse_test_list(values.get("TILEFOUNDRY_NPU_CPU_TESTS"), DEFAULT_CPU_TESTS)
+def default_cpu_tests(source: Path) -> tuple[str, ...]:
+    """Base CPU suite plus optional paths that exist in this checkout."""
+    return DEFAULT_CPU_TESTS + tuple(
+        rel for rel in OPTIONAL_CPU_TESTS if (source / rel).exists()
+    )
+
+
+def cpu_tests(values: dict[str, str], source: Path) -> tuple[str, ...]:
+    return _parse_test_list(values.get("TILEFOUNDRY_NPU_CPU_TESTS"), default_cpu_tests(source))
+
+
+def cpu_deselects(source: Path) -> tuple[str, ...]:
+    """Return exact device-only node ids present in this checkout for CPU deselection."""
+    return tuple(
+        node
+        for node in CPU_DEVICE_NODE_DESELECTS
+        if (source / node.split("::", 1)[0]).is_file()
+    )
+
+
+def fast_device_tests(source: Path) -> tuple[str, ...]:
+    """Return the fixed harness node a typed fast request runs, requiring its file."""
+    if not (source / FAST_DEVICE_TEST_FILE).is_file():
+        raise BridgeError(
+            f"typed fast request harness is missing in {source}: {FAST_DEVICE_TEST_FILE}"
+        )
+    return (FAST_DEVICE_TEST_NODE,)
 
 
 def device_tests(values: dict[str, str]) -> tuple[str, ...]:
@@ -1280,6 +1372,762 @@ def _source_root() -> Path:
     if not ((source / "src" / "tilefoundry").is_dir() or (source / "pyproject.toml").is_file()):
         raise BridgeError(f"{source} does not look like a TileFoundry checkout")
     return source
+
+
+class FastCandidate(NamedTuple):
+    """One candidate module bound by a typed fast request."""
+
+    operator: str
+    candidate_id: str
+    relative_path: str
+    sha256: str
+
+
+class FastRequest(NamedTuple):
+    """Validated, immutable snapshot identity of one typed fast request."""
+
+    request_id: str
+    mode: str
+    path: Path
+    relative_path: str
+    sha256: str
+    raw: bytes
+    response_path: Path
+    response_relative: str
+    candidates: tuple[FastCandidate, ...]
+    profile_cases: tuple[tuple[str, str, tuple[int, ...]], ...]
+
+
+def _fast_path(source: Path, raw: object, field: str) -> tuple[str, Path]:
+    """Resolve one canonical workspace-relative fast-request path without symlinks."""
+    if not isinstance(raw, str) or not raw or "\x00" in raw or "\\" in raw:
+        raise BridgeError(f"fast request {field} must be a workspace-relative POSIX path")
+    parsed = PurePosixPath(raw)
+    if parsed.is_absolute() or str(parsed) != raw or any(
+        part in {"", ".", ".."} for part in parsed.parts
+    ):
+        raise BridgeError(
+            f"fast request {field} must be a canonical relative path "
+            "with no '.' or '..' segment"
+        )
+    current = source
+    for part in parsed.parts:
+        current = current / part
+        if current.is_symlink():
+            raise BridgeError(f"fast request {field} must not traverse a symlink: {raw}")
+    return raw, source / raw
+
+
+def _fast_read_bytes(path: Path, *, limit: int, field: str) -> bytes:
+    """Read one regular non-symlink file with a hard byte limit."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise BridgeError(f"cannot read fast request {field} {path}: {exc.strerror}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise BridgeError(f"fast request {field} is not a regular file: {path}")
+        if info.st_size > limit:
+            raise BridgeError(f"fast request {field} exceeds {limit} bytes: {path}")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+            block = os.read(fd, min(remaining, 1 << 20))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise BridgeError(f"fast request {field} exceeds {limit} bytes: {path}")
+    return data
+
+
+def _fast_no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _fast_json_object(data: bytes, *, field: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(data.decode("utf-8"), object_pairs_hook=_fast_no_duplicate_keys)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise BridgeError(f"fast request {field} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not all(isinstance(key, str) for key in parsed):
+        raise BridgeError(f"fast request {field} must be a JSON object")
+    return parsed
+
+
+def _fast_object(
+    value: object,
+    *,
+    context: str,
+    required: tuple[str, ...],
+    optional: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Narrow one JSON value to an object with exactly the declared keys."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise BridgeError(f"fast request {context} must be a JSON object")
+    unknown = sorted(set(value) - set(required) - set(optional))
+    missing = sorted(set(required) - set(value))
+    if unknown:
+        raise BridgeError(f"fast request {context} has unknown keys: {', '.join(unknown)}")
+    if missing:
+        raise BridgeError(f"fast request {context} is missing keys: {', '.join(missing)}")
+    return value
+
+
+def _fast_name(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not FAST_NAME_RE.fullmatch(value)
+        or value in {".", ".."}
+    ):
+        raise BridgeError(
+            f"fast request {field} must match [A-Za-z0-9][A-Za-z0-9._-]* and be at most 128 chars"
+        )
+    return value
+
+
+def _fast_int(value: object, *, field: str, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise BridgeError(f"fast request {field} must be an integer >= {minimum}")
+    return value
+
+
+def _fast_bool(value: object, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise BridgeError(f"fast request {field} must be a boolean")
+    return value
+
+
+def _fast_text(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or len(value) > 256:
+        raise BridgeError(f"fast request {field} must be a non-empty string of at most 256 chars")
+    return value
+
+
+def _fast_declared_sha(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not FAST_SHA256_RE.fullmatch(value):
+        raise BridgeError(f"fast request {field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _fast_candidate(
+    value: object,
+    *,
+    source: Path,
+    candidates_prefix: str,
+    operator: str,
+    context: str,
+) -> FastCandidate:
+    row = _fast_object(
+        value,
+        context=context,
+        required=("candidate_id", "module_path", "sha256"),
+    )
+    candidate_id = _fast_name(row["candidate_id"], field=f"{context}.candidate_id")
+    relative_path, module_path = _fast_path(
+        source, row["module_path"], f"{context}.module_path"
+    )
+    if (
+        relative_path == candidates_prefix
+        or not PurePosixPath(relative_path).is_relative_to(
+            PurePosixPath(candidates_prefix)
+        )
+    ):
+        raise BridgeError(
+            f"fast request {context}.module_path must stay under "
+            f"{candidates_prefix}/: {relative_path}"
+        )
+    declared_sha = _fast_declared_sha(row["sha256"], field=f"{context}.sha256")
+    if not module_path.is_file():
+        raise BridgeError(f"fast request {context}.module_path does not name a file: {relative_path}")
+    actual_sha = _sha256_file(module_path)
+    if actual_sha != declared_sha:
+        raise BridgeError(
+            f"fast request {context}.sha256 does not match candidate bytes: "
+            f"declared {declared_sha}, actual {actual_sha}"
+        )
+    return FastCandidate(operator, candidate_id, relative_path, declared_sha)
+
+
+def _fast_anchor(value: object, *, context: str) -> None:
+    row = _fast_object(value, context=context, required=FAST_ANCHOR_KEYS)
+    _fast_text(row["task"], field=f"{context}.task")
+    _fast_int(row["case_num"], field=f"{context}.case_num", minimum=0)
+    regime_tag = row["regime_tag"]
+    if not isinstance(regime_tag, str) or "\x00" in regime_tag or len(regime_tag) > 256:
+        raise BridgeError(
+            f"fast request {context}.regime_tag must be a string of at most 256 chars"
+        )
+    for field in ("ref_perf_us", "t_hw_us"):
+        if isinstance(row[field], bool) or not isinstance(row[field], (int, float)):
+            raise BridgeError(f"fast request {context}.{field} must be a number")
+
+
+def _fast_pair() -> tuple[str, str] | None:
+    """Read the engine-published dynamic target/candidate pair, if any."""
+    target = (os.environ.get(L3_TARGET_REQUEST_ENV) or "").strip()
+    candidate = (os.environ.get(L3_CANDIDATE_REQUEST_ENV) or "").strip()
+    if not target and not candidate:
+        return None
+    if not target or not candidate:
+        raise BridgeError(
+            f"{L3_TARGET_REQUEST_ENV} and {L3_CANDIDATE_REQUEST_ENV} "
+            "must be supplied together"
+        )
+    return target, candidate
+
+
+def _reject_parent_fast_request() -> None:
+    """Refuse the retired parent-environment request channel."""
+    if (os.environ.get(FAST_REQUEST_ENV) or "").strip():
+        raise BridgeError(
+            f"{FAST_REQUEST_ENV} is not read from the parent environment; submit "
+            "--target fast/<request_id> with the request JSON as --candidate"
+        )
+
+
+def _fast_request_id(target: str) -> str:
+    request_id = target[len("fast/"):] if target.startswith("fast/") else ""
+    if not FAST_REQUEST_ID_RE.fullmatch(request_id):
+        raise BridgeError(
+            f"{L3_TARGET_REQUEST_ENV} must be fast/<32 lowercase hex>: {target!r}"
+        )
+    return request_id
+
+
+def _fast_surrogate_caches(wroot: Path) -> dict[str, Path]:
+    """Create the adapter-owned cache roots the fast child may write into."""
+    base = wroot / "surrogate"
+    caches = {
+        "base": base,
+        "tilelang": base / "tilelang",
+        "reference": base / "reference",
+    }
+    for path in (base, caches["tilelang"], caches["reference"]):
+        if path.is_symlink():
+            raise BridgeError(f"surrogate cache path must not be a symlink: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+        if not path.is_dir() or not path.resolve().is_relative_to(wroot):
+            raise BridgeError(f"surrogate cache path escapes the work root: {path}")
+    return caches
+
+
+def _load_fast_request(
+    source: Path,
+    values: dict[str, str],
+    pair: tuple[str, str] | None,
+) -> FastRequest | None:
+    """Read and fully validate the V2-published typed fast request, if any."""
+    if pair is None:
+        return None
+    target, candidate = pair
+    request_id = _fast_request_id(target)
+    build = build_subdir(values)
+    expected_request = f"{build}/agent_gates/fast/{request_id}.request.json"
+    if candidate != expected_request:
+        raise BridgeError(
+            f"{L3_CANDIDATE_REQUEST_ENV} must name the immutable request "
+            f"{expected_request!r} for {target!r}: {candidate!r}"
+        )
+    relative_path, path = _fast_path(source, candidate, "path")
+    raw = _fast_read_bytes(path, limit=FAST_REQUEST_MAX_BYTES, field="request")
+    digest = hashlib.sha256(raw).hexdigest()
+    payload = _fast_json_object(raw, field="request")
+    mode = payload.get("mode")
+    if mode not in FAST_REQUEST_MODES:
+        raise BridgeError(
+            f"fast request mode must be one of {', '.join(FAST_REQUEST_MODES)}: {mode!r}"
+        )
+    if mode == "batch":
+        request = _fast_object(
+            payload,
+            context="request",
+            required=(*FAST_REQUEST_COMMON_KEYS, "batches"),
+            optional=("msprof_targets",),
+        )
+        if request.get("msprof_targets") not in (None, []):
+            raise BridgeError("fast batch request must not declare msprof_targets")
+    else:
+        request = _fast_object(
+            payload,
+            context="request",
+            required=(*FAST_REQUEST_COMMON_KEYS, "msprof_targets"),
+            optional=("batches",),
+        )
+        if request.get("batches") not in (None, []):
+            raise BridgeError("fast profile request must not declare batches")
+    if request["schema"] != FAST_REQUEST_SCHEMA:
+        raise BridgeError(
+            f"fast request schema must be {FAST_REQUEST_SCHEMA}: {request['schema']!r}"
+        )
+    if request["request_id"] != request_id:
+        raise BridgeError(
+            f"fast request request_id must equal the target request id {request_id}: "
+            f"{request['request_id']!r}"
+        )
+    _fast_int(request["warmup"], field="warmup", minimum=1)
+    _fast_int(request["repeat"], field="repeat", minimum=1)
+    _fast_bool(request["require_all_passed"], field="require_all_passed")
+    response_relative = f"{build}/agent_gates/fast/{request_id}.response.json"
+    if request["response_path"] != response_relative:
+        raise BridgeError(
+            f"fast request response_path must be {response_relative!r}: "
+            f"{request['response_path']!r}"
+        )
+    _, response_path = _fast_path(source, response_relative, "response_path")
+    response_path.parent.mkdir(parents=True, exist_ok=True)
+    if response_path.parent.is_symlink() or not response_path.parent.resolve().is_relative_to(source):
+        raise BridgeError(
+            f"fast request response_path escapes the source root: {response_relative}"
+        )
+    if response_path.exists():
+        raise BridgeError(f"fast request response_path already exists: {response_relative}")
+
+    candidates_prefix = f"{build}/agent_gates/fast/{request_id}/candidates"
+    _, candidates_dir = _fast_path(source, candidates_prefix, "request candidates directory")
+    if not candidates_dir.is_dir():
+        raise BridgeError(f"fast request candidates directory is missing: {candidates_prefix}")
+
+    candidates: list[FastCandidate] = []
+    candidate_keys: set[tuple[str, str]] = set()
+    if mode == "batch":
+        raw_batches = request["batches"]
+        if not isinstance(raw_batches, list) or not raw_batches:
+            raise BridgeError("fast request batches must be a non-empty list")
+        operators: set[str] = set()
+        for index, raw_batch in enumerate(raw_batches):
+            context = f"batches[{index}]"
+            batch = _fast_object(
+                raw_batch,
+                context=context,
+                required=("operator_name", "entrypoint", "candidates", "anchors"),
+            )
+            operator = _fast_name(batch["operator_name"], field=f"{context}.operator_name")
+            if operator in operators:
+                raise BridgeError(f"fast request duplicates operator {operator!r}")
+            operators.add(operator)
+            _fast_text(batch["entrypoint"], field=f"{context}.entrypoint")
+            raw_anchors = batch["anchors"]
+            if not isinstance(raw_anchors, list) or not raw_anchors:
+                raise BridgeError(f"fast request {context}.anchors must be a non-empty list")
+            for anchor_index, raw_anchor in enumerate(raw_anchors):
+                _fast_anchor(raw_anchor, context=f"{context}.anchors[{anchor_index}]")
+            raw_candidates = batch["candidates"]
+            if not isinstance(raw_candidates, list) or not raw_candidates:
+                raise BridgeError(f"fast request {context}.candidates must be a non-empty list")
+            for candidate_index, raw_candidate in enumerate(raw_candidates):
+                candidate_context = f"{context}.candidates[{candidate_index}]"
+                row = _fast_candidate(
+                    raw_candidate,
+                    source=source,
+                    candidates_prefix=candidates_prefix,
+                    operator=operator,
+                    context=candidate_context,
+                )
+                key = (operator, row.candidate_id)
+                if key in candidate_keys:
+                    raise BridgeError(
+                        f"fast request duplicates candidate {operator}/{row.candidate_id}"
+                    )
+                candidate_keys.add(key)
+                candidates.append(row)
+        return FastRequest(
+            request_id=request_id,
+            mode=mode,
+            path=path,
+            relative_path=relative_path,
+            sha256=digest,
+            raw=raw,
+            response_path=response_path,
+            response_relative=response_relative,
+            candidates=tuple(candidates),
+            profile_cases=(),
+        )
+
+    raw_targets = request["msprof_targets"]
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise BridgeError("fast request msprof_targets must be a non-empty list")
+    candidates_by_key: dict[tuple[str, str], FastCandidate] = {}
+    profile_cases: dict[tuple[str, str], list[int]] = {}
+    for index, raw_target in enumerate(raw_targets):
+        context = f"msprof_targets[{index}]"
+        target_row = _fast_object(
+            raw_target,
+            context=context,
+            required=(
+                "operator_name",
+                "candidate_id",
+                "module_path",
+                "sha256",
+                "case_num",
+                "warmup",
+                "repeat",
+            ),
+        )
+        operator = _fast_name(target_row["operator_name"], field=f"{context}.operator_name")
+        candidate_id = _fast_name(
+            target_row["candidate_id"], field=f"{context}.candidate_id"
+        )
+        row = _fast_candidate(
+            {
+                "candidate_id": candidate_id,
+                "module_path": target_row["module_path"],
+                "sha256": target_row["sha256"],
+            },
+            source=source,
+            candidates_prefix=candidates_prefix,
+            operator=operator,
+            context=context,
+        )
+        key = (operator, candidate_id)
+        previous = candidates_by_key.setdefault(key, row)
+        if previous != row:
+            raise BridgeError(
+                f"fast request declares conflicting modules for {operator}/{candidate_id}"
+            )
+        case_num = _fast_int(target_row["case_num"], field=f"{context}.case_num", minimum=0)
+        _fast_int(target_row["warmup"], field=f"{context}.warmup", minimum=1)
+        _fast_int(target_row["repeat"], field=f"{context}.repeat", minimum=1)
+        cases = profile_cases.setdefault(key, [])
+        if case_num in cases:
+            raise BridgeError(
+                f"fast request duplicates msprof case {operator}/{candidate_id}/{case_num}"
+            )
+        cases.append(case_num)
+    return FastRequest(
+        request_id=request_id,
+        mode=mode,
+        path=path,
+        relative_path=relative_path,
+        sha256=digest,
+        raw=raw,
+        response_path=response_path,
+        response_relative=response_relative,
+        candidates=tuple(candidates_by_key.values()),
+        profile_cases=tuple(
+            (operator, candidate_id, tuple(sorted(cases)))
+            for (operator, candidate_id), cases in profile_cases.items()
+        ),
+    )
+
+
+def _fast_response_envelope(
+    fast_request: FastRequest, payload: dict[str, object]
+) -> tuple[str | None, list[str]]:
+    """Require the response envelope to describe exactly this request."""
+    failures: list[str] = []
+    schema = payload.get("schema")
+    if schema != FAST_RESPONSE_SCHEMA:
+        failures.append(f"FAST_RESPONSE_SCHEMA:{schema!r}")
+    if payload.get("request_id") != fast_request.request_id:
+        failures.append("FAST_RESPONSE_REQUEST_ID")
+    if payload.get("request_sha256") != fast_request.sha256:
+        failures.append("FAST_RESPONSE_REQUEST_SHA")
+    if payload.get("mode") != fast_request.mode:
+        failures.append("FAST_RESPONSE_MODE")
+    status = payload.get("status")
+    if not isinstance(status, str) or status not in FAST_RESPONSE_STATUSES:
+        failures.append(f"FAST_RESPONSE_STATUS_INVALID:{status!r}")
+        return None, failures
+    return status, failures
+
+
+def _fast_response_bindings(
+    fast_request: FastRequest, payload: dict[str, object]
+) -> list[str]:
+    """Require one pre/post SHA binding row for every declared candidate."""
+    raw = payload.get("candidates")
+    if not isinstance(raw, dict):
+        return ["FAST_RESPONSE_BINDINGS_MISSING"]
+    expected = {
+        (candidate.operator, candidate.candidate_id): candidate
+        for candidate in fast_request.candidates
+    }
+    rows: dict[tuple[str, str], object] = {}
+    failures: list[str] = []
+    for operator, row in raw.items():
+        if not isinstance(operator, str) or not isinstance(row, dict):
+            failures.append("FAST_RESPONSE_BINDINGS_INVALID")
+            continue
+        for candidate_id, item in row.items():
+            if not isinstance(candidate_id, str):
+                failures.append("FAST_RESPONSE_BINDINGS_INVALID")
+                continue
+            rows[(operator, candidate_id)] = item
+    for operator, candidate_id in sorted(set(rows) - set(expected)):
+        failures.append(f"FAST_RESPONSE_BINDING_EXTRA:{operator}:{candidate_id}")
+    for key, candidate in expected.items():
+        operator, candidate_id = key
+        item = rows.get(key)
+        if item is None:
+            failures.append(f"FAST_RESPONSE_BINDING_MISSING:{operator}:{candidate_id}")
+            continue
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"module_path", "sha256", "post_sha256"}
+        ):
+            failures.append(f"FAST_RESPONSE_BINDING_INVALID:{operator}:{candidate_id}")
+            continue
+        if item["module_path"] != candidate.relative_path:
+            failures.append(f"FAST_RESPONSE_BINDING_PATH:{operator}:{candidate_id}")
+        for field in ("sha256", "post_sha256"):
+            value = item[field]
+            if not isinstance(value, str) or value != candidate.sha256:
+                failures.append(f"FAST_RESPONSE_BINDING_SHA:{operator}:{candidate_id}")
+                break
+    return failures
+
+
+def _fast_response_coverage(
+    fast_request: FastRequest, payload: dict[str, object]
+) -> tuple[list[str], dict[str, object]]:
+    """Require coverage counts that match the declared candidates and cases."""
+    raw = payload.get("coverage")
+    if not isinstance(raw, dict):
+        return ["FAST_RESPONSE_COVERAGE_MISSING"], {}
+    coverage: dict[str, object] = {}
+    failures: list[str] = []
+    for key in FAST_COVERAGE_KEYS:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            failures.append(f"FAST_RESPONSE_COVERAGE_INVALID:{key}")
+            continue
+        coverage[key] = value
+    if failures:
+        return failures, {}
+    expected_candidates = len(fast_request.candidates)
+    expected_targets = sum(len(cases) for _, _, cases in fast_request.profile_cases)
+    checks = {
+        "expected_candidates": expected_candidates,
+        "evaluated_candidates": expected_candidates,
+        "expected_msprof_targets": expected_targets,
+        "observed_msprof_targets": expected_targets,
+    }
+    for key, expected in checks.items():
+        if coverage[key] != expected:
+            failures.append(f"FAST_RESPONSE_COVERAGE_{key.upper()}")
+    return failures, coverage
+
+
+def _fast_response_producers(
+    fast_request: FastRequest, payload: dict[str, object]
+) -> list[str]:
+    """Require exactly the declared operators, candidates, and cases in the results."""
+    failures: list[str] = []
+    if fast_request.mode == "batch":
+        operators = payload.get("operators")
+        if not isinstance(operators, dict):
+            return ["FAST_RESPONSE_OPERATORS_MISSING"]
+        expected: dict[str, set[str]] = {}
+        for candidate in fast_request.candidates:
+            expected.setdefault(candidate.operator, set()).add(candidate.candidate_id)
+        for operator in sorted(set(operators) - set(expected)):
+            failures.append(f"FAST_RESPONSE_OPERATOR_EXTRA:{operator}")
+        for operator, candidate_ids in expected.items():
+            row = operators.get(operator)
+            if not isinstance(row, dict):
+                failures.append(f"FAST_RESPONSE_OPERATOR_MISSING:{operator}")
+                continue
+            for candidate_id in sorted(candidate_ids - set(row)):
+                failures.append(
+                    f"FAST_RESPONSE_CANDIDATE_MISSING:{operator}:{candidate_id}"
+                )
+            for candidate_id in sorted(set(row) - candidate_ids):
+                failures.append(
+                    f"FAST_RESPONSE_CANDIDATE_EXTRA:{operator}:{candidate_id}"
+                )
+        return failures
+
+    telemetry = payload.get("msprof_telemetry")
+    if not isinstance(telemetry, dict):
+        return ["FAST_RESPONSE_TELEMETRY_MISSING"]
+    expected_cases: dict[str, dict[str, set[int]]] = {}
+    for operator, candidate_id, cases in fast_request.profile_cases:
+        expected_cases.setdefault(operator, {})[candidate_id] = set(cases)
+    for operator in sorted(set(telemetry) - set(expected_cases)):
+        failures.append(f"FAST_RESPONSE_OPERATOR_EXTRA:{operator}")
+    for operator, candidate_map in expected_cases.items():
+        row = telemetry.get(operator)
+        if not isinstance(row, dict):
+            failures.append(f"FAST_RESPONSE_OPERATOR_MISSING:{operator}")
+            continue
+        for candidate_id in sorted(set(row) - set(candidate_map)):
+            failures.append(
+                f"FAST_RESPONSE_CANDIDATE_EXTRA:{operator}:{candidate_id}"
+            )
+        for candidate_id, cases in candidate_map.items():
+            case_row = row.get(candidate_id)
+            if not isinstance(case_row, dict):
+                failures.append(
+                    f"FAST_RESPONSE_CANDIDATE_MISSING:{operator}:{candidate_id}"
+                )
+                continue
+            actual_cases: set[int] = set()
+            for raw_case in case_row:
+                if not isinstance(raw_case, str) or not raw_case.isdecimal():
+                    failures.append(
+                        f"FAST_RESPONSE_CASE_INVALID:{operator}:{candidate_id}"
+                    )
+                    continue
+                actual_cases.add(int(raw_case))
+            for case_num in sorted(cases - actual_cases):
+                failures.append(
+                    f"FAST_RESPONSE_CASE_MISSING:{operator}:{candidate_id}:{case_num}"
+                )
+            for case_num in sorted(actual_cases - cases):
+                failures.append(
+                    f"FAST_RESPONSE_CASE_EXTRA:{operator}:{candidate_id}:{case_num}"
+                )
+    return failures
+
+
+def _fast_response_check(
+    fast_request: FastRequest, payload: dict[str, object]
+) -> tuple[str | None, list[str], dict[str, object]]:
+    """Validate one response; a request/infrastructure status is a block, not a verdict."""
+    status, failures = _fast_response_envelope(fast_request, payload)
+    if status is None:
+        return None, failures, {}
+    if status in {"request_error", "infrastructure_error"}:
+        failures.append(f"FAST_RESPONSE_STATUS:{status}")
+        return status, failures, {}
+    failures.extend(_fast_response_bindings(fast_request, payload))
+    coverage_failures, coverage = _fast_response_coverage(fast_request, payload)
+    failures.extend(coverage_failures)
+    failures.extend(_fast_response_producers(fast_request, payload))
+    return status, failures, coverage
+
+
+def _fast_verify_binding(
+    fast_request: FastRequest, source: Path
+) -> tuple[dict[str, object], list[dict[str, str]], list[str]]:
+    """Re-hash the request, candidates, and response; bind them as gate artifacts."""
+    failures: list[str] = []
+    artifacts: dict[str, dict[str, str]] = {}
+
+    def bind(path: Path, digest: str) -> None:
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            return
+        artifacts.setdefault(str(resolved), {"path": str(resolved), "sha256": digest})
+
+    request_stable = False
+    try:
+        current = _fast_read_bytes(
+            fast_request.path, limit=FAST_REQUEST_MAX_BYTES, field="request"
+        )
+        request_stable = hashlib.sha256(current).hexdigest() == fast_request.sha256
+    except BridgeError:
+        request_stable = False
+    if request_stable:
+        bind(fast_request.path, fast_request.sha256)
+    else:
+        failures.append("REQUEST_IDENTITY_CHANGED")
+
+    candidate_rows: list[dict[str, object]] = []
+    for candidate in fast_request.candidates:
+        module_path = source / candidate.relative_path
+        post_sha = ""
+        try:
+            _fast_path(source, candidate.relative_path, "candidate module_path")
+            post_sha = _sha256_file(module_path)
+        except (BridgeError, OSError):
+            post_sha = ""
+        stable = post_sha == candidate.sha256
+        candidate_rows.append(
+            {
+                "operator": candidate.operator,
+                "candidateId": candidate.candidate_id,
+                "modulePath": candidate.relative_path,
+                "preSha256": candidate.sha256,
+                "postSha256": post_sha,
+                "stable": stable,
+            }
+        )
+        if stable:
+            bind(module_path, candidate.sha256)
+        else:
+            failures.append(
+                f"FAST_CANDIDATE_CHANGED:{candidate.operator}:{candidate.candidate_id}"
+            )
+
+    response_sha = ""
+    response_bytes = 0
+    response_bound = False
+    response_status: str | None = None
+    coverage: dict[str, object] = {}
+    try:
+        response_data = _fast_read_bytes(
+            fast_request.response_path,
+            limit=FAST_RESPONSE_MAX_BYTES,
+            field="response",
+        )
+        response_sha = hashlib.sha256(response_data).hexdigest()
+        response_bytes = len(response_data)
+        bind(fast_request.response_path, response_sha)
+        response_payload = _fast_json_object(response_data, field="response")
+        response_status, response_failures, coverage = _fast_response_check(
+            fast_request, response_payload
+        )
+        failures.extend(response_failures)
+        response_bound = response_status is not None and not response_failures
+    except BridgeError as exc:
+        failures.append(f"FAST_RESPONSE_UNREADABLE:{exc}")
+    observed: dict[str, object] = {
+        "fastRequest": {
+            "path": fast_request.relative_path,
+            "sha256": fast_request.sha256,
+            "requestId": fast_request.request_id,
+            "mode": fast_request.mode,
+        },
+        "requestStable": request_stable,
+        "fastCandidates": candidate_rows,
+        "fastResponse": {
+            "path": fast_request.response_relative,
+            "sha256": response_sha,
+            "bytes": response_bytes,
+            "status": response_status,
+            "bound": response_bound,
+        },
+        "fastCoverage": coverage or None,
+    }
+    return observed, list(artifacts.values()), failures
+
+
+def _fast_failure_fields(
+    binding_obs: dict[str, object],
+    binding_failures: list[str],
+    *,
+    ok: bool,
+    timed_out: bool,
+) -> dict[str, object]:
+    """Classify a fast outcome; only an explicit candidate status is a candidate failure."""
+    if timed_out or binding_failures:
+        category = "infra"
+    else:
+        response = binding_obs.get("fastResponse")
+        status = response.get("status") if isinstance(response, dict) else None
+        if status in {"request_error", "infrastructure_error"}:
+            category = "infra"
+        elif not ok:
+            category = "candidate" if status == "candidate_failure" else "infra"
+        else:
+            category = None
+    return {
+        "errorCategory": category or "none",
+        "failureCategory": category,
+    }
 
 
 def _junit_counts(path: Path) -> dict[str, int] | None:
@@ -2986,12 +3834,22 @@ def check_config(
         if not python.is_file():
             raise BridgeError(f"TileFoundry Python interpreter does not exist: {python}")
         source = _source_root()
-        for rel in cpu_tests(values):
+        for rel in cpu_tests(values, source):
             if not (source / rel).exists():
                 raise BridgeError(f"CPU test path missing in {source}: {rel}")
-        for rel in device_tests(values):
-            if not (source / rel).exists():
-                raise BridgeError(f"device test path missing in {source}: {rel}")
+        # Only the device route consumes the typed fast descriptor: the canonical
+        # device route shares this entry point without a pair, while the L3 and
+        # CANNBench routes validate their own canonical target/candidate below.
+        # Routing those canonical pairs through fast parsing would reject every
+        # managed L3/L4 diagnosis before its own validator ever sees the pair.
+        fast_request: FastRequest | None = None
+        if check_device and not (check_l3 or check_cannbench):
+            _reject_parent_fast_request()
+            fast_request = _load_fast_request(source, values, _fast_pair())
+        if fast_request is None:
+            for rel in device_tests(values):
+                if not (source / rel).exists():
+                    raise BridgeError(f"device test path missing in {source}: {rel}")
         tilelang_reuse_identity(values)
         if check_cannbench or check_cannbench_remote:
             repo = cannbench_repo(values)
@@ -3013,6 +3871,10 @@ def check_config(
             operator = _l3_operator(task)
             _l3_cache_layout(wroot, operator)
         if check_device:
+            if fast_request is not None:
+                repo = cannbench_repo(values)
+                _fast_surrogate_caches(work_root(values, source, repo))
+                fast_device_tests(source)
             dev = device_id()
             if dev is not None:
                 try:
@@ -3028,7 +3890,7 @@ def check_config(
 def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
-    tests = cpu_tests(values)
+    tests = cpu_tests(values, source)
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
@@ -3052,6 +3914,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         cmd = " ".join(
             [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider",
              f"--junit-xml={shlex.quote(str(report))}"]
+            + [f"--deselect={shlex.quote(node)}" for node in cpu_deselects(source)]
             + [shlex.quote(t) for t in tests]
         )
         try:
@@ -3384,12 +4247,26 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
-    tests = device_tests(values)
+    _reject_parent_fast_request()
+    fast_request = _load_fast_request(source, values, _fast_pair())
+    tests = fast_device_tests(source) if fast_request is not None else device_tests(values)
     if fast and not tests:
         raise BridgeError(
-            "tilefoundry-npu-device-fast requires TILEFOUNDRY_NPU_DEVICE_TESTS"
+            "tilefoundry-npu-device-fast requires TILEFOUNDRY_NPU_DEVICE_TESTS "
+            "for the legacy fixed mode"
         )
-    msprof_lock = _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK")
+    fast_repo: Path | None = None
+    fast_caches: dict[str, Path] | None = None
+    if fast_request is not None:
+        if not fast:
+            raise BridgeError(
+                "a dynamic fast request target is only supported by "
+                "tilefoundry-npu-device-fast"
+            )
+        fast_repo = cannbench_repo(values)
+        fast_caches = _fast_surrogate_caches(work_root(values, source, fast_repo))
+    profile_mode = fast_request is not None and fast_request.mode == "profile"
+    msprof_lock = _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK") or profile_mode
     cache_enabled = _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
 
     started = time.monotonic()
@@ -3420,6 +4297,22 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                 if tl_identity is not None:
                     run_env.setdefault("USE_CUDA", "0")
                     run_env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
+
+                if fast_request is not None:
+                    # The child reads only the validated snapshot. The original
+                    # request is re-hashed after the run, so a caller cannot
+                    # rewrite the terms of the run while the device is held.
+                    assert fast_repo is not None and fast_caches is not None
+                    snapshot = Path(tmp) / "fast_request.json"
+                    snapshot.write_bytes(fast_request.raw)
+                    snapshot.chmod(0o400)
+                    run_env[FAST_REQUEST_ENV] = str(snapshot)
+                    run_env[FAST_REQUEST_SOURCE_ENV] = str(source)
+                    run_env["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(fast_repo)
+                    run_env["TILELANG_CACHE_DIR"] = str(fast_caches["tilelang"])
+                    run_env["CANNBENCH_CACHE_DIR"] = str(fast_caches["reference"])
+                    run_env.pop(FAST_REQUEST_LEGACY_ENV, None)
+                    run_env.pop(FAST_MICRO_PROBE_LEGACY_ENV, None)
 
                 if fast:
                     cmd = " ".join(
@@ -3456,6 +4349,13 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                     if exc.stderr:
                         sys.stderr.write(_redact_llm_credential(exc.stderr, credential)[-4000:])
                     print(f"{PROG}: device run timed out after {timeout}s", file=sys.stderr)
+                    binding_obs: dict[str, object] = {}
+                    binding_artifacts: list[dict[str, str]] = []
+                    binding_failures: list[str] = []
+                    if fast_request is not None:
+                        binding_obs, binding_artifacts, binding_failures = _fast_verify_binding(
+                            fast_request, source
+                        )
                     if fast:
                         obs = {
                             "exitCodeZero": False,
@@ -3464,6 +4364,7 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                             "testsFailed": 0,
                             "testsSkipped": 0,
                             **_window_evidence(occ, win),
+                            **binding_obs,
                         }
                     else:
                         obs = {
@@ -3473,11 +4374,27 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                         }
                         if tl_identity is not None:
                             obs["tilelangReused"] = False
+                    if fast_request is not None:
+                        obs["fastBindingFailures"] = binding_failures
+                        obs["fastRunTimedOut"] = True
+                        obs["artifacts"] = binding_artifacts
+                        obs.update(
+                            _fast_failure_fields(
+                                binding_obs, binding_failures, ok=False, timed_out=True
+                            )
+                        )
                     if tl_identity is not None:
                         obs["tilelang"] = tl_identity
                     return 1, obs
 
                 occ, win = finalize_window()
+                binding_obs = {}
+                binding_artifacts = []
+                binding_failures = []
+                if fast_request is not None:
+                    binding_obs, binding_artifacts, binding_failures = _fast_verify_binding(
+                        fast_request, source
+                    )
                 if fast:
                     counts = _junit_counts(report)
                     if counts is None:
@@ -3493,8 +4410,14 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                         and counts["collected"] > 0
                         and counts["failed"] == 0
                         and counts["skipped"] < counts["collected"]
+                        and not binding_failures
                     )
                     if not ok:
+                        if binding_failures:
+                            print(
+                                f"{PROG}: fast request binding failed: {', '.join(binding_failures)}",
+                                file=sys.stderr,
+                            )
                         sys.stderr.write(
                             _redact_llm_credential(
                                 completed.stdout + "\n" + completed.stderr, credential
@@ -3507,7 +4430,16 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                         "testsFailed": counts["failed"],
                         "testsSkipped": counts["skipped"],
                         **_window_evidence(occ, win),
+                        **binding_obs,
                     }
+                    if fast_request is not None:
+                        obs["fastBindingFailures"] = binding_failures
+                        obs["artifacts"] = binding_artifacts
+                        obs.update(
+                            _fast_failure_fields(
+                                binding_obs, binding_failures, ok=ok, timed_out=False
+                            )
+                        )
                     if tl_identity is not None:
                         obs["tilelang"] = tl_identity
                     return (0 if ok else (completed.returncode or 1)), obs

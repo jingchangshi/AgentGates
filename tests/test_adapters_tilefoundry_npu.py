@@ -323,6 +323,37 @@ class CheckConfigAndRunCase(unittest.TestCase):
             os.chdir(old_cwd)
 
 
+    def test_run_cpu_deselects_device_nodes_present_in_checkout(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            for node in GATE.CPU_DEVICE_NODE_DESELECTS:
+                path = self.src / node.split("::", 1)[0]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("def test_placeholder():\n    assert True\n", encoding="utf-8")
+            self.write_env()
+
+            def fake_run_host_bash(cmd, *, cwd, env, **kwargs):
+                for part in cmd.split():
+                    if part.startswith("--junit-xml="):
+                        xml_path = Path(part.split("=", 1)[1].strip("'\""))
+                        xml_path.write_text(
+                            '<testsuite tests="1" failures="0" errors="0" skipped="0"></testsuite>',
+                            encoding="utf-8",
+                        )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_run_host_bash) as cpu:
+                rc, _obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc, 0)
+            cmd = cpu.call_args.args[0]
+            for node in GATE.CPU_DEVICE_NODE_DESELECTS:
+                self.assertIn(f"--deselect={node}", cmd)
+        finally:
+            os.chdir(old_cwd)
+
+
 class CannbenchIntegrationCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
