@@ -1166,6 +1166,19 @@ class OptionalAgentKeysCase(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_campaign_device_pool_is_an_inert_machine_declaration(self):
+        self.write_env(TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS="0,1,2")
+        values = GATE._parse_env_file(self.env_file.read_text(encoding="utf-8"), self.env_file)
+        self.assertEqual(values["TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS"], "0,1,2")
+        self.assertNotIn("TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS", GATE.NOT_MACHINE_KEYS)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+        finally:
+            os.chdir(old_cwd)
+
     def test_l4_external_probe_limit_defaults_and_rejects_bad_values(self):
         self.assertEqual(GATE.l4_external_probe_limit({}), 3)
         self.assertEqual(

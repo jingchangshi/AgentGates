@@ -20,7 +20,7 @@
 
 1. **只写 `NAME=VALUE` 数据行**：支持 `#` 注释和空行；成对单/双引号会被去除，未闭合引号报错；未知键或重复键报错。
 2. **禁止在外部 shell 冲突 export**：若启动 shell 中导出了同前缀变量且值与 `env.sh` 不一致，Gate 会明确拒绝，保证引擎加锁路径与 Gate 实际读写路径一致。
-3. **卡号不写入 `env.sh`**：`*_DEVICE_ID` 和 `*_REQUIRE_EXCLUSIVE_DEVICE` 属于单次运行/集群策略参数，由 `--device-id` 或 `~/.config/agent-gates/config.toml` 解析后注入，绝不写入 `env.sh`。
+3. **卡号不写入 `env.sh`**：`*_DEVICE_ID` 和 `*_REQUIRE_EXCLUSIVE_DEVICE` 属于单次运行/集群策略参数，由 `--device-id` 或 `~/.config/agent-gates/config.toml` 解析后注入，绝不写入 `env.sh`。唯一例外是 `TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS`：它是 campaign 编排声明（候选卡顺序），不是启动值、不授权任何卡、也不会被 Gate 读取；每次 execution 仍由 `--device-id` 指定单卡，最终权限由 `devices.allowed_npu_devices` 裁决。
 4. **不要将 `*_BUILD_SUBDIR=` 或 `*_NINJA_JOBS=` 留成空赋值行**：若使用默认值（如 `build` 或 `$(nproc)`），应保留默认值（如 `=build`）或整行 `#` 注释掉。
 
 ---
@@ -41,6 +41,7 @@
 | `TILEFOUNDRY_NPU_CPU_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的 `pytest` 测试文件或目录（禁止 `/` 开头和 `..`）。留空默认运行 5 个目录：`tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators` |
 | `TILEFOUNDRY_NPU_DEVICE_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的额外 NPU `pytest` 路径（禁止 `/` 开头和 `..`）。**默认留空**：只跑内置窗口期 NPU 探针（`import tilefoundry`、FP32 向量加、BF16 Cube `matmul`、显存分配 > 0、`torch.npu.synchronize()`）；填写后会在同一设备窗口内追加执行 `pytest` 并要求至少通过 1 个用例且零失败 |
 | `TILEFOUNDRY_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | 引擎加 `build:<dir>` 锁使用；模板默认填 `build`，请勿改为 `=` 空值 |
+| `TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS` | 可选 | 逗号分隔的物理卡号列表（如 `0,1,2`） | 仅供 TileFoundry campaign 读取的候选卡顺序，用于整次 L4 尝试间的换卡；Adapter 解析后忽略其值。**不授权任何卡**：`submit --device-id` 仍受 `devices.allowed_npu_devices` 约束，越权返回 `DEVICE_NOT_AUTHORIZED`。留空表示不声明运行池 |
 | `TILEFOUNDRY_NPU_CANNBENCH_REPO` | CANNBench 必填 | 宿主机绝对路径 | 只读 CANNBench 仓库根路径（如 `cannbot-ops`）；门禁绝不写入该目录 |
 | `TILEFOUNDRY_NPU_WORK_ROOT` | CANNBench 必填 | 宿主机绝对路径 | 须位于 `--source` 与 `CANNBENCH_REPO` 之外，存放按 Python/Torch ABI 隔离构建的 `cann_bench_utils` 与 `reports/` |
 | `TILEFOUNDRY_NPU_CANNBENCH_ARCH` | CANNBench 可选 | 目标架构（默认 `ascend950`） | 可选 `ascend950`、`ascend910b`、`ascend910_93` |

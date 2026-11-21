@@ -229,6 +229,7 @@ TILEFOUNDRY_NPU_KEYS = (
     'TILEFOUNDRY_NPU_CANNBOT_DSL_REPO',
     'TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO',
     'TILEFOUNDRY_NPU_ASC_DEVKIT_REPO',
+    'TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS',
 )
 
 # The adapter ID -> the prefix it owns, the selector variable it honours and the

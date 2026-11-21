@@ -21,6 +21,17 @@
 #   * TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE: forwarded by AgentGates devices config.
 
 # ---------------------------------------------------------------------------
+# Campaign orchestration — optional
+# ---------------------------------------------------------------------------
+# Ordered, comma-separated physical NPU card IDs the TileFoundry campaign may
+# try for whole-L4 attempts (for example 0,1,2). Each AgentGates execution still
+# selects exactly one card via `--device-id`; this key only seeds the campaign's
+# candidate order, and the Adapter ignores its value. Listing an id here does
+# not authorize it: `devices.allowed_npu_devices` in config.toml remains
+# authoritative, and submit refuses anything outside it. Empty = no pool.
+TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS=
+
+# ---------------------------------------------------------------------------
 # Toolchain — host-local CANN & Conda
 # ---------------------------------------------------------------------------
 # Required: absolute host path to CANN `set_env.sh` (e.g. <cann-root>/cann-9.3.0/set_env.sh).
