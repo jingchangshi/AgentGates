@@ -53,6 +53,8 @@ OPTIONAL_AGENT_LLM_KEYS = (
     "TILEFOUNDRY_NPU_LLM_MAX_CONCURRENCY",
     "TILEFOUNDRY_NPU_LLM_EXPLOIT_TIMEOUT_SEC",
     "TILEFOUNDRY_NPU_LLM_REASONING_TIMEOUT_SEC",
+    "TILEFOUNDRY_NPU_LLM_STARTUP_TIMEOUT_SEC",
+    "TILEFOUNDRY_NPU_LLM_IDLE_STALL_TIMEOUT_SEC",
     "TILEFOUNDRY_NPU_LLM_CLI_BIN",
     "TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE",
     "TILEFOUNDRY_NPU_AGY_BIN",
@@ -62,6 +64,9 @@ OPTIONAL_AGENT_LLM_KEYS = (
     "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
     "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
 )
+
+PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+OPTIONAL_PROXY_KEYS = tuple(f"TILEFOUNDRY_NPU_LLM_{key}" for key in PROXY_KEYS)
 
 TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CANN_SETUP",
@@ -90,6 +95,8 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN",
     "TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT",
     *OPTIONAL_AGENT_LLM_KEYS,
+    *OPTIONAL_PROXY_KEYS,
+    "TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT",
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
@@ -104,7 +111,9 @@ OPTIONAL_REPO_AND_PYTHON_KEYS = (
     "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
 
-OPTIONAL_FORWARDED_KEYS = OPTIONAL_REPO_AND_PYTHON_KEYS + OPTIONAL_AGENT_LLM_KEYS
+OPTIONAL_FORWARDED_KEYS = (
+    OPTIONAL_REPO_AND_PYTHON_KEYS + OPTIONAL_AGENT_LLM_KEYS + OPTIONAL_PROXY_KEYS
+)
 
 OPTIONAL_ABS_PATH_KEYS = (
     "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE",
@@ -207,7 +216,7 @@ FAST_REQUEST_LEGACY_ENV = "TF_SURROGATE_BATCH_REQUEST"
 FAST_MICRO_PROBE_LEGACY_ENV = "TF_MICRO_PROBE_REQUEST"
 FAST_REQUEST_SCHEMA = "tilefoundry-fast-request/v1"
 FAST_RESPONSE_SCHEMA = "tilefoundry-fast-response/v1"
-FAST_REQUEST_MODES = ("batch", "profile")
+FAST_REQUEST_MODES = ("batch", "profile", "micro_probe")
 FAST_RESPONSE_STATUSES = (
     "ok",
     "candidate_failure",
@@ -218,6 +227,7 @@ FAST_REQUEST_MAX_BYTES = 4 << 20
 FAST_RESPONSE_MAX_BYTES = 64 << 20
 FAST_REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
 FAST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+FAST_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 FAST_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 FAST_REQUEST_COMMON_KEYS = (
     "schema",
@@ -229,6 +239,23 @@ FAST_REQUEST_COMMON_KEYS = (
     "require_all_passed",
 )
 FAST_ANCHOR_KEYS = ("task", "case_num", "regime_tag", "ref_perf_us", "t_hw_us")
+FAST_PROBE_KEYS = (
+    "probe_id",
+    "probe_kind",
+    "factory_name",
+    "line_count_baseline",
+    "line_count_optimized",
+    "tensor_shape",
+    "tensor_dtype",
+    "min_speedup",
+)
+FAST_PROBE_CANDIDATE_IDS = ("baseline", "optimized")
+FAST_PROBE_METRIC_KEYS = (
+    "baseline_dur_us",
+    "optimized_dur_us",
+    "speedup",
+    "numerical_ok",
+)
 FAST_COVERAGE_KEYS = (
     "expected_candidates",
     "evaluated_candidates",
@@ -1383,6 +1410,19 @@ class FastCandidate(NamedTuple):
     sha256: str
 
 
+class FastProbe(NamedTuple):
+    """Validated micro-probe specification carried by a typed fast request."""
+
+    probe_id: str
+    probe_kind: str
+    factory_name: str
+    line_count_baseline: int
+    line_count_optimized: int
+    tensor_shape: tuple[int, ...]
+    tensor_dtype: str
+    min_speedup: float
+
+
 class FastRequest(NamedTuple):
     """Validated, immutable snapshot identity of one typed fast request."""
 
@@ -1396,6 +1436,7 @@ class FastRequest(NamedTuple):
     response_relative: str
     candidates: tuple[FastCandidate, ...]
     profile_cases: tuple[tuple[str, str, tuple[int, ...]], ...]
+    probe: FastProbe | None = None
 
 
 def _fast_path(source: Path, raw: object, field: str) -> tuple[str, Path]:
@@ -1573,6 +1614,48 @@ def _fast_anchor(value: object, *, context: str) -> None:
             raise BridgeError(f"fast request {context}.{field} must be a number")
 
 
+def _fast_probe(value: object, *, context: str) -> FastProbe:
+    """Narrow one micro-probe specification declared by a typed fast request."""
+    row = _fast_object(value, context=context, required=FAST_PROBE_KEYS)
+    probe_id = _fast_text(row["probe_id"], field=f"{context}.probe_id")
+    probe_kind = _fast_text(row["probe_kind"], field=f"{context}.probe_kind")
+    factory_name = row["factory_name"]
+    if not isinstance(factory_name, str) or not FAST_IDENTIFIER_RE.fullmatch(factory_name):
+        raise BridgeError(f"fast request {context}.factory_name must be a Python identifier")
+    tensor_dtype = _fast_text(row["tensor_dtype"], field=f"{context}.tensor_dtype")
+    shape = row["tensor_shape"]
+    if not isinstance(shape, list) or not 1 <= len(shape) <= 8:
+        raise BridgeError(f"fast request {context}.tensor_shape must list 1 to 8 dimensions")
+    dims = tuple(
+        _fast_int(dim, field=f"{context}.tensor_shape[{index}]", minimum=1)
+        for index, dim in enumerate(shape)
+    )
+    min_speedup = row["min_speedup"]
+    if (
+        isinstance(min_speedup, bool)
+        or not isinstance(min_speedup, (int, float))
+        or not math.isfinite(min_speedup)
+        or min_speedup <= 0.0
+    ):
+        raise BridgeError(
+            f"fast request {context}.min_speedup must be a finite positive number"
+        )
+    return FastProbe(
+        probe_id=probe_id,
+        probe_kind=probe_kind,
+        factory_name=factory_name,
+        line_count_baseline=_fast_int(
+            row["line_count_baseline"], field=f"{context}.line_count_baseline", minimum=0
+        ),
+        line_count_optimized=_fast_int(
+            row["line_count_optimized"], field=f"{context}.line_count_optimized", minimum=0
+        ),
+        tensor_shape=dims,
+        tensor_dtype=tensor_dtype,
+        min_speedup=float(min_speedup),
+    )
+
+
 def _fast_pair() -> tuple[str, str] | None:
     """Read the engine-published dynamic target/candidate pair, if any."""
     target = (os.environ.get(L3_TARGET_REQUEST_ENV) or "").strip()
@@ -1657,7 +1740,7 @@ def _load_fast_request(
         )
         if request.get("msprof_targets") not in (None, []):
             raise BridgeError("fast batch request must not declare msprof_targets")
-    else:
+    elif mode == "profile":
         request = _fast_object(
             payload,
             context="request",
@@ -1666,6 +1749,12 @@ def _load_fast_request(
         )
         if request.get("batches") not in (None, []):
             raise BridgeError("fast profile request must not declare batches")
+    else:
+        request = _fast_object(
+            payload,
+            context="request",
+            required=(*FAST_REQUEST_COMMON_KEYS, "probe", "candidates"),
+        )
     if request["schema"] != FAST_REQUEST_SCHEMA:
         raise BridgeError(
             f"fast request schema must be {FAST_REQUEST_SCHEMA}: {request['schema']!r}"
@@ -1752,6 +1841,56 @@ def _load_fast_request(
             response_relative=response_relative,
             candidates=tuple(candidates),
             profile_cases=(),
+        )
+
+    if mode == "micro_probe":
+        probe = _fast_probe(request["probe"], context="probe")
+        raw_candidates = request["candidates"]
+        if not isinstance(raw_candidates, list) or len(raw_candidates) != len(
+            FAST_PROBE_CANDIDATE_IDS
+        ):
+            raise BridgeError(
+                "fast request micro_probe candidates must declare exactly "
+                + " and ".join(FAST_PROBE_CANDIDATE_IDS)
+            )
+        probe_candidates: list[FastCandidate] = []
+        for index, raw_candidate in enumerate(raw_candidates):
+            context = f"candidates[{index}]"
+            row = _fast_candidate(
+                raw_candidate,
+                source=source,
+                candidates_prefix=candidates_prefix,
+                operator="micro_probe",
+                context=context,
+            )
+            if row.candidate_id not in FAST_PROBE_CANDIDATE_IDS:
+                raise BridgeError(
+                    f"fast request {context}.candidate_id must be one of "
+                    + ", ".join(FAST_PROBE_CANDIDATE_IDS)
+                    + f": {row.candidate_id!r}"
+                )
+            if stat.S_IMODE((source / row.relative_path).stat().st_mode) & 0o222:
+                raise BridgeError(
+                    f"fast request {context}.module_path must be read-only: "
+                    f"{row.relative_path}"
+                )
+            probe_candidates.append(row)
+        if {row.candidate_id for row in probe_candidates} != set(FAST_PROBE_CANDIDATE_IDS):
+            raise BridgeError(
+                "fast request micro_probe candidates must declare both baseline and optimized"
+            )
+        return FastRequest(
+            request_id=request_id,
+            mode=mode,
+            path=path,
+            relative_path=relative_path,
+            sha256=digest,
+            raw=raw,
+            response_path=response_path,
+            response_relative=response_relative,
+            candidates=tuple(probe_candidates),
+            profile_cases=(),
+            probe=probe,
         )
 
     raw_targets = request["msprof_targets"]
@@ -1919,6 +2058,38 @@ def _fast_response_coverage(
     return failures, coverage
 
 
+def _fast_response_micro_probe(
+    fast_request: FastRequest, payload: dict[str, object]
+) -> list[str]:
+    """Require one probe result whose identity and metrics match the request."""
+    probe = fast_request.probe
+    assert probe is not None
+    row = payload.get("micro_probe")
+    if not isinstance(row, dict):
+        return ["FAST_RESPONSE_MICRO_PROBE_MISSING"]
+    if set(row) != {"probe_id", "metrics"}:
+        return ["FAST_RESPONSE_MICRO_PROBE_INVALID"]
+    failures: list[str] = []
+    if row["probe_id"] != probe.probe_id:
+        failures.append("FAST_RESPONSE_MICRO_PROBE_ID")
+    metrics = row["metrics"]
+    if not isinstance(metrics, dict) or not all(
+        isinstance(key, str) for key in metrics
+    ):
+        return [*failures, "FAST_RESPONSE_MICRO_PROBE_METRICS_INVALID"]
+    for key, value in metrics.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            failures.append(f"FAST_RESPONSE_MICRO_PROBE_METRIC_INVALID:{key}")
+    for key in FAST_PROBE_METRIC_KEYS:
+        if key not in metrics:
+            failures.append(f"FAST_RESPONSE_MICRO_PROBE_METRIC_MISSING:{key}")
+    return failures
+
+
 def _fast_response_producers(
     fast_request: FastRequest, payload: dict[str, object]
 ) -> list[str]:
@@ -1947,6 +2118,9 @@ def _fast_response_producers(
                     f"FAST_RESPONSE_CANDIDATE_EXTRA:{operator}:{candidate_id}"
                 )
         return failures
+
+    if fast_request.mode == "micro_probe":
+        return _fast_response_micro_probe(fast_request, payload)
 
     telemetry = payload.get("msprof_telemetry")
     if not isinstance(telemetry, dict):
@@ -2176,6 +2350,41 @@ def _device_occupancy(device: str) -> str:
 
 def _quarantine_path(lease_path: str | Path) -> Path:
     return Path(f"{lease_path}{QUARANTINE_SUFFIX}")
+
+
+def _l4_idle_preflight(device: str, *, confirmations: int) -> dict:
+    """Refuse official L4 timing while another process holds the leased card."""
+    streak = 0
+    processes: list[dict[str, str]] = []
+    npu_id = 0
+    for attempt in range(1, confirmations + 1):
+        try:
+            processes, npu_id = adapter_runtime.processes_on(int(device))
+        except adapter_runtime.BlockedEnv as exc:
+            raise BridgeError(
+                f"L4 idle preflight could not determine device occupancy: {exc}",
+                category="occupancy",
+                occupancy="unknown",
+            ) from exc
+        if not processes:
+            return {
+                "npuId": npu_id,
+                "occupancy": "free",
+                "attempts": attempt,
+                "confirmations": confirmations,
+            }
+        streak += 1
+        if streak < confirmations:
+            time.sleep(HEALTH_PROBE_INTERVAL_SECONDS)
+    summary = ", ".join(
+        f"pid={row.get('pid')}({row.get('name')})" for row in processes[:6]
+    )
+    raise BridgeError(
+        "official L4 timing requires an idle card: external process(es) "
+        f"{summary} remained on NPU {npu_id} for {streak} consecutive probes",
+        category="occupancy",
+        occupancy=f"shared({len(processes)})",
+    )
 
 
 def _process_identity(pid: int) -> dict | None:
@@ -2537,6 +2746,7 @@ HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
 HEALTH_PROBE_FAILURE_LIMIT = 3
 HEALTH_FATAL_CONFIRMATIONS = 2
 HEALTH_EXTERNAL_CONFIRMATIONS = 2
+L4_EXTERNAL_PROBE_LIMIT_DEFAULT = 3
 HEALTH_MISSING_CONFIRMATIONS = 2
 HEALTH_PID_RESCAN_SECONDS = 1.0
 HEALTH_CLEANUP_GRACE_SECONDS = 2.0
@@ -3044,6 +3254,7 @@ class _RunHealthMonitor:
         mode: str,
         token: str,
         phase_getter: Callable[[], str | None] | None = None,
+        external_limit: int | None = None,
     ) -> None:
         self.device = device
         self.mode = mode
@@ -3054,7 +3265,14 @@ class _RunHealthMonitor:
         self.probe_timeout = max(0.05, float(HEALTH_PROBE_TIMEOUT_SECONDS))
         self.failure_limit = max(1, int(HEALTH_PROBE_FAILURE_LIMIT))
         self.fatal_limit = max(1, int(HEALTH_FATAL_CONFIRMATIONS))
-        self.external_limit = max(1, int(HEALTH_EXTERNAL_CONFIRMATIONS))
+        self.external_limit = max(
+            1,
+            int(
+                HEALTH_EXTERNAL_CONFIRMATIONS
+                if external_limit is None
+                else external_limit
+            ),
+        )
         self.missing_limit = max(1, int(HEALTH_MISSING_CONFIRMATIONS))
         self.started_at = _timestamp()
         self.last_scan = 0.0
@@ -3427,6 +3645,7 @@ def _run_host_bash_monitored(
     monitor_sink: dict,
     phase_getter: Callable[[], str | None] | None = None,
     lease_path: str | None = None,
+    external_probe_limit: int | None = None,
     **kwargs,
 ) -> subprocess.CompletedProcess[str]:
     """Run one existing host command while sampling this run's health.
@@ -3447,6 +3666,7 @@ def _run_host_bash_monitored(
         mode=mode,
         token=token,
         phase_getter=phase_getter,
+        external_limit=external_probe_limit,
     )
     resolved_lease = lease_path
     if resolved_lease is None:
@@ -3759,6 +3979,30 @@ def _inspect_conda_cannbench_env(
     return info
 
 
+def _forward_proxy_env(
+    run_env: dict[str, str],
+    values: dict[str, str],
+    *,
+    include_agent_llm: bool,
+) -> None:
+    """Forward explicitly configured proxies in both variable cases."""
+    for key in PROXY_KEYS:
+        scoped = f"TILEFOUNDRY_NPU_LLM_{key}"
+        scoped_value = (values.get(scoped) or "").strip()
+        value = scoped_value if include_agent_llm else ""
+        value = (
+            value
+            or (run_env.get(key) or "").strip()
+            or (run_env.get(key.lower()) or "").strip()
+        )
+        if not value:
+            continue
+        run_env[key] = value
+        run_env[key.lower()] = value
+        if scoped_value and include_agent_llm:
+            run_env[scoped] = scoped_value
+
+
 def _forward_optional_env(
     run_env: dict[str, str],
     values: dict[str, str],
@@ -3775,8 +4019,9 @@ def _forward_optional_env(
         if val:
             run_env[key] = val
     if not include_agent_llm:
-        for key in OPTIONAL_AGENT_LLM_KEYS:
+        for key in (*OPTIONAL_AGENT_LLM_KEYS, *OPTIONAL_PROXY_KEYS):
             run_env.pop(key, None)
+    _forward_proxy_env(run_env, values, include_agent_llm=include_agent_llm)
 
 
 def _validate_optional_agent_keys(values: dict[str, str]) -> None:
@@ -3808,6 +4053,26 @@ def l3_timeout(values: dict[str, str]) -> float:
     return value
 
 
+def l4_external_probe_limit(values: dict[str, str]) -> int:
+    """Resolve how many consecutive external-occupancy probes block L4 timing."""
+    raw = (values.get("TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT") or "").strip()
+    if not raw:
+        return L4_EXTERNAL_PROBE_LIMIT_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT must be an integer: "
+            f"{raw!r}"
+        ) from exc
+    if value < 1:
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT must be at least 1: "
+            f"{raw!r}"
+        )
+    return value
+
+
 def check_config(
     *,
     check_device: bool = False,
@@ -3824,6 +4089,7 @@ def check_config(
         _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK")
         _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
         l3_timeout(values)
+        l4_external_probe_limit(values)
         cann = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
         if not cann.is_file():
             raise BridgeError(f"TILEFOUNDRY_NPU_CANN_SETUP does not exist: {cann}")
@@ -4265,8 +4531,11 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
             )
         fast_repo = cannbench_repo(values)
         fast_caches = _fast_surrogate_caches(work_root(values, source, fast_repo))
-    profile_mode = fast_request is not None and fast_request.mode == "profile"
-    msprof_lock = _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK") or profile_mode
+    msprof_mode = fast_request is not None and fast_request.mode in (
+        "profile",
+        "micro_probe",
+    )
+    msprof_lock = _binary_flag(values, "TILEFOUNDRY_NPU_MSPROF_LOCK") or msprof_mode
     cache_enabled = _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
 
     started = time.monotonic()
@@ -5528,6 +5797,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
+    external_probe_limit = l4_external_probe_limit(values)
     reports_root = wroot / "reports"
     report_epoch = time.time()
 
@@ -5598,6 +5868,11 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                                         f"{utils_dir}; run tilefoundry-npu-cannbench-prep first"
                                     )
 
+                            with _phase(phases, "idle-preflight"):
+                                obs["idlePreflight"] = _l4_idle_preflight(
+                                    device, confirmations=external_probe_limit
+                                )
+
                             runner_cfg = {
                                 "repo": str(repo),
                                 "source": str(source),
@@ -5660,6 +5935,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                                             mode="l4",
                                             device=device,
                                             monitor_sink=health_sink,
+                                            external_probe_limit=external_probe_limit,
                                             phase_getter=(
                                                 lambda: phases[-1]["name"] if phases else None
                                             ),

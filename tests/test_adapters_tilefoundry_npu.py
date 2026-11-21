@@ -1109,6 +1109,89 @@ class OptionalAgentKeysCase(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_scoped_proxy_keys_forward_in_both_cases_to_agent_children(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            scoped = {
+                "TILEFOUNDRY_NPU_LLM_HTTP_PROXY": "http://scoped-http.invalid:3128",
+                "TILEFOUNDRY_NPU_LLM_HTTPS_PROXY": "http://scoped-https.invalid:3128",
+                "TILEFOUNDRY_NPU_LLM_ALL_PROXY": "socks5://scoped-all.invalid:1080",
+                "TILEFOUNDRY_NPU_LLM_NO_PROXY": "localhost,127.0.0.1",
+            }
+            self.write_env(**scoped)
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                values = GATE.machine_values()
+            self.assertEqual({key: values[key] for key in scoped}, scoped)
+
+            agent_env = {"HTTPS_PROXY": "http://inherited.invalid:8080", "no_proxy": "internal"}
+            GATE._forward_optional_env(agent_env, values, include_agent_llm=True)
+            for key, value in scoped.items():
+                name = key.removeprefix("TILEFOUNDRY_NPU_LLM_")
+                self.assertEqual(agent_env[name], value)
+                self.assertEqual(agent_env[name.lower()], value)
+
+            cpu_env = {"HTTPS_PROXY": "http://inherited.invalid:8080"}
+            GATE._forward_optional_env(cpu_env, values, include_agent_llm=False)
+            self.assertTrue(scoped.keys().isdisjoint(cpu_env))
+            self.assertNotIn("HTTP_PROXY", cpu_env)
+            self.assertEqual(cpu_env["HTTPS_PROXY"], "http://inherited.invalid:8080")
+            self.assertEqual(cpu_env["https_proxy"], "http://inherited.invalid:8080")
+        finally:
+            os.chdir(old_cwd)
+
+    def test_streaming_watchdog_keys_load_and_forward_to_agent_children(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            keys = {
+                "TILEFOUNDRY_NPU_LLM_STARTUP_TIMEOUT_SEC": "45",
+                "TILEFOUNDRY_NPU_LLM_IDLE_STALL_TIMEOUT_SEC": "75",
+            }
+            self.write_env(**keys)
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                values = GATE.machine_values()
+            self.assertEqual({key: values[key] for key in keys}, keys)
+
+            agent_env = {}
+            GATE._forward_optional_env(agent_env, values, include_agent_llm=True)
+            for key, value in keys.items():
+                self.assertEqual(agent_env[key], value)
+
+            cpu_env = {}
+            GATE._forward_optional_env(cpu_env, values, include_agent_llm=False)
+            self.assertTrue(keys.keys().isdisjoint(cpu_env))
+        finally:
+            os.chdir(old_cwd)
+
+    def test_l4_external_probe_limit_defaults_and_rejects_bad_values(self):
+        self.assertEqual(GATE.l4_external_probe_limit({}), 3)
+        self.assertEqual(
+            GATE.l4_external_probe_limit(
+                {"TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT": "5"}
+            ),
+            5,
+        )
+        for raw in ("0", "-2", "three"):
+            with self.subTest(value=raw):
+                with self.assertRaises(GATE.BridgeError):
+                    GATE.l4_external_probe_limit(
+                        {"TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT": raw}
+                    )
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            self.write_env(TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT="0")
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    GATE.main(["--check-config"])
+                self.assertEqual(caught.exception.code, 75)
+        finally:
+            os.chdir(old_cwd)
+
+
 
 class CannbenchRemoteCase(unittest.TestCase):
     """Remote CANNBench submission validates MCP rules, packages compliant ZIPs, and submits via MCP."""

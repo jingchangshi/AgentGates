@@ -270,6 +270,87 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertFalse(sink["cleanup"]["incomplete"])
         print(f"runtime-health external-occupancy-to-exit measured={measured:.3f}s")
 
+    def test_configured_external_probe_limit_aborts_after_one_probe(self):
+        self.external = subprocess.Popen(
+            ["/bin/sleep", "30"],
+            start_new_session=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        external_row = {
+            "ok": True,
+            "processTableSeen": True,
+            "processes": [{
+                "pid": str(self.external.pid),
+                "name": "sleep",
+                "memoryMb": "1",
+            }],
+            "error": None,
+        }
+        processes = self._sequence(
+            [self._free_processes(), external_row], external_row
+        )
+        health = self._sequence([_row("ok", "OK")], _row("ok", "OK"))
+        sink: dict = {}
+        with patch.object(GATE, "_device_occupancy", return_value="free"), \
+                patch.object(
+                    GATE, "_probe_npu_mapping",
+                    return_value={"ok": True, "npuId": 7, "error": None},
+                ), \
+                patch.object(GATE, "_probe_device_health", side_effect=health), \
+                patch.object(GATE, "_probe_device_processes", side_effect=processes), \
+                self.lease_environment():
+            with self.assertRaises(GATE.BridgeError) as caught:
+                with GATE._open_device_window("1", wait_seconds=0, require_idle=True):
+                    GATE._run_host_bash_monitored(
+                        "sleep 300",
+                        cwd=self.root,
+                        env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+                        cann_setup=None,
+                        conda_sh=None,
+                        conda_env=None,
+                        timeout=30,
+                        isolate_temp=True,
+                        mode="l4",
+                        device="1",
+                        monitor_sink=sink,
+                        external_probe_limit=1,
+                        phase_getter=lambda: "workload",
+                    )
+        self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+        self.assertEqual(sink["abort"]["kind"], "external_occupancy")
+        self.assertIn("for 1 consecutive probes", str(caught.exception))
+        self.assertIsNone(self.external.poll(), "an unrelated tenant process was killed")
+
+    def test_l4_idle_preflight_accepts_a_consecutively_free_card(self):
+        with patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 7)):
+            observed = GATE._l4_idle_preflight("1", confirmations=3)
+        self.assertEqual(
+            observed,
+            {"npuId": 7, "occupancy": "free", "attempts": 1, "confirmations": 3},
+        )
+
+    def test_l4_idle_preflight_refuses_an_occupied_card(self):
+        occupied = ([{"pid": "4242", "name": "other"}], 7)
+        with patch.object(GATE.adapter_runtime, "processes_on", return_value=occupied), \
+                patch.object(GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 0.01):
+            with self.assertRaises(GATE.BridgeError) as caught:
+                GATE._l4_idle_preflight("1", confirmations=3)
+        self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+        self.assertEqual(getattr(caught.exception, "occupancy", None), "shared(1)")
+        self.assertIn("pid=4242(other)", str(caught.exception))
+        self.assertIn("3 consecutive probes", str(caught.exception))
+
+    def test_l4_idle_preflight_reports_unobservable_occupancy(self):
+        def blocked(_device):
+            raise GATE.adapter_runtime.BlockedEnv("npu-smi unavailable")
+
+        with patch.object(GATE.adapter_runtime, "processes_on", side_effect=blocked):
+            with self.assertRaises(GATE.BridgeError) as caught:
+                GATE._l4_idle_preflight("1", confirmations=3)
+        self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+        self.assertEqual(getattr(caught.exception, "occupancy", None), "unknown")
+        self.assertIn("could not determine device occupancy", str(caught.exception))
+
     def test_probe_self_hang_is_bounded_and_reported_as_unavailable(self):
         result = GATE._bounded_host_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],

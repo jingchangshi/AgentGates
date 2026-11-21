@@ -20,6 +20,8 @@ SCRIPT = ADAPTER / "scripts" / "tilefoundry_host_gate.py"
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
 PROFILE_ID = "fedcba9876543210fedcba9876543210"
+PROBE_REQUEST_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+PROBE_ID = "probe_unit_0"
 
 
 def load_script(path, name):
@@ -130,6 +132,49 @@ def test_surrogate_anchor_batch_npu() -> None:
         "expected_msprof_targets": expected,
         "observed_msprof_targets": expected,
     }
+    _write(response, payload)
+"""
+
+MICRO_PROBE_RESPONSE = """\
+def test_surrogate_anchor_batch_npu() -> None:
+    request_path = Path(os.environ["TF_FAST_REQUEST"])
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    source = Path(os.environ["TF_FAST_SOURCE_ROOT"])
+    response = source / request["response_path"]
+    payload = _envelope(request, request_path, "ok")
+    payload["candidates"]["micro_probe"] = {}
+    for candidate in request["candidates"]:
+        module = source / candidate["module_path"]
+        payload["candidates"]["micro_probe"][candidate["candidate_id"]] = {
+            "module_path": candidate["module_path"],
+            "sha256": candidate["sha256"],
+            "post_sha256": _sha(module),
+        }
+    payload["coverage"] = {
+        "expected_candidates": len(request["candidates"]),
+        "evaluated_candidates": len(request["candidates"]),
+        "expected_msprof_targets": 0,
+        "observed_msprof_targets": 0,
+    }
+    payload["micro_probe"] = {
+        "probe_id": request["probe"]["probe_id"],
+        "metrics": {
+            "baseline_dur_us": 10.0,
+            "optimized_dur_us": 8.0,
+            "speedup": 1.25,
+            "numerical_ok": 1.0,
+        },
+    }
+    _write(response, payload)
+"""
+
+MICRO_PROBE_MISSING_METRIC_RESPONSE = MICRO_PROBE_RESPONSE + """\
+    del payload["micro_probe"]["metrics"]["speedup"]
+    _write(response, payload)
+"""
+
+MICRO_PROBE_WRONG_ID_RESPONSE = MICRO_PROBE_RESPONSE + """\
+    payload["micro_probe"]["probe_id"] = "probe_other"
     _write(response, payload)
 """
 
@@ -293,6 +338,8 @@ class FastRequestCase(unittest.TestCase):
         relative = f"build/agent_gates/fast/{request_id}/candidates/{name}"
         path = self.src / relative
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.chmod(0o644)
         path.write_text(source, encoding="utf-8")
         return relative, path
 
@@ -388,6 +435,56 @@ class FastRequestCase(unittest.TestCase):
                 }
             ],
         }
+
+    def micro_probe_request(
+        self,
+        *,
+        request_id: str = PROBE_REQUEST_ID,
+        probe: dict | None = None,
+        candidate_ids: tuple[str, str] = ("baseline", "optimized"),
+        read_only: bool = True,
+    ) -> dict:
+        candidates = []
+        for candidate_id, body in zip(
+            candidate_ids,
+            ("def make_flywheel_probe():\n    return 1\n", "def make_flywheel_probe():\n    return 2\n"),
+        ):
+            relative, path = self.stage_candidate(
+                request_id, f"{candidate_id}.py", body
+            )
+            if read_only:
+                path.chmod(0o444)
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "module_path": relative,
+                    "sha256": self.candidate_sha(path),
+                }
+            )
+        payload = {
+            "schema": "tilefoundry-fast-request/v1",
+            "mode": "micro_probe",
+            "request_id": request_id,
+            "response_path": f"build/agent_gates/fast/{request_id}.response.json",
+            "warmup": 1,
+            "repeat": 1,
+            "require_all_passed": False,
+            "probe": probe
+            if probe is not None
+            else {
+                "probe_id": PROBE_ID,
+                "probe_kind": "stage_a",
+                "factory_name": "make_flywheel_probe",
+                "line_count_baseline": 12,
+                "line_count_optimized": 9,
+                "tensor_shape": [16, 32],
+                "tensor_dtype": "float16",
+                "min_speedup": 1.08,
+            },
+            "candidates": candidates,
+        }
+        self.probe_candidates = candidates
+        return payload
 
     def write_request(self, request_id: str, payload: dict) -> str:
         relative = f"build/agent_gates/fast/{request_id}.request.json"
@@ -669,6 +766,101 @@ class FastRequestCase(unittest.TestCase):
         self.assertTrue(obs["fastResponse"]["bound"])
         self.assertEqual(obs["fastCoverage"]["expected_msprof_targets"], 1)
         self.assertTrue((self.lock_root / ".msprof.lock").is_file())
+
+    def test_micro_probe_binds_staged_candidates_and_returns_metrics(self):
+        self.write_test_file(MICRO_PROBE_RESPONSE)
+        self.write_request(PROBE_REQUEST_ID, self.micro_probe_request())
+        with self._record_host_call() as calls:
+            rc, obs = self.run_fast(env=self.environment(PROBE_REQUEST_ID))
+        self.assertEqual(rc, 0)
+        self.assertEqual(obs["fastRequest"]["mode"], "micro_probe")
+        self.assertTrue(obs["fastResponse"]["bound"])
+        self.assertEqual(obs["fastResponse"]["status"], "ok")
+        self.assertEqual(obs["fastCoverage"]["expected_candidates"], 2)
+        self.assertEqual(obs["fastCoverage"]["evaluated_candidates"], 2)
+        self.assertEqual(obs["fastCoverage"]["expected_msprof_targets"], 0)
+        self.assertEqual(
+            [row["candidateId"] for row in obs["fastCandidates"]],
+            ["baseline", "optimized"],
+        )
+        self.assertTrue(all(row["stable"] for row in obs["fastCandidates"]))
+        self.assertNotIn("TF_MICRO_PROBE_REQUEST", calls[0][1])
+        self.assertTrue((self.lock_root / ".msprof.lock").is_file())
+
+    def test_micro_probe_rejects_writable_candidate_modules(self):
+        self.write_request(
+            PROBE_REQUEST_ID, self.micro_probe_request(read_only=False)
+        )
+        with self._in_source(), \
+                patch.dict(os.environ, self.environment(PROBE_REQUEST_ID), clear=True), \
+                patch.object(GATE.locking, "lock_root", return_value=self.lock_root):
+            with self.assertRaises(GATE.BridgeError) as caught:
+                GATE.run_device(GATE.machine_values(), 60.0, fast=True)
+        self.assertIn("must be read-only", str(caught.exception))
+
+    def test_micro_probe_requires_both_probe_candidates(self):
+        missing = self.micro_probe_request()
+        missing["candidates"] = missing["candidates"][:1]
+        duplicate = self.micro_probe_request()
+        duplicate["candidates"][1]["candidate_id"] = "baseline"
+        for label, payload in (("missing", missing), ("duplicate", duplicate)):
+            with self.subTest(case=label):
+                self.write_request(PROBE_REQUEST_ID, payload)
+                with self._in_source(), \
+                        patch.dict(
+                            os.environ,
+                            self.environment(PROBE_REQUEST_ID),
+                            clear=True,
+                        ), \
+                        patch.object(
+                            GATE.locking, "lock_root", return_value=self.lock_root
+                        ):
+                    with self.assertRaises(GATE.BridgeError):
+                        GATE.run_device(GATE.machine_values(), 60.0, fast=True)
+
+    def test_micro_probe_rejects_invalid_probe_fields(self):
+        valid = self.micro_probe_request()["probe"]
+        cases = {
+            "factory_name": {**valid, "factory_name": "not a name"},
+            "tensor_shape": {**valid, "tensor_shape": []},
+            "min_speedup": {**valid, "min_speedup": 0},
+            "extra_key": {**valid, "extra": 1},
+        }
+        for label, probe in cases.items():
+            with self.subTest(field=label):
+                self.write_request(
+                    PROBE_REQUEST_ID, self.micro_probe_request(probe=probe)
+                )
+                with self._in_source(), \
+                        patch.dict(
+                            os.environ,
+                            self.environment(PROBE_REQUEST_ID),
+                            clear=True,
+                        ), \
+                        patch.object(
+                            GATE.locking, "lock_root", return_value=self.lock_root
+                        ):
+                    with self.assertRaises(GATE.BridgeError):
+                        GATE.run_device(GATE.machine_values(), 60.0, fast=True)
+
+    def test_micro_probe_response_requires_core_metrics(self):
+        self.write_test_file(MICRO_PROBE_MISSING_METRIC_RESPONSE)
+        self.write_request(PROBE_REQUEST_ID, self.micro_probe_request())
+        rc, obs = self.run_fast(env=self.environment(PROBE_REQUEST_ID))
+        self.assertEqual(rc, 1)
+        self.assertFalse(obs["fastResponse"]["bound"])
+        self.assertIn(
+            "FAST_RESPONSE_MICRO_PROBE_METRIC_MISSING:speedup",
+            obs["fastBindingFailures"],
+        )
+        self.assertEqual(obs["failureCategory"], "infra")
+
+    def test_micro_probe_response_probe_id_must_match(self):
+        self.write_test_file(MICRO_PROBE_WRONG_ID_RESPONSE)
+        self.write_request(PROBE_REQUEST_ID, self.micro_probe_request())
+        rc, obs = self.run_fast(env=self.environment(PROBE_REQUEST_ID))
+        self.assertEqual(rc, 1)
+        self.assertIn("FAST_RESPONSE_MICRO_PROBE_ID", obs["fastBindingFailures"])
 
     def test_candidate_mutation_during_run_is_infrastructure(self):
         self.write_request(REQUEST_ID, self.batch_request())
