@@ -742,6 +742,106 @@ class CannbenchIntegrationCase(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_cannbench_runner_uses_per_run_isolated_tilelang_cache(self):
+        import subprocess
+        (self.repo / "tasks/level4/attention_residual/proto.yaml").write_text(
+            json.dumps({
+                "operator": {
+                    "name": "AttentionResidual",
+                    "schema": "attention_residual(Tensor x) -> Tensor",
+                }
+            }),
+            encoding="utf-8",
+        )
+        (self.repo / "tasks/level4/attention_residual/cases.yaml").write_text(
+            json.dumps({"cases": [{"case_id": "case_0"}]}),
+            encoding="utf-8",
+        )
+        (self.repo / "tasks/level4/attention_residual/golden.py").write_text(
+            "def attention_residual(x):\n    return x\n",
+            encoding="utf-8",
+        )
+        stub_yaml = self.root / "stub_yaml"
+        stub_yaml.mkdir()
+        (stub_yaml / "yaml.py").write_text(
+            "import json\n\ndef safe_load(text):\n    return json.loads(text)\n",
+            encoding="utf-8",
+        )
+        (self.repo / "src/kernel_eval/__init__.py").write_text("", encoding="utf-8")
+        capture_log = self.root / "captured_envs.jsonl"
+        (self.repo / "src/kernel_eval/staged_eval.py").write_text(
+            "import argparse, json, os, pathlib\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--reports-dir', required=True)\n"
+            "args, _ = p.parse_known_args()\n"
+            "cache_dir = pathlib.Path(os.environ['TILELANG_CACHE_DIR'])\n"
+            "marker_exists = (cache_dir / 'sentinel.txt').exists()\n"
+            "(cache_dir / 'sentinel.txt').write_text('warm', encoding='utf-8')\n"
+            "record = {\n"
+            "    'TILELANG_CACHE_DIR': str(cache_dir),\n"
+            "    'TILELANG_DISABLE_CACHE': os.environ.get('TILELANG_DISABLE_CACHE'),\n"
+            "    'TILELANG_KERNEL_CACHE_USE_LIB_STAMP': os.environ.get('TILELANG_KERNEL_CACHE_USE_LIB_STAMP'),\n"
+            "    'cache_dir_exists': cache_dir.is_dir(),\n"
+            "    'marker_existed_before': marker_exists,\n"
+            "}\n"
+            f"with open({str(capture_log)!r}, 'a', encoding='utf-8') as f:\n"
+            "    f.write(json.dumps(record) + '\\n')\n"
+            "rdir = pathlib.Path(args.reports_dir)\n"
+            "(rdir / 'official_final.json').write_text(json.dumps({\n"
+            "    'operators': [{'cases': [{'case_id': 'level4/attention_residual_case_0', 'status': 'success', 'accuracy': {'passed': True}, 'elapsed_us': 12.5, 'speedup': 1.1}]}],\n"
+            "    'overall_score': 90.0,\n"
+            "}), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        utils_dir = self.root / "utils_stub"
+        utils_dir.mkdir()
+        runner_py = self.root / "runner.py"
+        cfg_json = self.root / "runner_cfg.json"
+        runner_py.write_text(GATE.CANNBENCH_RUNNER, encoding="utf-8")
+        cfg_json.write_text(
+            json.dumps({
+                "repo": str(self.repo),
+                "source": str(self.src),
+                "utils_dir": str(utils_dir),
+                "reports_root": str(self.work_root / "reports"),
+                "device": "0",
+                "per_op_timeout": 120,
+                "pythonpath_parts": ["src"],
+                "tilelang_source": "",
+                "targets": [{
+                    "task": "level4/attention_residual",
+                    "candidate": "examples/ascend950pr_ops/attention_residual/kernels.py",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        stale_env = dict(os.environ)
+        stale_env["PYTHONPATH"] = str(stub_yaml)
+        stale_env["TILELANG_DISABLE_CACHE"] = "1"
+        stale_env["TILELANG_CACHE_DIR"] = str(self.root / "stale-shared-cache")
+        for _ in range(2):
+            completed = subprocess.run(
+                [sys.executable, str(runner_py), str(cfg_json)],
+                env=stale_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        rows = [json.loads(line) for line in capture_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            cache_path = Path(row["TILELANG_CACHE_DIR"])
+            self.assertEqual(cache_path.name, "tilelang-cache")
+            self.assertTrue(cache_path.parent.name.startswith("cannbench-tf-"))
+            self.assertNotEqual(str(cache_path), stale_env["TILELANG_CACHE_DIR"])
+            self.assertEqual(row["TILELANG_DISABLE_CACHE"], "0")
+            self.assertEqual(row["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"], "1")
+            self.assertTrue(row["cache_dir_exists"])
+            self.assertFalse(row["marker_existed_before"])
+        self.assertNotEqual(rows[0]["TILELANG_CACHE_DIR"], rows[1]["TILELANG_CACHE_DIR"])
+
 
 class TilelangReuseCase(unittest.TestCase):
     """Downstream TileLang reuse honors tilelang-npu build stamps and fails closed when stale."""
@@ -1163,6 +1263,55 @@ class OptionalAgentKeysCase(unittest.TestCase):
             cpu_env = {}
             GATE._forward_optional_env(cpu_env, values, include_agent_llm=False)
             self.assertTrue(keys.keys().isdisjoint(cpu_env))
+        finally:
+            os.chdir(old_cwd)
+
+    def test_503_resilience_keys_validate_and_forward_only_to_agent_children(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            keys = {
+                "TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL": "gemini-4-hydrogen-medium",
+                "TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "0",
+                "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "5.0,15.0,35.0,60.0",
+            }
+            self.write_env(**keys)
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                values = GATE.machine_values()
+            self.assertEqual({key: values[key] for key in keys}, keys)
+
+            agent_env = {}
+            GATE._forward_optional_env(agent_env, values, include_agent_llm=True)
+            for key, value in keys.items():
+                self.assertEqual(agent_env[key], value)
+
+            cpu_env = dict(keys)
+            GATE._forward_optional_env(cpu_env, values, include_agent_llm=False)
+            self.assertTrue(keys.keys().isdisjoint(cpu_env))
+
+            invalid_cases = (
+                {"TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL": '"   "'},
+                {"TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL": '"model one two"'},
+                {"TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "-1"},
+                {"TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "1.5"},
+                {"TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "four"},
+                {"TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": ","},
+                {"TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "1.0,,2.0"},
+                {"TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "-0.5,2.0"},
+                {"TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "nan,2.0"},
+                {"TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "inf"},
+                {"TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "fast"},
+            )
+            for bad in invalid_cases:
+                with self.subTest(bad=bad):
+                    self.write_env(**bad)
+                    with patch.dict(
+                        os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True
+                    ):
+                        with self.assertRaises(SystemExit) as caught:
+                            GATE.main(["--check-config"])
+                        self.assertEqual(caught.exception.code, 75)
         finally:
             os.chdir(old_cwd)
 

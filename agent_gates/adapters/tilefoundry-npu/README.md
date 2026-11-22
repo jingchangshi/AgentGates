@@ -115,6 +115,11 @@ conflicting exports in the launching environment):
 - `TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL`, `TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL`,
   `TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL`, and `TILEFOUNDRY_NPU_LLM_REPAIR_MODEL`
   choose model IDs for the four generation roles.
+- `TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL` (single-token model ID),
+  `TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES` (non-negative integer), and
+  `TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC` (comma-separated non-negative finite
+  floats) configure 503 capacity retry and fallback model resilience for agent
+  LLM calls.
 - `TILEFOUNDRY_NPU_LLM_MAX_EFFORT` sets the effort cap.
   `TILEFOUNDRY_NPU_LLM_EFFORT_CAP` is a fallback when `MAX_EFFORT` is unset.
   Set `TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT=1` for an HTTP endpoint that
@@ -373,7 +378,11 @@ wrapper, so the control process loads no project Python startup hook. The
 official workload runs with `-E -s` and rebuilds the target `PYTHONPATH` from
 activation-derived CANN paths plus the adapter-known staging, CANNBench,
 TileLang, and TileFoundry source paths; inherited project paths and `PYTHON*`
-startup hooks never reach the benchmark child. The official gate still requires
+startup hooks never reach the benchmark child. Each L4 target run also exports a
+brand-new per-run `TILELANG_CACHE_DIR` under its temporary stage directory with
+`TILELANG_KERNEL_CACHE_USE_LIB_STAMP=1` and `TILELANG_DISABLE_CACHE=0`,
+preventing cross-run cache contamination while enabling intra-run Stage-2 to
+Stage-3 kernel reuse. The official gate still requires
 `officialReportValid`, `allCasesPassed`, and `allTimingsValid`; upstream
 `verify-requirements` remains responsible for the `satisfied: true` check.
 

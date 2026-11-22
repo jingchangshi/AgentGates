@@ -46,6 +46,9 @@ OPTIONAL_AGENT_LLM_KEYS = (
     "TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL",
     "TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL",
     "TILEFOUNDRY_NPU_LLM_REPAIR_MODEL",
+    "TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL",
+    "TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES",
+    "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC",
     "TILEFOUNDRY_NPU_LLM_MAX_EFFORT",
     "TILEFOUNDRY_NPU_LLM_EFFORT_CAP",
     "TILEFOUNDRY_NPU_LLM_PASS_REASONING_EFFORT",
@@ -468,6 +471,8 @@ for index, item in enumerate(cfg["targets"]):
 
     with tempfile.TemporaryDirectory(prefix="cannbench-tf-") as temp:
         stage = pathlib.Path(temp)
+        l4_cache = stage / "tilelang-cache"
+        l4_cache.mkdir()
         staged_task = stage / "tasks" / task
         staged_task.mkdir(parents=True)
         for fname in ("golden.py", "cases.yaml", "proto.yaml"):
@@ -484,7 +489,9 @@ for index, item in enumerate(cfg["targets"]):
         # a project hook cannot reach the official workload.
         activation_pythonpath = env.pop("AGENT_GATES_ACTIVATION_PYTHONPATH", "")
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(cfg["device"])
-        env["TILELANG_DISABLE_CACHE"] = "1"
+        env["TILELANG_CACHE_DIR"] = str(l4_cache)
+        env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
+        env["TILELANG_DISABLE_CACHE"] = "0"
         env["PYTHONNOUSERSITE"] = "1"
         for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
             env.pop(name, None)
@@ -4031,6 +4038,44 @@ def _validate_optional_agent_keys(values: dict[str, str]) -> None:
         raise BridgeError(
             f"TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY must be a positive integer: {conc!r}"
         )
+    raw_fallback = values.get("TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL") or ""
+    fallback_model = raw_fallback.strip()
+    if raw_fallback and not fallback_model:
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL must not be whitespace-only"
+        )
+    if fallback_model and any(ch.isspace() for ch in fallback_model):
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL must be a single-token model ID: "
+            f"{fallback_model!r}"
+        )
+    raw_503_retries = (values.get("TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES") or "").strip()
+    if raw_503_retries and not re.fullmatch(r"[0-9]+", raw_503_retries):
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES must be a non-negative integer: "
+            f"{raw_503_retries!r}"
+        )
+    raw_503_backoff = (values.get("TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC") or "").strip()
+    if raw_503_backoff:
+        parts = [part.strip() for part in raw_503_backoff.split(",")]
+        if not parts or any(not part for part in parts):
+            raise BridgeError(
+                "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC must be a comma-separated list "
+                f"of non-negative finite floats: {raw_503_backoff!r}"
+            )
+        for part in parts:
+            try:
+                val = float(part)
+            except ValueError as exc:
+                raise BridgeError(
+                    "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC must contain only "
+                    f"non-negative finite floats: {raw_503_backoff!r}"
+                ) from exc
+            if not math.isfinite(val) or val < 0.0:
+                raise BridgeError(
+                    "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC entries must be "
+                    f"non-negative finite floats: {raw_503_backoff!r}"
+                )
     for key in OPTIONAL_ABS_PATH_KEYS:
         val = (values.get(key) or "").strip()
         if val and not Path(val).is_absolute():
@@ -4562,6 +4607,8 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                 run_env["PYTHONDONTWRITEBYTECODE"] = "1"
                 run_env["PYTHONNOUSERSITE"] = "1"
                 run_env["TILELANG_DISABLE_CACHE"] = "0" if cache_enabled else "1"
+                if cache_enabled:
+                    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
                 shim = (run_env.get("TF_SURROGATE_SHIM_DIR") or "").strip() if cache_enabled else ""
                 run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity, shim=shim)
                 if tl_identity is not None:

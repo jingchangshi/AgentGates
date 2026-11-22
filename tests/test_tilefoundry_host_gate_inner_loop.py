@@ -259,6 +259,7 @@ class DeviceModeCase(unittest.TestCase):
         self.assertEqual(rc, 0)
         env = calls[0][1]
         self.assertEqual(env["TILELANG_DISABLE_CACHE"], "0")
+        self.assertEqual(env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"], "1")
         self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(self.shim))
         self.assertEqual(env["TF_SURROGATE_TL_CACHE_DIR"], str(self.tl_cache))
 
