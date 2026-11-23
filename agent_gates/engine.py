@@ -429,7 +429,8 @@ def device_window(observations, lease):
 
 
 class Engine:
-    def __init__(self, *, registry=None, store=None, lock_root=None, device_lock_root=None):
+    def __init__(self, *, registry=None, store=None, lock_root=None, device_lock_root=None,
+                 build_lock_timeout: float | None = None):
         self.registry = registry or Registry()
         self.store = store or EvidenceStore()
         self.lock_root = lock_root
@@ -438,6 +439,7 @@ class Engine:
         # both resolve the same canonical root (or its one environment override)
         # so two processes cannot drive one card at the same time.
         self.device_lock_root = device_lock_root
+        self.build_lock_timeout = build_lock_timeout
 
     def _device_root(self) -> Path:
         if self.device_lock_root is not None:
@@ -646,8 +648,22 @@ class Engine:
                     receipt["deviceLease"] = {"mode": "windowed",
                                               "resource": "npu:" + str(int(device)),
                                               "gates": sorted(windows)}
+            if self.build_lock_timeout is not None:
+                build_lock_timeout = max(0.0, float(self.build_lock_timeout))
+            else:
+                window_waits = [
+                    float(recipe.device_window)
+                    for recipe in (
+                        manifest.resolve_recipe(manifest.gates[gate_id]["recipeId"], source)
+                        for gate_id in order
+                    )
+                    if recipe.device_window is not None
+                ]
+                build_lock_timeout = max([30.0, *window_waits])
             with ExitStack() as stack:
-                lease_fds = stack.enter_context(acquire(resources, root=self.lock_root))
+                lease_fds = stack.enter_context(
+                    acquire(resources, root=self.lock_root, timeout=build_lock_timeout)
+                )
                 if device_resource is not None:
                     lease_fds += stack.enter_context(
                         acquire([device_resource], root=device_root))
