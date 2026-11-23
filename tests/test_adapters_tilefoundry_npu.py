@@ -1137,7 +1137,6 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 TILEFOUNDRY_NPU_TILELANG_REPO="/refs/tilelang",
                 TILEFOUNDRY_NPU_CANNBOT_DSL_REPO="/refs/cannbot-dsl",
                 TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO="/refs/ops-transformer",
-                TILEFOUNDRY_NPU_ASC_DEVKIT_REPO="",
             )
             with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
                 self.assertEqual(GATE.main(["--check-config"]), 0)
@@ -1150,13 +1149,17 @@ class OptionalAgentKeysCase(unittest.TestCase):
                     return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
                 with patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_cpu) as cpu:
-                    rc, _obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+                    rc, obs_cpu = GATE.run_cpu(GATE.machine_values(), 30.0)
                 self.assertEqual(rc, 0)
                 self.assertTrue(cpu.call_args.args[0].endswith(" " + " ".join(GATE.DEFAULT_CPU_TESTS)))
                 self.assertNotIn("TILEFOUNDRY_NPU_LLM_BACKEND", captured_env)
                 self.assertNotIn("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", captured_env)
                 self.assertEqual(captured_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
-                self.assertNotIn("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", captured_env)
+                self.assertEqual(captured_env["TILEFOUNDRY_CANN_SERIES"], "cann_9_2")
+                self.assertEqual(
+                    obs_cpu["environment"],
+                    {"cannSeries": "cann_9_2", "bishengArch": "dav-3510"},
+                )
 
                 captured_dev_env = {}
                 probe_json = json.dumps({
@@ -1346,6 +1349,90 @@ class OptionalAgentKeysCase(unittest.TestCase):
         try:
             os.chdir(self.src)
             self.write_env(TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT="0")
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    GATE.main(["--check-config"])
+                self.assertEqual(caught.exception.code, 75)
+        finally:
+            os.chdir(old_cwd)
+
+    def test_asc_devkit_repo_key_is_rejected_by_machine_env_and_doctor(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            self.write_env(TILEFOUNDRY_NPU_ASC_DEVKIT_REPO="/refs/asc-devkit")
+            with self.assertRaises(machine_env.MachineEnvError):
+                machine_env.parse(
+                    self.env_file.read_text(encoding="utf-8"),
+                    self.env_file,
+                    machine_env.TILEFOUNDRY_NPU_KEYS,
+                )
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    GATE.main(["--check-config"])
+                self.assertEqual(caught.exception.code, 75)
+        finally:
+            os.chdir(old_cwd)
+
+    def test_cann_series_auto_detection_and_explicit_override(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            cann93_root = self.root / "cann-9.3.0"
+            (cann93_root / "compiler").mkdir(parents=True)
+            (cann93_root / "set_env.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (cann93_root / "compiler" / "version.info").write_text("Version=9.3.0\n", encoding="utf-8")
+            self.write_env(TILEFOUNDRY_NPU_CANN_SETUP=str(cann93_root / "set_env.sh"))
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                values = GATE.machine_values()
+                self.assertEqual(GATE.resolve_cann_series(values), "cann_9_3")
+
+                captured_dev_env = {}
+                probe_json = json.dumps({
+                    "tilefoundryImported": True,
+                    "npuAvailable": True,
+                    "deviceCountOne": True,
+                    "tensorOnDevice": True,
+                    "fp32VectorOk": True,
+                    "bf16MatmulOk": True,
+                    "numericalOk": True,
+                    "synchronizeOk": True,
+                    "deviceMemoryPositive": True,
+                })
+
+                def fake_dev(cmd, *, cwd, env, **kwargs):
+                    captured_dev_env.update(env)
+                    return types.SimpleNamespace(returncode=0, stdout=probe_json + "\n", stderr="")
+
+                lease = self.root / "locks" / "npu.lock"
+                dev_env = {
+                    "TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file),
+                    "TILEFOUNDRY_NPU_DEVICE_ID": "0",
+                    "AGENT_GATES_DEVICE_LEASE_PATH": str(lease),
+                    "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:0",
+                    "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "2",
+                }
+                with patch.dict(os.environ, dev_env, clear=True), \
+                        patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                        patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_dev):
+                    rc_d, obs_d = GATE.run_device(GATE.machine_values(), 30.0)
+                self.assertEqual(rc_d, 0)
+                self.assertEqual(captured_dev_env["TILEFOUNDRY_CANN_SERIES"], "cann_9_3")
+                self.assertEqual(
+                    obs_d["environment"],
+                    {"cannSeries": "cann_9_3", "bishengArch": "dav-3510"},
+                )
+
+            self.write_env(
+                TILEFOUNDRY_NPU_CANN_SETUP=str(cann93_root / "set_env.sh"),
+                TILEFOUNDRY_NPU_CANN_SERIES="cann_9_2",
+            )
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                self.assertEqual(GATE.resolve_cann_series(GATE.machine_values()), "cann_9_2")
+
+            self.write_env(TILEFOUNDRY_NPU_CANN_SERIES="cann_9_9")
             with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
                 with self.assertRaises(SystemExit) as caught:
                     GATE.main(["--check-config"])

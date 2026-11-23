@@ -188,11 +188,49 @@ OPTIONAL_FORWARDED_KEYS = (
     "TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL",
     "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
     "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+    "TILEFOUNDRY_NPU_CANN_SERIES",
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
-    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
+
+VALID_CANN_SERIES = ("cann_9_2", "cann_9_3")
+
+
+def resolve_cann_series(source: dict | None = None) -> str:
+    """Resolve CANN surface series (cann_9_2 / cann_9_3) from env or CANN setup."""
+    src = os.environ if source is None else source
+    explicit = (src.get("TILEFOUNDRY_NPU_CANN_SERIES") or "").strip()
+    if explicit:
+        if explicit not in VALID_CANN_SERIES:
+            raise ValueError(
+                f"TILEFOUNDRY_NPU_CANN_SERIES must be one of {VALID_CANN_SERIES}: {explicit!r}"
+            )
+        return explicit
+    cann_setup = (src.get("TILEFOUNDRY_NPU_CANN_SETUP") or CANN_SET_ENV or "").strip()
+    if cann_setup:
+        import re as _re  # noqa: PLC0415
+
+        setup_path = Path(cann_setup)
+        for root in (setup_path.parent, setup_path.resolve().parent):
+            for rel in (
+                "version.cfg",
+                "version.info",
+                "compiler/version.info",
+                "x86_64-linux/ascend_toolkit_install.info",
+                "aarch64-linux/ascend_toolkit_install.info",
+            ):
+                meta_file = root / rel
+                if meta_file.is_file():
+                    text = meta_file.read_text(encoding="utf-8", errors="ignore")
+                    if _re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", text):
+                        return "cann_9_3"
+                    if _re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", text):
+                        return "cann_9_2"
+        for probe in (cann_setup, str(setup_path.resolve())):
+            if _re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", probe):
+                return "cann_9_3"
+    return "cann_9_2"
 
 
 def forward_optional_machine_env(env: dict, source: dict | None = None) -> dict:
@@ -256,6 +294,7 @@ def runtime_env(base: dict | None = None, *, with_cann: bool = True,
     env.pop("LD_LIBRARY_PATH_FOR_TILELANG", None)
     if with_cann:
         env["TFNU_SOURCE_CANN"] = CANN_SET_ENV
+    env["TILEFOUNDRY_CANN_SERIES"] = resolve_cann_series(env)
     return forward_optional_machine_env(env)
 
 

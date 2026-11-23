@@ -137,9 +137,23 @@ conflicting exports in the launching environment):
   `TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL`, `TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL`,
   `TILEFOUNDRY_NPU_AGY_COMMON_ARGS`, and `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY`
   are supported by existing `agy_cli` deployments.
+- `TILEFOUNDRY_NPU_CANN_SERIES`: optional CANN surface series override
+  (empty = auto-detect `cann_9_2` / `cann_9_3` from `TILEFOUNDRY_NPU_CANN_SETUP`
+  toolkit metadata). Forwarded to TileFoundry subprocesses as
+  `TILEFOUNDRY_CANN_SERIES` and recorded with `bishengArch: "dav-3510"` in
+  V2 receipt `observations.environment`.
 - `TILEFOUNDRY_NPU_TILELANG_REPO` / `TILEFOUNDRY_NPU_CANNBOT_DSL_REPO` /
-  `TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO` / `TILEFOUNDRY_NPU_ASC_DEVKIT_REPO`:
+  `TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO`:
   optional absolute host paths to read-only Ascend 950 reference checkouts forwarded when non-empty.
+
+### Multi-Worktree Zero-Lock Concurrency
+
+AgentGates acquires `source:<dir>` and `build:<dir>/build` locks scoped to
+the `--source` directory. When running concurrent multi-NPU optimization
+campaigns across cards, create an independent `git worktree` per NPU card and
+pass each worktree as `--source`, while sharing one external
+`--experience-lake-dir`. That keeps single-tree build locks strict while
+reducing cross-card lock contention to `0s`.
 
 The host adapter reads LLM settings directly from `env.sh`. When
 `TILEFOUNDRY_NPU_LLM_API_KEY_ENV` is set, it supplies the named credential

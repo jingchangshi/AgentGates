@@ -63,7 +63,8 @@
 | `TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL` | Optional | Model ID | Legacy escalation model for `agy_cli` |
 | `TILEFOUNDRY_NPU_AGY_COMMON_ARGS` | 可选 | CLI 参数串 | 无状态沙盒 `agy` 子进程公共参数 |
 | `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY` | 可选 | 正整数 | `agy` 并发子进程上限 |
-| `TILEFOUNDRY_NPU_{TILELANG,CANNBOT_DSL,OPS_TRANSFORMER,ASC_DEVKIT}_REPO` | 可选 | 宿主机绝对路径 | 本地只读 Ascend 950 参考仓路径（非空时透传；运行时隔离沙盒严禁直接访问） |
+| `TILEFOUNDRY_NPU_CANN_SERIES` | 可选 | `cann_9_2` / `cann_9_3` / 留空 | 显式覆写 CANN 表面版本；留空则由 `TILEFOUNDRY_NPU_CANN_SETUP` 自动探测并注入 `TILEFOUNDRY_CANN_SERIES` 与 Receipt `observations.environment.cannSeries` |
+| `TILEFOUNDRY_NPU_{TILELANG,CANNBOT_DSL,OPS_TRANSFORMER}_REPO` | 可选 | 宿主机绝对路径 | 本地只读 Ascend 950 参考仓路径（非空时透传；运行时隔离沙盒严禁直接访问） |
 
 Store only the credential variable name in `env.sh`. The host adapter reads
 settings from this file and resolves the named credential from the worker

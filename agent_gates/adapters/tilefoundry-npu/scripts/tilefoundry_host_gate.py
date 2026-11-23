@@ -68,6 +68,8 @@ OPTIONAL_AGENT_LLM_KEYS = (
     "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
 )
 
+VALID_CANN_SERIES = ("cann_9_2", "cann_9_3")
+
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
 OPTIONAL_PROXY_KEYS = tuple(f"TILEFOUNDRY_NPU_LLM_{key}" for key in PROXY_KEYS)
 
@@ -100,19 +102,19 @@ TOOLCHAIN_KEYS = (
     *OPTIONAL_AGENT_LLM_KEYS,
     *OPTIONAL_PROXY_KEYS,
     "TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT",
+    "TILEFOUNDRY_NPU_CANN_SERIES",
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
-    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
     "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS",
 )
 
 OPTIONAL_REPO_AND_PYTHON_KEYS = (
     "TILEFOUNDRY_NPU_PYTHON",
+    "TILEFOUNDRY_NPU_CANN_SERIES",
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
-    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
 
 OPTIONAL_FORWARDED_KEYS = (
@@ -125,7 +127,6 @@ OPTIONAL_ABS_PATH_KEYS = (
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
-    "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
 )
 
 NOT_MACHINE_KEYS = frozenset({
@@ -4011,6 +4012,61 @@ def _forward_proxy_env(
             run_env[scoped] = scoped_value
 
 
+def _detect_cann_series_from_setup(cann_setup: str) -> str:
+    raw = str(cann_setup or "").strip()
+    if not raw:
+        return "cann_9_2"
+    candidates: list[Path] = []
+    setup_path = Path(raw)
+    for base in (setup_path.parent, setup_path.resolve().parent):
+        if base not in candidates:
+            candidates.append(base)
+    meta_relpaths = (
+        Path("version.cfg"),
+        Path("version.info"),
+        Path("compiler/version.cfg"),
+        Path("compiler/version.info"),
+        Path("x86_64-linux/ascend_toolkit_install.info"),
+        Path("aarch64-linux/ascend_toolkit_install.info"),
+    )
+    for root in candidates:
+        for rel in meta_relpaths:
+            meta_file = root / rel
+            try:
+                if meta_file.is_file():
+                    text = meta_file.read_text(encoding="utf-8", errors="ignore")
+                    if re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", text):
+                        return "cann_9_3"
+                    if re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", text):
+                        return "cann_9_2"
+            except OSError:
+                continue
+    for probe in (raw, str(setup_path.resolve())):
+        if re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", probe):
+            return "cann_9_3"
+        if re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", probe):
+            return "cann_9_2"
+    return "cann_9_2"
+
+
+def resolve_cann_series(values: dict[str, str]) -> str:
+    explicit = (values.get("TILEFOUNDRY_NPU_CANN_SERIES") or "").strip()
+    if explicit:
+        if explicit not in VALID_CANN_SERIES:
+            raise BridgeError(
+                f"TILEFOUNDRY_NPU_CANN_SERIES must be one of {VALID_CANN_SERIES}: {explicit!r}"
+            )
+        return explicit
+    return _detect_cann_series_from_setup(values.get("TILEFOUNDRY_NPU_CANN_SETUP") or "")
+
+
+def _environment_observations(values: dict[str, str]) -> dict[str, str]:
+    return {
+        "cannSeries": resolve_cann_series(values),
+        "bishengArch": "dav-3510",
+    }
+
+
 def _forward_optional_env(
     run_env: dict[str, str],
     values: dict[str, str],
@@ -4026,6 +4082,7 @@ def _forward_optional_env(
         val = (values.get(key) or "").strip()
         if val:
             run_env[key] = val
+    run_env["TILEFOUNDRY_CANN_SERIES"] = resolve_cann_series(values)
     if not include_agent_llm:
         for key in (*OPTIONAL_AGENT_LLM_KEYS, *OPTIONAL_PROXY_KEYS):
             run_env.pop(key, None)
@@ -4033,6 +4090,7 @@ def _forward_optional_env(
 
 
 def _validate_optional_agent_keys(values: dict[str, str]) -> None:
+    resolve_cann_series(values)
     conc = (values.get("TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY") or "").strip()
     if conc and (not conc.isdigit() or int(conc) < 1):
         raise BridgeError(
@@ -4245,6 +4303,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                 sys.stderr.write(str(exc.stderr)[-4000:])
             print(f"{PROG}: CPU pytest timed out after {timeout}s", file=sys.stderr)
             timeout_obs = _cpu_observations(False, 0, 0, 0, 0)
+            timeout_obs["environment"] = _environment_observations(values)
             if tl_identity is not None:
                 timeout_obs["tilelang"] = tl_identity
             return 1, timeout_obs
@@ -4254,6 +4313,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             sys.stderr.write((completed.stderr or completed.stdout)[-4000:])
             print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
             missing_obs = _cpu_observations(False, 0, 0, 0, 0)
+            missing_obs["environment"] = _environment_observations(values)
             if tl_identity is not None:
                 missing_obs["tilelang"] = tl_identity
             return 1, missing_obs
@@ -4271,6 +4331,7 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
             counts["failed"],
             counts["skipped"],
         )
+        obs["environment"] = _environment_observations(values)
         if tl_identity is not None:
             obs["tilelang"] = tl_identity
         if not succeeded:
@@ -4702,6 +4763,7 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                         )
                     if tl_identity is not None:
                         obs["tilelang"] = tl_identity
+                    obs["environment"] = _environment_observations(values)
                     return 1, obs
 
                 occ, win = finalize_window()
@@ -4746,6 +4808,7 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                         "testsPassed": counts["passed"],
                         "testsFailed": counts["failed"],
                         "testsSkipped": counts["skipped"],
+                        "environment": _environment_observations(values),
                         **_window_evidence(occ, win),
                         **binding_obs,
                     }
@@ -4774,6 +4837,7 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
 
                 obs = {
                     "exitCodeZero": ok,
+                    "environment": _environment_observations(values),
                     **{key: bool(parsed.get(key, False)) for key in DEVICE_PROBE_FLAGS},
                     **_window_evidence(occ, win),
                 }
@@ -4843,9 +4907,12 @@ def _l3_child_env(
         "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1",
         "TILELANG_DISABLE_CACHE": "0",
         "CANNBENCH_CACHE_DIR": str(caches["reference"]),
+        "TILEFOUNDRY_CANN_SERIES": resolve_cann_series(values),
         L3_CACHE_MODE_ENV: "required",
         L3_CACHE_EXPECTATION_ENV: expectation,
     })
+    if (values.get("TILEFOUNDRY_NPU_CANN_SERIES") or "").strip():
+        env["TILEFOUNDRY_NPU_CANN_SERIES"] = values["TILEFOUNDRY_NPU_CANN_SERIES"].strip()
     if workload:
         env.update({
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "1",
@@ -5213,6 +5280,7 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
         "promotionEligible": False,
         "candidateDigestRecorded": False,
         "errorCategory": "environment",
+        "environment": _environment_observations(values),
         "windowOpened": False,
         "windowReleased": False,
         "occupancyRecorded": False,
@@ -5607,6 +5675,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
         "phases": phases,
         "elapsedSeconds": 0.0,
         "errorCategory": "environment",
+        "environment": _environment_observations(values),
     }
     health_sink: dict = obs["healthMonitoring"]
     if tl_identity is not None:
@@ -5684,6 +5753,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
                                 build_env["CONDA_ENVS_PATH"] = envs_path
                             build_env["PYTHONDONTWRITEBYTECODE"] = "1"
                             build_env["PYTHONNOUSERSITE"] = "1"
+                            build_env["TILEFOUNDRY_CANN_SERIES"] = resolve_cann_series(values)
                             if deadline.remaining() <= 0:
                                 raise BridgeError(
                                     "CANNBench prep build exceeded the recipe deadline",
@@ -5757,6 +5827,7 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
                     run_env["PYTHONDONTWRITEBYTECODE"] = "1"
                     run_env["PYTHONNOUSERSITE"] = "1"
                     run_env["PYTHONPATH"] = str(utils_dir)
+                    run_env["TILEFOUNDRY_CANN_SERIES"] = resolve_cann_series(values)
                     probe_cmd = f"{shlex.quote(str(python))} -c {shlex.quote(CANNBENCH_ABI_PROBE)}"
                     try:
                         probed = _run_host_bash_monitored(
@@ -5869,6 +5940,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         "phases": phases,
         "elapsedSeconds": 0.0,
         "errorCategory": "environment",
+        "environment": _environment_observations(values),
         "reportEvidence": {"root": str(reports_root), "reports": []},
     }
     health_sink: dict = obs["healthMonitoring"]
@@ -5959,6 +6031,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                                         run_env["CONDA_ENVS_PATH"] = envs_path
                                     run_env["PYTHONDONTWRITEBYTECODE"] = "1"
                                     run_env["PYTHONNOUSERSITE"] = "1"
+                                    run_env["TILEFOUNDRY_CANN_SERIES"] = resolve_cann_series(values)
                                     cmd = (
                                         'export AGENT_GATES_ACTIVATION_PYTHONPATH="${PYTHONPATH:-}"; '
                                         f"{shlex.quote(str(python))} -E -s "
@@ -6410,6 +6483,7 @@ def run_cannbench_remote(values: dict[str, str], timeout: float) -> tuple[int, d
         "targetCount": len(targets),
         "targetsSource": targets_source,
         "mcpUrl": mcp_cfg["mcp_url"],
+        "environment": _environment_observations(values),
         "results": results,
     }
     return (0 if ok else 1), obs

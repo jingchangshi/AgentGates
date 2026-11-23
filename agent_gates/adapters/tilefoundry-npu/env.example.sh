@@ -267,9 +267,12 @@ TILEFOUNDRY_NPU_AGY_COMMON_ARGS=
 # Optional positive integer concurrency cap for parallel `agy` worker subprocesses.
 TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY=
 
+# Optional CANN surface series override (empty = auto-detect from CANN_SETUP;
+# accepted: cann_9_2, cann_9_3). Forwarded to TileFoundry as TILEFOUNDRY_CANN_SERIES.
+TILEFOUNDRY_NPU_CANN_SERIES=
+
 # Optional absolute host paths to local read-only Ascend 950 reference repositories
 # used for offline inspection and Two-Snapshot IR Diff (never passed to runtime `agy`).
 TILEFOUNDRY_NPU_TILELANG_REPO=
 TILEFOUNDRY_NPU_CANNBOT_DSL_REPO=
 TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO=
-TILEFOUNDRY_NPU_ASC_DEVKIT_REPO=
