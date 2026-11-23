@@ -142,10 +142,10 @@ conflicting exports in the launching environment):
   `TILEFOUNDRY_NPU_AGY_COMMON_ARGS`, and `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY`
   are supported by existing `agy_cli` deployments.
 - `TILEFOUNDRY_NPU_CANN_SERIES`: optional CANN surface series override
-  (empty = auto-detect `cann_9_2` / `cann_9_3` from `TILEFOUNDRY_NPU_CANN_SETUP`
-  toolkit metadata). Forwarded to TileFoundry subprocesses as
-  `TILEFOUNDRY_CANN_SERIES` and recorded with `bishengArch: "dav-3510"` in
-  V2 receipt `observations.environment`.
+  (empty auto-detects to `"cann_9_3"`, the sole active mainline; `"cann_9_2"` is
+  accepted ONLY as an explicit inert placeholder override). Forwarded to
+  TileFoundry subprocesses as `TILEFOUNDRY_CANN_SERIES` and recorded with
+  `bishengArch: "dav-3510"` in V2 receipt `observations.environment`.
 - `TILEFOUNDRY_NPU_TILELANG_REPO` / `TILEFOUNDRY_NPU_CANNBOT_DSL_REPO` /
   `TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO`:
   optional absolute host paths to read-only Ascend 950 reference checkouts forwarded when non-empty.

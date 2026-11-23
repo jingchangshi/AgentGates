@@ -4116,39 +4116,10 @@ def _forward_proxy_env(
 
 
 def _detect_cann_series_from_setup(cann_setup: str) -> str:
-    raw = str(cann_setup or "").strip()
-    if not raw:
-        return "cann_9_3"
-    candidates: list[Path] = []
-    setup_path = Path(raw)
-    for base in (setup_path.parent, setup_path.resolve().parent):
-        if base not in candidates:
-            candidates.append(base)
-    meta_relpaths = (
-        Path("version.cfg"),
-        Path("version.info"),
-        Path("compiler/version.cfg"),
-        Path("compiler/version.info"),
-        Path("x86_64-linux/ascend_toolkit_install.info"),
-        Path("aarch64-linux/ascend_toolkit_install.info"),
-    )
-    for root in candidates:
-        for rel in meta_relpaths:
-            meta_file = root / rel
-            try:
-                if meta_file.is_file():
-                    text = meta_file.read_text(encoding="utf-8", errors="ignore")
-                    if re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", text):
-                        return "cann_9_3"
-                    if re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", text):
-                        return "cann_9_2"
-            except OSError:
-                continue
-    for probe in (raw, str(setup_path.resolve())):
-        if re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", probe):
-            return "cann_9_3"
-        if re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", probe):
-            return "cann_9_2"
+    # cann_9_3 is the sole active mainline; cann_9_2 is an inert schema
+    # placeholder selectable ONLY when explicitly set via
+    # TILEFOUNDRY_NPU_CANN_SERIES=cann_9_2.
+    _ = cann_setup
     return "cann_9_3"
 
 
