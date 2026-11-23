@@ -347,9 +347,113 @@ class CheckConfigAndRunCase(unittest.TestCase):
                     patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_run_host_bash) as cpu:
                 rc, _obs = GATE.run_cpu(GATE.machine_values(), 30.0)
             self.assertEqual(rc, 0)
-            cmd = cpu.call_args.args[0]
+            all_cmds = [call.args[0] for call in cpu.call_args_list]
             for node in GATE.CPU_DEVICE_NODE_DESELECTS:
-                self.assertIn(f"--deselect={node}", cmd)
+                self.assertTrue(
+                    any(f"--deselect={node}" in cmd for cmd in all_cmds),
+                    f"missing --deselect={node} in {all_cmds!r}",
+                )
+        finally:
+            os.chdir(old_cwd)
+
+    def test_run_cpu_sharded_parallel_execution_and_worker_bounds(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            for idx in range(14):
+                rel_dir = GATE.DEFAULT_CPU_TESTS[idx % len(GATE.DEFAULT_CPU_TESTS)]
+                tf = self.src / rel_dir / f"test_mod_{idx:02d}.py"
+                tf.write_text("x = " + ("1\n" * ((idx + 1) * 20)), encoding="utf-8")
+            for node in GATE.CPU_DEVICE_NODE_DESELECTS:
+                path = self.src / node.split("::", 1)[0]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("def test_placeholder():\n    assert True\n", encoding="utf-8")
+            self.write_env(TILEFOUNDRY_NPU_CPU_WORKERS="4")
+
+            captured_calls = []
+
+            def fake_sharded_cpu(cmd, *, cwd, env, **kwargs):
+                captured_calls.append((cmd, dict(env)))
+                tokens = cmd.split()
+                xml_path = next(
+                    Path(t.split("=", 1)[1].strip("'\""))
+                    for t in tokens
+                    if t.startswith("--junit-xml=")
+                )
+                target_args = [
+                    t for t in tokens[tokens.index(f"--junit-xml={xml_path}") + 1:]
+                    if not t.startswith("--deselect=")
+                ]
+                if target_args and all(
+                    t.endswith(".py") and not Path(t).name.startswith("test_mod_")
+                    for t in target_args
+                ):
+                    xml_path.write_text(
+                        '<testsuite tests="0" errors="0" failures="0" skipped="0"></testsuite>',
+                        encoding="utf-8",
+                    )
+                    return types.SimpleNamespace(returncode=5, stdout="", stderr="")
+                xml_path.write_text(
+                    '<testsuite tests="3" errors="0" failures="0" skipped="1"></testsuite>',
+                    encoding="utf-8",
+                )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_sharded_cpu):
+                rc, obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc, 0)
+            self.assertEqual(obs["cpuWorkers"], 4)
+            self.assertEqual(len(captured_calls), 4)
+            self.assertGreater(obs["testsCollected"], 0)
+            self.assertEqual(obs["testsFailed"], 0)
+            for _cmd, env in captured_calls:
+                self.assertEqual(env.get("OMP_NUM_THREADS"), "1")
+                self.assertEqual(env.get("TORCH_NUM_THREADS"), "1")
+                self.assertNotIn("TMPDIR", env)
+
+            self.write_env(TILEFOUNDRY_NPU_CPU_WORKERS="1")
+            captured_calls.clear()
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_sharded_cpu):
+                rc1, obs1 = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc1, 0)
+            self.assertEqual(obs1["cpuWorkers"], 1)
+            self.assertEqual(len(captured_calls), 1)
+
+            self.write_env(TILEFOUNDRY_NPU_CPU_WORKERS="4")
+
+            def fake_failing_shard(cmd, *, cwd, env, **kwargs):
+                tokens = cmd.split()
+                xml_path = next(
+                    Path(t.split("=", 1)[1].strip("'\""))
+                    for t in tokens
+                    if t.startswith("--junit-xml=")
+                )
+                if "junit_shard_1" in str(xml_path):
+                    xml_path.write_text(
+                        '<testsuite tests="2" errors="0" failures="1" skipped="0"></testsuite>',
+                        encoding="utf-8",
+                    )
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="shard 1 failed")
+                xml_path.write_text(
+                    '<testsuite tests="2" errors="0" failures="0" skipped="0"></testsuite>',
+                    encoding="utf-8",
+                )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_failing_shard):
+                rc_fail, obs_fail = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc_fail, 1)
+            self.assertFalse(obs_fail["exitCodeZero"])
+            self.assertEqual(obs_fail["testsFailed"], 1)
+
+            for bad in ("0", "17", "abc", "-2"):
+                self.write_env(TILEFOUNDRY_NPU_CPU_WORKERS=bad)
+                with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                    with self.assertRaises(GATE.BridgeError):
+                        GATE.cpu_workers(GATE.machine_values())
         finally:
             os.chdir(old_cwd)
 

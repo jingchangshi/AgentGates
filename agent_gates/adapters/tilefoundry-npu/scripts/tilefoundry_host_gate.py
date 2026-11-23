@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import concurrent.futures
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
@@ -82,6 +83,7 @@ TOOLCHAIN_KEYS = (
     "TILEFOUNDRY_NPU_TILELANG_SOURCE",
     "TILEFOUNDRY_NPU_TILELANG_BUILD",
     "TILEFOUNDRY_NPU_CPU_TESTS",
+    "TILEFOUNDRY_NPU_CPU_WORKERS",
     "TILEFOUNDRY_NPU_DEVICE_TESTS",
     "TILEFOUNDRY_NPU_MSPROF_LOCK",
     "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE",
@@ -168,6 +170,16 @@ CPU_DEVICE_NODE_DESELECTS = (
     "tests/ascend/agent/test_surrogate_batch_npu.py::test_surrogate_anchor_batch_npu",
     "tests/ascend/target/test_micro_probes_npu.py::test_ascend950_calibration_micro_probes",
 )
+DEFAULT_CPU_WORKERS = 12
+MAX_CPU_WORKERS = 16
+CPU_WORKER_THREAD_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "TORCH_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
 # A typed fast request fixes the one harness node it runs. The request carries
 # data only; it cannot select a pytest node or command. Batch and profile share
 # this node so the device-fast gate has one stable synthetic-device workload.
@@ -1018,6 +1030,74 @@ def cpu_deselects(source: Path) -> tuple[str, ...]:
         for node in CPU_DEVICE_NODE_DESELECTS
         if (source / node.split("::", 1)[0]).is_file()
     )
+
+
+def cpu_workers(values: dict[str, str]) -> int:
+    """Resolve the bounded worker count for multi-process CPU pytest shards."""
+    raw = (values.get("TILEFOUNDRY_NPU_CPU_WORKERS") or "").strip()
+    if not raw:
+        return min(DEFAULT_CPU_WORKERS, max(1, os.cpu_count() or 1))
+    if not re.fullmatch(r"\d+", raw):
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_CPU_WORKERS must be an integer between 1 and {MAX_CPU_WORKERS}: {raw!r}"
+        )
+    workers = int(raw)
+    if workers < 1 or workers > MAX_CPU_WORKERS:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_CPU_WORKERS must be an integer between 1 and {MAX_CPU_WORKERS}: {raw!r}"
+        )
+    return workers
+
+
+def _expand_cpu_test_shards(
+    source: Path, tests: tuple[str, ...], workers: int
+) -> list[tuple[str, ...]]:
+    """Expand relative test directories into size-balanced file shards when safe."""
+    if workers <= 1 or any("::" in item for item in tests):
+        return [tuple(tests)]
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for entry in tests:
+        target = source / entry
+        if target.is_dir():
+            dir_files = [
+                path
+                for path in sorted(target.rglob("*.py"))
+                if "__pycache__" not in path.parts
+                and (path.name.startswith("test_") or path.name.endswith("_test.py"))
+            ]
+            if not dir_files:
+                return [tuple(tests)]
+            for path in dir_files:
+                rel = path.relative_to(source).as_posix()
+                if rel not in seen:
+                    seen.add(rel)
+                    discovered.append(rel)
+        elif target.is_file():
+            rel = target.relative_to(source).as_posix()
+            if rel not in seen:
+                seen.add(rel)
+                discovered.append(rel)
+        else:
+            return [tuple(tests)]
+    if len(discovered) <= 1:
+        return [tuple(tests)]
+
+    items = sorted(
+        ((source / rel).stat().st_size, rel) for rel in discovered
+    )
+    items.sort(key=lambda item: (-item[0], item[1]))
+    num_shards = min(workers, len(items))
+    shards: list[list[str]] = [[] for _ in range(num_shards)]
+    shard_bytes = [0 for _ in range(num_shards)]
+    for size, rel in items:
+        idx = min(
+            range(num_shards),
+            key=lambda shard_i: (shard_bytes[shard_i], len(shards[shard_i]), shard_i),
+        )
+        shards[idx].append(rel)
+        shard_bytes[idx] += size
+    return [tuple(sorted(shard)) for shard in shards if shard]
 
 
 def fast_device_tests(source: Path) -> tuple[str, ...]:
@@ -4204,6 +4284,7 @@ def check_config(
         if not python.is_file():
             raise BridgeError(f"TileFoundry Python interpreter does not exist: {python}")
         source = _source_root()
+        cpu_workers(values)
         for rel in cpu_tests(values, source):
             if not (source / rel).exists():
                 raise BridgeError(f"CPU test path missing in {source}: {rel}")
@@ -4261,81 +4342,146 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
     tests = cpu_tests(values, source)
+    workers = cpu_workers(values)
+    shards = _expand_cpu_test_shards(source, tests, workers)
+    all_deselects = cpu_deselects(source)
     conda_sh = Path(_required(values, "TILEFOUNDRY_NPU_CONDA_SH"))
     conda_env = _required(values, "TILEFOUNDRY_NPU_CONDA_ENV")
     python = python_path(values)
+    deadline = _Deadline(timeout)
 
     with tempfile.TemporaryDirectory(prefix="tilefoundry-cpu-") as tmp:
-        report = Path(tmp) / "junit.xml"
-        run_env = _host_child_env(values)
+        base_env = _host_child_env(values)
         envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
         if envs_path:
-            run_env["CONDA_ENVS_PATH"] = envs_path
-        _forward_optional_env(run_env, values, include_agent_llm=False)
-        run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
-        run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        run_env["PYTHONNOUSERSITE"] = "1"
-        run_env["TILELANG_DISABLE_CACHE"] = "1"
-        run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
+            base_env["CONDA_ENVS_PATH"] = envs_path
+        _forward_optional_env(base_env, values, include_agent_llm=False)
+        base_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+        base_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        base_env["PYTHONNOUSERSITE"] = "1"
+        base_env["TILELANG_DISABLE_CACHE"] = "1"
+        base_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
         if tl_identity is not None:
-            run_env.setdefault("USE_CUDA", "0")
-        # CPU suite deliberately does NOT source CANN set_env.sh because
-        # CANN's native libraries collide with ortools CP-SAT in this env.
-        cmd = " ".join(
-            [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider",
-             f"--junit-xml={shlex.quote(str(report))}"]
-            + [f"--deselect={shlex.quote(node)}" for node in cpu_deselects(source)]
-            + [shlex.quote(t) for t in tests]
-        )
-        try:
+            base_env.setdefault("USE_CUDA", "0")
+        if len(shards) > 1:
+            base_env.update(CPU_WORKER_THREAD_ENV)
+
+        deselect_files = {node.split("::", 1)[0] for node in all_deselects}
+
+        def _run_shard(
+            shard_idx: int, shard_targets: tuple[str, ...]
+        ) -> tuple[tuple[str, ...], Path, subprocess.CompletedProcess[str]]:
+            shard_env = dict(base_env)
+            if len(shards) > 1:
+                for tmp_key in ("TMPDIR", "TEMP", "TMP", "ASCEND_WORK_PATH"):
+                    shard_env.pop(tmp_key, None)
+                report = Path(tmp) / f"junit_shard_{shard_idx}.xml"
+                target_set = set(shard_targets)
+                shard_deselects = [
+                    node for node in all_deselects if node.split("::", 1)[0] in target_set
+                ]
+            else:
+                report = Path(tmp) / "junit.xml"
+                shard_deselects = list(all_deselects)
+            cmd = " ".join(
+                [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider",
+                 f"--junit-xml={shlex.quote(str(report))}"]
+                + [f"--deselect={shlex.quote(node)}" for node in shard_deselects]
+                + [shlex.quote(t) for t in shard_targets]
+            )
+            # CPU suite deliberately does NOT source CANN set_env.sh because
+            # CANN's native libraries collide with ortools CP-SAT in this env.
             completed = adapter_runtime.run_host_bash(
                 cmd,
                 cwd=source,
-                env=run_env,
+                env=shard_env,
                 cann_setup=None,
                 conda_sh=conda_sh,
                 conda_env=conda_env,
-                timeout=timeout,
+                timeout=max(1.0, deadline.remaining()),
                 isolate_temp=True,
             )
+            return shard_targets, report, completed
+
+        shard_results: list[tuple[tuple[str, ...], Path, subprocess.CompletedProcess[str]]] = []
+        try:
+            if len(shards) == 1:
+                shard_results.append(_run_shard(0, shards[0]))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(shards)) as pool:
+                    futures = [
+                        pool.submit(_run_shard, idx, shard)
+                        for idx, shard in enumerate(shards)
+                    ]
+                    for fut in futures:
+                        shard_results.append(fut.result())
         except subprocess.TimeoutExpired as exc:
             if exc.stderr:
                 sys.stderr.write(str(exc.stderr)[-4000:])
             print(f"{PROG}: CPU pytest timed out after {timeout}s", file=sys.stderr)
             timeout_obs = _cpu_observations(False, 0, 0, 0, 0)
+            timeout_obs["cpuWorkers"] = len(shards)
             timeout_obs["environment"] = _environment_observations(values)
             if tl_identity is not None:
                 timeout_obs["tilelang"] = tl_identity
             return 1, timeout_obs
 
-        counts = _junit_counts(report)
-        if counts is None:
-            sys.stderr.write((completed.stderr or completed.stdout)[-4000:])
-            print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
-            missing_obs = _cpu_observations(False, 0, 0, 0, 0)
-            missing_obs["environment"] = _environment_observations(values)
-            if tl_identity is not None:
-                missing_obs["tilelang"] = tl_identity
-            return 1, missing_obs
+        total_collected = 0
+        total_passed = 0
+        total_failed = 0
+        total_skipped = 0
+        all_rc_ok = True
+        combined_tails: list[str] = []
+        for shard_targets, report, completed in shard_results:
+            counts = _junit_counts(report)
+            if counts is None:
+                sys.stderr.write((completed.stderr or completed.stdout)[-4000:])
+                print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
+                missing_obs = _cpu_observations(False, 0, 0, 0, 0)
+                missing_obs["cpuWorkers"] = len(shards)
+                missing_obs["environment"] = _environment_observations(values)
+                if tl_identity is not None:
+                    missing_obs["tilelang"] = tl_identity
+                return 1, missing_obs
+            empty_deselected_shard = (
+                completed.returncode == 5
+                and counts["collected"] == 0
+                and all(target in deselect_files for target in shard_targets)
+            )
+            if completed.returncode != 0 and not empty_deselected_shard:
+                all_rc_ok = False
+                combined_tails.append((completed.stdout + "\n" + completed.stderr)[-2000:])
+            total_collected += counts["collected"]
+            total_passed += counts["passed"]
+            total_failed += counts["failed"]
+            total_skipped += counts["skipped"]
 
         succeeded = (
-            completed.returncode == 0
-            and counts["collected"] > 0
-            and counts["failed"] == 0
-            and counts["skipped"] < counts["collected"]
+            all_rc_ok
+            and total_collected > 0
+            and total_failed == 0
+            and total_skipped < total_collected
         )
         obs = _cpu_observations(
             succeeded,
-            counts["collected"],
-            counts["passed"],
-            counts["failed"],
-            counts["skipped"],
+            total_collected,
+            total_passed,
+            total_failed,
+            total_skipped,
         )
+        obs["cpuWorkers"] = len(shards)
         obs["environment"] = _environment_observations(values)
         if tl_identity is not None:
             obs["tilelang"] = tl_identity
         if not succeeded:
-            sys.stderr.write((completed.stdout + "\n" + completed.stderr)[-4000:])
+            if combined_tails:
+                sys.stderr.write("\n".join(combined_tails)[-4000:])
+            else:
+                tail = "\n".join(
+                    (res.stdout + "\n" + res.stderr)[-1500:]
+                    for _, _, res in shard_results
+                )
+                sys.stderr.write(tail[-4000:])
         return (0 if succeeded else 1), obs
 
 

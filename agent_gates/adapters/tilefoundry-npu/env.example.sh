@@ -87,6 +87,10 @@ TILEFOUNDRY_NPU_TILELANG_BUILD=
 #     tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators
 TILEFOUNDRY_NPU_CPU_TESTS=
 
+# Optional: positive integer in 1..16 controlling parallel file-sharded pytest workers
+# for `tilefoundry-npu-cpu`. Leave empty to auto-cap at min(12, os.cpu_count()).
+TILEFOUNDRY_NPU_CPU_WORKERS=
+
 # Optional: comma- or whitespace-separated list of RELATIVE pytest file or directory
 # paths inside the TileFoundry checkout (`--source`), e.g.:
 #   TILEFOUNDRY_NPU_DEVICE_TESTS=tests/ascend/e2e/test_vadd_npu.py

@@ -59,6 +59,10 @@ conflicting exports in the launching environment):
   five device-only node ids under `tests/ascend/agent` and `tests/ascend/target`
   are passed as exact `--deselect=` arguments when their files exist, so the
   CPU gate keeps the host assertions in those files without opening a device.
+- `TILEFOUNDRY_NPU_CPU_WORKERS`: optional integer in `1..16` controlling how
+  many parallel file-sharded `pytest` worker subprocesses `tilefoundry-npu-cpu`
+  spawns (with single-threaded BLAS/OpenMP/PyTorch env per worker). Leave empty
+  for automatic `min(12, cpu_count)`.
 - `TILEFOUNDRY_NPU_DEVICE_TESTS`: optional comma- or whitespace-separated
   **relative** pytest paths under `--source` executed inside the NPU lease
   window after the built-in FP32/BF16 probe. Leave empty to run only the
