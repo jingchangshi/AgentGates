@@ -198,7 +198,7 @@ VALID_CANN_SERIES = ("cann_9_2", "cann_9_3")
 
 
 def resolve_cann_series(source: dict | None = None) -> str:
-    """Resolve CANN surface series (cann_9_2 / cann_9_3) from env or CANN setup."""
+    """Resolve CANN surface series (default cann_9_3; explicit cann_9_2 / cann_9_3)."""
     src = os.environ if source is None else source
     explicit = (src.get("TILEFOUNDRY_NPU_CANN_SERIES") or "").strip()
     if explicit:
@@ -207,31 +207,9 @@ def resolve_cann_series(source: dict | None = None) -> str:
                 f"TILEFOUNDRY_NPU_CANN_SERIES must be one of {VALID_CANN_SERIES}: {explicit!r}"
             )
         return explicit
-    cann_setup = (src.get("TILEFOUNDRY_NPU_CANN_SETUP") or CANN_SET_ENV or "").strip()
-    if cann_setup:
-        import re as _re  # noqa: PLC0415
-
-        setup_path = Path(cann_setup)
-        for root in (setup_path.parent, setup_path.resolve().parent):
-            for rel in (
-                "version.cfg",
-                "version.info",
-                "compiler/version.info",
-                "x86_64-linux/ascend_toolkit_install.info",
-                "aarch64-linux/ascend_toolkit_install.info",
-            ):
-                meta_file = root / rel
-                if meta_file.is_file():
-                    text = meta_file.read_text(encoding="utf-8", errors="ignore")
-                    if _re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", text):
-                        return "cann_9_3"
-                    if _re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", text):
-                        return "cann_9_2"
-        for probe in (cann_setup, str(setup_path.resolve())):
-            if _re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", probe):
-                return "cann_9_3"
-            if _re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", probe):
-                return "cann_9_2"
+    # cann_9_3 is the sole active mainline; cann_9_2 is an inert schema
+    # placeholder selectable ONLY when explicitly set via
+    # TILEFOUNDRY_NPU_CANN_SERIES=cann_9_2.
     return "cann_9_3"
 
 

@@ -1545,6 +1545,58 @@ class OptionalAgentKeysCase(unittest.TestCase):
                     {"cannSeries": "cann_9_3", "bishengArch": "dav-3510"},
                 )
 
+            for legacy_dir_name, legacy_version in (
+                ("cann-8.5.0", "Version=8.5.0\n"),
+                ("cann-9.2.0", "Version=9.2.0\n"),
+            ):
+                legacy_root = self.root / legacy_dir_name
+                (legacy_root / "compiler").mkdir(parents=True)
+                (legacy_root / "set_env.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (legacy_root / "compiler" / "version.info").write_text(legacy_version, encoding="utf-8")
+                self.write_env(TILEFOUNDRY_NPU_CANN_SETUP=str(legacy_root / "set_env.sh"))
+                with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                    self.assertEqual(GATE.main(["--check-config"]), 0)
+                    values = GATE.machine_values()
+                    self.assertEqual(GATE.resolve_cann_series(values), "cann_9_3")
+                    self.assertEqual(ENV_CONTEXT.resolve_cann_series(values), "cann_9_3")
+
+                    captured_dev_env = {}
+                    probe_json = json.dumps({
+                        "tilefoundryImported": True,
+                        "npuAvailable": True,
+                        "deviceCountOne": True,
+                        "tensorOnDevice": True,
+                        "fp32VectorOk": True,
+                        "bf16MatmulOk": True,
+                        "numericalOk": True,
+                        "synchronizeOk": True,
+                        "deviceMemoryPositive": True,
+                    })
+
+                    def fake_legacy_dev(cmd, *, cwd, env, **kwargs):
+                        captured_dev_env.update(env)
+                        return types.SimpleNamespace(returncode=0, stdout=probe_json + "\n", stderr="")
+
+                    lease = self.root / "locks" / "npu.lock"
+                    dev_env = {
+                        "TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file),
+                        "TILEFOUNDRY_NPU_DEVICE_ID": "0",
+                        "AGENT_GATES_DEVICE_LEASE_PATH": str(lease),
+                        "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:0",
+                        "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "2",
+                    }
+                    with patch.dict(os.environ, dev_env, clear=True), \
+                            patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                            patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_legacy_dev):
+                        rc_d, obs_d = GATE.run_device(GATE.machine_values(), 30.0)
+                    self.assertEqual(rc_d, 0)
+                    self.assertEqual(captured_dev_env["TILEFOUNDRY_CANN_SERIES"], "cann_9_3")
+                    self.assertEqual(obs_d["environment"]["cannSeries"], "cann_9_3")
+                    self.assertEqual(
+                        obs_d["environment"],
+                        {"cannSeries": "cann_9_3", "bishengArch": "dav-3510"},
+                    )
+
             self.write_env(
                 TILEFOUNDRY_NPU_CANN_SETUP=str(cann93_root / "set_env.sh"),
                 TILEFOUNDRY_NPU_CANN_SERIES="cann_9_2",
