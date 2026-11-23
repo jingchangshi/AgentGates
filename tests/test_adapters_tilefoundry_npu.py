@@ -1591,6 +1591,18 @@ class OptionalAgentKeysCase(unittest.TestCase):
         self.assertIn("tests/ascend/ir", GATE.default_cpu_tests(v49_src))
         self.assertNotIn("tests/ascend/cost_model", GATE.default_cpu_tests(v49_src))
 
+        cache_dir = v49_src / "tests" / "ascend" / "ir" / "__pycache__"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "test_old.pyc").write_bytes(b"pyc")
+        (v49_src / "tests" / "tilefoundry" / "test_a.py").write_text("x = 1\n", encoding="utf-8")
+        (v49_src / "tests" / "ascend" / "target" / "test_b.py").write_text("y = 2\n", encoding="utf-8")
+        (v49_src / "tests" / "ascend" / "passes" / "test_c.py").write_text("z = 3\n", encoding="utf-8")
+        (v49_src / "tests" / "ascend" / "operators" / "test_d.py").write_text("w = 4\n", encoding="utf-8")
+        filtered_tests = GATE.default_cpu_tests(v49_src)
+        self.assertNotIn("tests/ascend/ir", filtered_tests)
+        shards = GATE._expand_cpu_test_shards(v49_src, filtered_tests, 4)
+        self.assertGreater(len(shards), 1)
+
 
 
 class CannbenchRemoteCase(unittest.TestCase):

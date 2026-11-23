@@ -1013,10 +1013,32 @@ def _parse_test_list(raw: str | None, default: tuple[str, ...]) -> tuple[str, ..
     return tuple(parts)
 
 
+def _is_active_cpu_suite_path(path: Path) -> bool:
+    """Return True when path is a file, an empty mock dir, or has non-cache entries."""
+    if not path.exists():
+        return False
+    if path.is_file():
+        return True
+    entries = list(path.iterdir())
+    if not entries:
+        return True
+    for child in entries:
+        if child.name in ("__pycache__", ".pytest_cache"):
+            continue
+        if child.is_dir():
+            if _is_active_cpu_suite_path(child):
+                return True
+        elif child.suffix != ".pyc":
+            return True
+    return False
+
+
 def default_cpu_tests(source: Path) -> tuple[str, ...]:
     """CPU suite paths from default and optional lists that exist in this checkout."""
     return tuple(
-        rel for rel in (*DEFAULT_CPU_TESTS, *OPTIONAL_CPU_TESTS) if (source / rel).exists()
+        rel
+        for rel in (*DEFAULT_CPU_TESTS, *OPTIONAL_CPU_TESTS)
+        if _is_active_cpu_suite_path(source / rel)
     )
 
 
