@@ -230,7 +230,9 @@ def resolve_cann_series(source: dict | None = None) -> str:
         for probe in (cann_setup, str(setup_path.resolve())):
             if _re.search(r"(?:^|[^0-9])9\.3(?:[^0-9]|$)", probe):
                 return "cann_9_3"
-    return "cann_9_2"
+            if _re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", probe):
+                return "cann_9_2"
+    return "cann_9_3"
 
 
 def forward_optional_machine_env(env: dict, source: dict | None = None) -> dict:

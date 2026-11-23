@@ -146,13 +146,14 @@ REQUIRED = (
 DEFAULT_CPU_TESTS = (
     "tests/tilefoundry",
     "tests/ascend/target",
-    "tests/ascend/ir",
     "tests/ascend/passes",
     "tests/ascend/operators",
 )
-# Collected when present so the V2 native CPU gate covers the agent and host L3
-# suites without breaking older checkouts that predate them.
+# Collected when present so the V2 native CPU gate covers the agent, cost_model,
+# host L3, and legacy IR suites without breaking checkouts that omit or predate them.
 OPTIONAL_CPU_TESTS = (
+    "tests/ascend/ir",
+    "tests/ascend/cost_model",
     "tests/ascend/agent",
     "tests/ascend/sil",
     "tests/ascend/benchmarks/test_l3_contract_host.py",
@@ -1013,9 +1014,9 @@ def _parse_test_list(raw: str | None, default: tuple[str, ...]) -> tuple[str, ..
 
 
 def default_cpu_tests(source: Path) -> tuple[str, ...]:
-    """Base CPU suite plus optional paths that exist in this checkout."""
-    return DEFAULT_CPU_TESTS + tuple(
-        rel for rel in OPTIONAL_CPU_TESTS if (source / rel).exists()
+    """CPU suite paths from default and optional lists that exist in this checkout."""
+    return tuple(
+        rel for rel in (*DEFAULT_CPU_TESTS, *OPTIONAL_CPU_TESTS) if (source / rel).exists()
     )
 
 
@@ -4095,7 +4096,7 @@ def _forward_proxy_env(
 def _detect_cann_series_from_setup(cann_setup: str) -> str:
     raw = str(cann_setup or "").strip()
     if not raw:
-        return "cann_9_2"
+        return "cann_9_3"
     candidates: list[Path] = []
     setup_path = Path(raw)
     for base in (setup_path.parent, setup_path.resolve().parent):
@@ -4126,7 +4127,7 @@ def _detect_cann_series_from_setup(cann_setup: str) -> str:
             return "cann_9_3"
         if re.search(r"(?:^|[^0-9])(?:9\.2|8\.5|9\.1)(?:[^0-9]|$)", probe):
             return "cann_9_2"
-    return "cann_9_2"
+    return "cann_9_3"
 
 
 def resolve_cann_series(values: dict[str, str]) -> str:

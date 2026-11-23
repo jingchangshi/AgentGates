@@ -513,10 +513,12 @@ class FastRequestCase(unittest.TestCase):
 
     def test_cpu_defaults_include_optional_suites_only_when_present(self):
         shutil.rmtree(self.src / "tests" / "ascend" / "agent")
+        shutil.rmtree(self.src / "tests" / "ascend" / "ir")
         self.assertEqual(
             GATE.default_cpu_tests(self.src),
             GATE.DEFAULT_CPU_TESTS,
         )
+        (self.src / "tests" / "ascend" / "cost_model").mkdir(parents=True)
         (self.src / "tests" / "ascend" / "agent").mkdir(parents=True)
         (self.src / "tests" / "ascend" / "sil").mkdir(parents=True)
         (self.src / "tests" / "ascend" / "benchmarks").mkdir(parents=True)
@@ -524,12 +526,16 @@ class FastRequestCase(unittest.TestCase):
             "def test_host():\n    assert True\n", encoding="utf-8"
         )
         tests = GATE.default_cpu_tests(self.src)
+        self.assertNotIn("tests/ascend/ir", tests)
         for rel in (
+            "tests/ascend/cost_model",
             "tests/ascend/agent",
             "tests/ascend/sil",
             "tests/ascend/benchmarks/test_l3_contract_host.py",
         ):
             self.assertIn(rel, tests)
+        (self.src / "tests" / "ascend" / "ir").mkdir(parents=True)
+        self.assertIn("tests/ascend/ir", GATE.default_cpu_tests(self.src))
         self.assertEqual(
             GATE.cpu_tests({"TILEFOUNDRY_NPU_CPU_TESTS": "tests/device"}, self.src),
             ("tests/device",),

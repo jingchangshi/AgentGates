@@ -360,8 +360,9 @@ class CheckConfigAndRunCase(unittest.TestCase):
         old_cwd = os.getcwd()
         try:
             os.chdir(self.src)
+            active_dirs = GATE.default_cpu_tests(self.src)
             for idx in range(14):
-                rel_dir = GATE.DEFAULT_CPU_TESTS[idx % len(GATE.DEFAULT_CPU_TESTS)]
+                rel_dir = active_dirs[idx % len(active_dirs)]
                 tf = self.src / rel_dir / f"test_mod_{idx:02d}.py"
                 tf.write_text("x = " + ("1\n" * ((idx + 1) * 20)), encoding="utf-8")
             for node in GATE.CPU_DEVICE_NODE_DESELECTS:
@@ -1255,14 +1256,16 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 with patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=fake_cpu) as cpu:
                     rc, obs_cpu = GATE.run_cpu(GATE.machine_values(), 30.0)
                 self.assertEqual(rc, 0)
-                self.assertTrue(cpu.call_args.args[0].endswith(" " + " ".join(GATE.DEFAULT_CPU_TESTS)))
+                self.assertTrue(
+                    cpu.call_args.args[0].endswith(" " + " ".join(GATE.default_cpu_tests(self.src)))
+                )
                 self.assertNotIn("TILEFOUNDRY_NPU_LLM_BACKEND", captured_env)
                 self.assertNotIn("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", captured_env)
                 self.assertEqual(captured_env["TILEFOUNDRY_NPU_TILELANG_REPO"], "/refs/tilelang")
-                self.assertEqual(captured_env["TILEFOUNDRY_CANN_SERIES"], "cann_9_2")
+                self.assertEqual(captured_env["TILEFOUNDRY_CANN_SERIES"], "cann_9_3")
                 self.assertEqual(
                     obs_cpu["environment"],
-                    {"cannSeries": "cann_9_2", "bishengArch": "dav-3510"},
+                    {"cannSeries": "cann_9_3", "bishengArch": "dav-3510"},
                 )
 
                 captured_dev_env = {}
@@ -1482,6 +1485,20 @@ class OptionalAgentKeysCase(unittest.TestCase):
         old_cwd = os.getcwd()
         try:
             os.chdir(self.src)
+            generic_dir = self.root / "cann-latest"
+            generic_dir.mkdir(parents=True)
+            generic_target = generic_dir / "set_env.sh"
+            generic_target.write_text("#!/bin/sh\n", encoding="utf-8")
+            generic_link = self.root / "cann-symlink" / "set_env.sh"
+            generic_link.parent.mkdir(parents=True)
+            generic_link.symlink_to(generic_target)
+            self.write_env(TILEFOUNDRY_NPU_CANN_SETUP=str(generic_link))
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                self.assertEqual(GATE.main(["--check-config"]), 0)
+                values = GATE.machine_values()
+                self.assertEqual(GATE.resolve_cann_series(values), "cann_9_3")
+                self.assertEqual(ENV_CONTEXT.resolve_cann_series(values), "cann_9_3")
+
             cann93_root = self.root / "cann-9.3.0"
             (cann93_root / "compiler").mkdir(parents=True)
             (cann93_root / "set_env.sh").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -1543,6 +1560,36 @@ class OptionalAgentKeysCase(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 75)
         finally:
             os.chdir(old_cwd)
+
+    def test_default_cpu_tests_filters_deleted_ir_and_includes_cost_model(self):
+        import shutil
+        v49_src = self.root / "tf-v49"
+        for sub in (
+            "src/tilefoundry",
+            "tests/tilefoundry",
+            "tests/ascend/target",
+            "tests/ascend/passes",
+            "tests/ascend/operators",
+            "tests/ascend/cost_model",
+        ):
+            (v49_src / sub).mkdir(parents=True)
+        tests = GATE.default_cpu_tests(v49_src)
+        self.assertNotIn("tests/ascend/ir", tests)
+        self.assertIn("tests/ascend/cost_model", tests)
+        self.assertEqual(
+            tests,
+            (
+                "tests/tilefoundry",
+                "tests/ascend/target",
+                "tests/ascend/passes",
+                "tests/ascend/operators",
+                "tests/ascend/cost_model",
+            ),
+        )
+        shutil.rmtree(v49_src / "tests" / "ascend" / "cost_model")
+        (v49_src / "tests" / "ascend" / "ir").mkdir(parents=True)
+        self.assertIn("tests/ascend/ir", GATE.default_cpu_tests(v49_src))
+        self.assertNotIn("tests/ascend/cost_model", GATE.default_cpu_tests(v49_src))
 
 
 
