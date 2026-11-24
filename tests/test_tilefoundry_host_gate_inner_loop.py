@@ -216,9 +216,24 @@ class DeviceModeCase(unittest.TestCase):
         self.write_env(**env_file_overrides)
         env = self.environment()
         env.update(extra_env or {})
+        free_processes = {
+            "ok": True,
+            "processTableSeen": True,
+            "processes": [],
+            "error": None,
+        }
         with self._in_source(), \
                 patch.dict(os.environ, env, clear=True), \
                 patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                patch.object(
+                    GATE, "_probe_npu_mapping",
+                    return_value={"ok": True, "npuId": 1, "error": None},
+                ), \
+                patch.object(
+                    GATE, "_probe_device_health",
+                    return_value={"ok": True, "healthKind": "ok", "healthValue": "OK", "error": None},
+                ), \
+                patch.object(GATE, "_probe_device_processes", return_value=free_processes), \
                 patch.object(GATE.locking, "lock_root", return_value=self.lock_root):
             return GATE.run_device(GATE.machine_values(), 60.0, fast=True)
 

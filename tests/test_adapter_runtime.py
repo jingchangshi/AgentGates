@@ -128,6 +128,37 @@ class SmiAndDeviceWindowCase(unittest.TestCase):
                             with adapter_runtime.device_window(lock_root, 1, exclusive=False, wait_seconds=0.0):
                                 pass
 
+    def test_run_smi_retries_transient_exit_code_215_and_succeeds(self):
+        calls = [
+            subprocess.CompletedProcess(["npu-smi", "info", "-t", "proc-mem", "-i", "0"], 215, "", "busy"),
+            subprocess.CompletedProcess(["npu-smi", "info", "-t", "proc-mem", "-i", "0"], 215, "", "busy"),
+            subprocess.CompletedProcess(["npu-smi", "info", "-t", "proc-mem", "-i", "0"], 0, "\tNPU ID : 0\n", ""),
+        ]
+        with patch.object(adapter_runtime.shutil, "which", return_value="/usr/local/sbin/npu-smi"), \
+                patch.object(adapter_runtime.subprocess, "run", side_effect=calls) as run_mock, \
+                patch.object(adapter_runtime.time, "sleep") as sleep_mock:
+            out = adapter_runtime._run_smi(["info", "-t", "proc-mem", "-i", "0"])
+        self.assertEqual(out, "\tNPU ID : 0\n")
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            list(adapter_runtime.SMI_RETRY_BACKOFF_SECONDS),
+        )
+
+    def test_run_smi_raises_blocked_env_after_exhausting_215_retries(self):
+        calls = [
+            subprocess.CompletedProcess(["npu-smi", "info", "-m"], 215, "", "transient"),
+            subprocess.CompletedProcess(["npu-smi", "info", "-m"], 215, "", "transient"),
+            subprocess.CompletedProcess(["npu-smi", "info", "-m"], 215, "", "still failing"),
+        ]
+        with patch.object(adapter_runtime.shutil, "which", return_value="/usr/local/sbin/npu-smi"), \
+                patch.object(adapter_runtime.subprocess, "run", side_effect=calls) as run_mock, \
+                patch.object(adapter_runtime.time, "sleep"):
+            with self.assertRaises(adapter_runtime.BlockedEnv) as caught:
+                adapter_runtime._run_smi(["info", "-m"])
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertIn("exited 215", str(caught.exception))
+
 
 class RunHostBashCase(unittest.TestCase):
     def test_set_plus_u_cann_and_temp_isolation(self):

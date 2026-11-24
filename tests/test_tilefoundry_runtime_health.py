@@ -545,7 +545,7 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertFalse(sink["cleanup"]["incomplete"])
         print(f"runtime-health occupancy-unknown-to-exit measured={measured:.3f}s")
 
-    def test_l3_legal_sharing_is_recorded_but_not_aborted(self):
+    def test_l3_external_occupancy_ends_own_run_but_never_kills_tenant(self):
         self.external = subprocess.Popen(
             ["/bin/sleep", "30"],
             start_new_session=True,
@@ -574,23 +574,24 @@ class RuntimeHealthCase(unittest.TestCase):
                 patch.object(GATE, "_probe_device_processes", return_value=shared), \
                 patch.object(GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 0.1), \
                 self.lease_environment():
-            with GATE._open_device_window("1", wait_seconds=0, require_idle=True):
-                completed = GATE._run_host_bash_monitored(
-                    "sleep 2",
-                    cwd=self.root,
-                    env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
-                    cann_setup=None,
-                    conda_sh=None,
-                    conda_env=None,
-                    timeout=10,
-                    isolate_temp=True,
-                    mode="l3",
-                    device="1",
-                    monitor_sink=sink,
-                )
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(sink["outcome"], "completed")
-        self.assertNotIn("abort", sink)
+            with self.assertRaises(GATE.BridgeError) as caught:
+                with GATE._open_device_window("1", wait_seconds=0, require_idle=True):
+                    GATE._run_host_bash_monitored(
+                        "sleep 30",
+                        cwd=self.root,
+                        env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+                        cann_setup=None,
+                        conda_sh=None,
+                        conda_env=None,
+                        timeout=10,
+                        isolate_temp=True,
+                        mode="l3",
+                        device="1",
+                        monitor_sink=sink,
+                    )
+        self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+        self.assertEqual(getattr(caught.exception, "occupancy", None), "shared(1)")
+        self.assertEqual(sink["abort"]["kind"], "external_occupancy")
         self.assertEqual(sink["occupancy"], "shared(1)")
         self.assertIn(self.external.pid, sink["externalPids"])
         self.assertIsNone(self.external.poll())
@@ -1104,3 +1105,95 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertTrue(marker.exists(), "the npu:1 marker was removed by another card's window")
         self.assertFalse(other_marker.exists(), "a marker was created for the unrelated card")
         self.assertIsNone(self.residue.poll(), "another card's window touched this card's residue")
+
+    def test_probe_retries_transient_exit_code_215_and_succeeds(self):
+        calls = []
+
+        def fake_cmd(argv, _timeout):
+            calls.append(argv)
+            if len(calls) < 3:
+                return {
+                    "argv": argv,
+                    "pid": 100 + len(calls),
+                    "returncode": 215,
+                    "stdout": "",
+                    "stderr": "transient",
+                    "seconds": 0.01,
+                    "timedOut": False,
+                    "unreaped": False,
+                    "wchan": None,
+                    "error": None,
+                }
+            return {
+                "argv": argv,
+                "pid": 103,
+                "returncode": 0,
+                "stdout": "\tNPU ID : 7\n\tNo process in device.\n",
+                "stderr": "",
+                "seconds": 0.01,
+                "timedOut": False,
+                "unreaped": False,
+                "wchan": None,
+                "error": None,
+            }
+
+        with patch.object(GATE, "_bounded_host_command", side_effect=fake_cmd), \
+                patch.object(GATE.time, "sleep") as sleep_mock:
+            res = GATE._probe_device_processes(7, 5.0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            list(GATE.adapter_runtime.SMI_RETRY_BACKOFF_SECONDS),
+        )
+
+    def test_fast_post_run_pre_release_intrusion_check_aborts_under_2s(self):
+        self.external = subprocess.Popen(
+            ["/bin/sleep", "30"],
+            start_new_session=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        external_row = {
+            "ok": True,
+            "processTableSeen": True,
+            "processes": [{
+                "pid": str(self.external.pid),
+                "name": "sleep",
+                "memoryMb": "1",
+            }],
+            "error": None,
+        }
+        # First probe during run sees free; post-run pre-release check sees intruder.
+        processes = self._sequence([self._free_processes(), external_row], external_row)
+        health = self._sequence([_row("ok", "OK")], _row("ok", "OK"))
+        sink: dict = {}
+        with patch.object(GATE, "_device_occupancy", return_value="free"), \
+                patch.object(
+                    GATE, "_probe_npu_mapping",
+                    return_value={"ok": True, "npuId": 7, "error": None},
+                ), \
+                patch.object(GATE, "_probe_device_health", side_effect=health), \
+                patch.object(GATE, "_probe_device_processes", side_effect=processes), \
+                patch.object(GATE, "HEALTH_POLL_SECONDS", 0.05), \
+                patch.object(GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 10.0), \
+                self.lease_environment():
+            with self.assertRaises(GATE.BridgeError) as caught:
+                with GATE._open_device_window("1", wait_seconds=0, require_idle=True):
+                    GATE._run_host_bash_monitored(
+                        "sleep 0.25",
+                        cwd=self.root,
+                        env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+                        cann_setup=None,
+                        conda_sh=None,
+                        conda_env=None,
+                        timeout=10,
+                        isolate_temp=True,
+                        mode="fast",
+                        device="1",
+                        monitor_sink=sink,
+                        external_probe_limit=1,
+                    )
+        self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+        self.assertEqual(getattr(caught.exception, "occupancy", None), "shared(1)")
+        self.assertEqual(sink["abort"]["kind"], "external_occupancy")
+        self.assertIsNone(self.external.poll())

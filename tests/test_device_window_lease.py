@@ -122,5 +122,80 @@ class TwoProcessWindowCase(unittest.TestCase):
             os.close(held)
 
 
+class SharedLockRootPermissionsCase(unittest.TestCase):
+    """Shared device lock roots must expose 0o1777 dir and 0o666 lock/quarantine files."""
+
+    def test_shared_device_lock_root_uses_1777_dir_and_0666_files(self):
+        import importlib.util
+        import stat
+        from unittest.mock import patch
+        from agent_gates import adapter_runtime, locking
+
+        gate_path = ROOT / 'agent_gates/adapters/tilefoundry-npu/scripts/tilefoundry_host_gate.py'
+        spec = importlib.util.spec_from_file_location('tf_gate_perm_test', gate_path)
+        assert spec is not None and spec.loader is not None
+        gate = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = gate
+        spec.loader.exec_module(gate)
+
+        with tempfile.TemporaryDirectory() as td:
+            shared_root = Path(td) / 'shared-locks'
+            lease_path = shared_root / 'npu-1.lock'
+            old_umask = os.umask(0o022)
+            try:
+                with patch.dict(os.environ, {
+                    'AGENT_GATES_DEVICE_LOCK_ROOT': str(shared_root),
+                    'AGENT_GATES_DEVICE_LEASE_PATH': str(lease_path),
+                    'AGENT_GATES_DEVICE_LEASE_RESOURCE': 'npu:1',
+                    'AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS': '0',
+                }, clear=False):
+                    self.assertTrue(locking.is_shared_device_lock_root(shared_root))
+                    self.assertFalse(locking.is_shared_device_lock_root(Path(td) / 'private'))
+
+                    with locking.ResourceLock('npu:1', shared_root):
+                        pass
+                    self.assertEqual(stat.S_IMODE(shared_root.stat().st_mode), 0o1777)
+                    self.assertEqual(
+                        stat.S_IMODE(locking.lock_path('npu:1', shared_root).stat().st_mode),
+                        0o666,
+                    )
+
+                    with patch.object(adapter_runtime, 'processes_on', return_value=([], 1)):
+                        with adapter_runtime.device_window(shared_root, 1, exclusive=True):
+                            pass
+                    self.assertEqual(stat.S_IMODE(lease_path.stat().st_mode), 0o666)
+
+                    with patch.object(gate, '_device_occupancy', return_value='free'):
+                        with gate._open_device_window('1', wait_seconds=0, require_idle=True):
+                            pass
+                    self.assertEqual(stat.S_IMODE(lease_path.stat().st_mode), 0o666)
+
+                    with gate._open_msprof_lock(locking.device_lock_root(), timeout_seconds=1.0) as msprof_lock:
+                        self.assertEqual(msprof_lock.parent.resolve(), shared_root.resolve())
+                    self.assertEqual(stat.S_IMODE((shared_root / '.msprof.lock').stat().st_mode), 0o666)
+
+                    identity = gate._process_identity(os.getpid())
+                    assert identity is not None
+                    cleanup = {
+                        'surviving': [os.getpid()],
+                        'survivingProcesses': [identity],
+                    }
+                    record = gate._quarantine_cleanup(
+                        cleanup,
+                        lease_path=str(lease_path),
+                        resource='npu:1',
+                        device='1',
+                        token='tok',
+                        phase='test',
+                        reason='perm-check',
+                    )
+                    self.assertTrue(record['written'])
+                    q_path = Path(record['path'])
+                    self.assertEqual(stat.S_IMODE(q_path.stat().st_mode), 0o666)
+                    q_path.unlink()
+            finally:
+                os.umask(old_umask)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -2702,16 +2702,17 @@ def _quarantine_cleanup(
         "phase": phase,
         "processes": identities,
     }
+    shared = locking.is_shared_device_lock_root(path.parent)
     tmp_path: str | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        locking.ensure_lock_dir(path.parent, shared=shared)
         fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_path, 0o600)
+        os.chmod(tmp_path, 0o666 if shared else 0o600)
         os.replace(tmp_path, path)
         tmp_path = None
         record["written"] = True
@@ -2765,8 +2766,9 @@ def _open_device_window(
             raise BridgeError("invalid AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS") from exc
     wait_seconds = max(0.0, float(wait_seconds))
 
-    Path(lease_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lease_file = Path(lease_path)
+    shared = locking.is_shared_device_lock_root(lease_file.parent)
+    fd = locking.open_lock_file(lease_file, shared=shared)
     started = time.monotonic()
     deadline = started + wait_seconds
     try:
@@ -2952,6 +2954,27 @@ def _bounded_host_command(argv: list[str], timeout: float) -> dict:
         }
 
 
+def _bounded_smi_command(argv: list[str], timeout: float) -> dict:
+    """Run a bounded npu-smi probe command, retrying transient exit code 215."""
+    backoffs = adapter_runtime.SMI_RETRY_BACKOFF_SECONDS
+    retry_codes = adapter_runtime.SMI_TRANSIENT_RETRY_CODES
+    result: dict | None = None
+    for attempt in range(len(backoffs) + 1):
+        result = _bounded_host_command(argv, timeout)
+        if (
+            result["error"] is None
+            and not result["timedOut"]
+            and not result["unreaped"]
+            and result["returncode"] in retry_codes
+            and attempt < len(backoffs)
+        ):
+            time.sleep(backoffs[attempt])
+            continue
+        return result
+    assert result is not None
+    return result
+
+
 def _npu_id_from_mapping(text: str, device: str) -> tuple[int | None, str | None]:
     matches: list[int] = []
     for line in text.splitlines():
@@ -2972,7 +2995,7 @@ def _npu_id_from_mapping(text: str, device: str) -> tuple[int | None, str | None
 
 def _probe_npu_mapping(device: str, timeout: float) -> dict:
     smi = adapter_runtime.smi_command()
-    result = _bounded_host_command([smi, "info", "-m"], timeout)
+    result = _bounded_smi_command([smi, "info", "-m"], timeout)
     base = {
         "kind": "mapping",
         "command": f"{smi} info -m",
@@ -3049,7 +3072,7 @@ def _health_value_from_info(text: str, npu_id: int) -> str | None:
 def _probe_device_health(npu_id: int, timeout: float) -> dict:
     smi = adapter_runtime.smi_command()
     command = [smi, "info", "-t", "health", "-i", str(npu_id)]
-    result = _bounded_host_command(command, timeout)
+    result = _bounded_smi_command(command, timeout)
     base = {
         "kind": "health",
         "command": " ".join(command),
@@ -3082,7 +3105,7 @@ def _probe_device_health(npu_id: int, timeout: float) -> dict:
 
     # Older npu-smi builds do not support `-t health`; fall back to the health
     # table in the full dump. Missing/ambiguous rows remain unknown.
-    fallback = _bounded_host_command([smi, "info"], timeout)
+    fallback = _bounded_smi_command([smi, "info"], timeout)
     fallback_base = {
         **base,
         "command": f"{smi} info",
@@ -3126,7 +3149,7 @@ def _probe_device_health(npu_id: int, timeout: float) -> dict:
 def _probe_device_processes(npu_id: int, timeout: float) -> dict:
     smi = adapter_runtime.smi_command()
     command = [smi, "info", "-t", "proc-mem", "-i", str(npu_id)]
-    result = _bounded_host_command(command, timeout)
+    result = _bounded_smi_command(command, timeout)
     base = {
         "kind": "occupancy",
         "command": " ".join(command),
@@ -3656,10 +3679,10 @@ class _RunHealthMonitor:
 
         if self.external_pids:
             self.external_streak += 1
-            if self.mode == "l4" and self.external_streak >= self.external_limit:
+            if self.mode in {"fast", "l3", "l4"} and self.external_streak >= self.external_limit:
                 self._abort_run(
                     "external_occupancy",
-                    "L4 lost exclusivity after the lease opened: external device "
+                    f"{self.mode.upper()} lost exclusivity after the lease opened: external device "
                     f"process(es) {self.external_pids[:8]} remained on NPU {self.npu_id} "
                     f"for {self.external_streak} consecutive probes",
                     occupancy=f"shared({len(self.external_pids)})",
@@ -3955,6 +3978,19 @@ def _run_host_bash_monitored(
         monitor_sink.update(monitor.snapshot())
         raise error
     completed = result["completed"]
+    if mode in {"fast", "l4"} and monitor.known_pids:
+        monitor._probe()
+        if monitor.abort is not None and monitor.abort.get("kind") == "external_occupancy":
+            abort = monitor.abort
+            cleanup = _cleanup(True, f"post-run intrusion fence ({abort.get('kind')})")
+            monitor_sink.update(monitor.snapshot())
+            raise BridgeError(
+                f"runtime health abort ({abort.get('kind')}) before window release on device "
+                f"{device} (npu {monitor.npu_id}): {abort.get('reason')}"
+                + _quarantine_note(cleanup),
+                category="occupancy",
+                occupancy=abort.get("occupancy"),
+            )
     cleanup = _cleanup(
         False, f"host command finished (exit {completed.returncode})"
     )
@@ -3977,9 +4013,9 @@ def _run_host_bash_monitored(
 @contextmanager
 def _open_msprof_lock(wroot: Path, *, timeout_seconds: float = 3600.0):
     """Serialize host-wide CANN msprof profiling across concurrent NPU device runs."""
-    wroot.mkdir(parents=True, exist_ok=True)
+    shared = locking.is_shared_device_lock_root(wroot)
     lock_path = wroot / ".msprof.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fd = locking.open_lock_file(lock_path, shared=shared)
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     try:
         while True:
@@ -4788,207 +4824,258 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
 
     started = time.monotonic()
     lock = (
-        _open_msprof_lock(locking.lock_root(), timeout_seconds=max(1.0, timeout - 30.0))
+        _open_msprof_lock(
+            locking.device_lock_root(), timeout_seconds=max(1.0, timeout - 30.0)
+        )
         if msprof_lock
         else nullcontext()
     )
-    with lock:
-        with _open_device_window(device) as finalize_window:
-            with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
-                report = Path(tmp) / "junit.xml"
-                run_env = _host_child_env(values, include_llm_credential=bool(tests))
-                credential = run_env.get(_llm_credential_name(values), "").strip()
-                envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
-                if envs_path:
-                    run_env["CONDA_ENVS_PATH"] = envs_path
-                _forward_optional_env(run_env, values)
-                run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
-                # A caller that imported tilefoundry_ascend without CANN sourced
-                # exports "0"; torch only autoloads torch_npu when this is "1".
-                run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
-                run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-                run_env["PYTHONNOUSERSITE"] = "1"
-                run_env["TILELANG_DISABLE_CACHE"] = "0" if cache_enabled else "1"
-                if cache_enabled:
-                    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
-                shim = (run_env.get("TF_SURROGATE_SHIM_DIR") or "").strip() if cache_enabled else ""
-                run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity, shim=shim)
-                if tl_identity is not None:
-                    run_env.setdefault("USE_CUDA", "0")
-                    run_env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
+    require_idle_window = bool(fast_request is not None)
+    health_sink: dict = {}
+    occ = "not_checked"
+    win: dict | None = None
+    try:
+        with lock:
+            with _open_device_window(
+                device, require_idle=require_idle_window
+            ) as finalize_window:
+                with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
+                    report = Path(tmp) / "junit.xml"
+                    run_env = _host_child_env(values, include_llm_credential=bool(tests))
+                    credential = run_env.get(_llm_credential_name(values), "").strip()
+                    envs_path = (values.get("TILEFOUNDRY_NPU_CONDA_ENVS_PATH") or "").strip()
+                    if envs_path:
+                        run_env["CONDA_ENVS_PATH"] = envs_path
+                    _forward_optional_env(run_env, values)
+                    run_env["ASCEND_RT_VISIBLE_DEVICES"] = device
+                    # A caller that imported tilefoundry_ascend without CANN sourced
+                    # exports "0"; torch only autoloads torch_npu when this is "1".
+                    run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "1"
+                    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                    run_env["PYTHONNOUSERSITE"] = "1"
+                    run_env["TILELANG_DISABLE_CACHE"] = "0" if cache_enabled else "1"
+                    if cache_enabled:
+                        run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
+                    shim = (run_env.get("TF_SURROGATE_SHIM_DIR") or "").strip() if cache_enabled else ""
+                    run_env["PYTHONPATH"] = _effective_pythonpath(tl_identity, shim=shim)
+                    if tl_identity is not None:
+                        run_env.setdefault("USE_CUDA", "0")
+                        run_env["TILEFOUNDRY_EXPECTED_TILELANG_SOURCE"] = tl_identity["source"]
 
-                if fast_request is not None:
-                    # The child reads only the validated snapshot. The original
-                    # request is re-hashed after the run, so a caller cannot
-                    # rewrite the terms of the run while the device is held.
-                    assert fast_repo is not None and fast_caches is not None
-                    snapshot = Path(tmp) / "fast_request.json"
-                    snapshot.write_bytes(fast_request.raw)
-                    snapshot.chmod(0o400)
-                    run_env[FAST_REQUEST_ENV] = str(snapshot)
-                    run_env[FAST_REQUEST_SOURCE_ENV] = str(source)
-                    run_env["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(fast_repo)
-                    run_env["TILELANG_CACHE_DIR"] = str(fast_caches["tilelang"])
-                    run_env["CANNBENCH_CACHE_DIR"] = str(fast_caches["reference"])
-                    run_env.pop(FAST_REQUEST_LEGACY_ENV, None)
-                    run_env.pop(FAST_MICRO_PROBE_LEGACY_ENV, None)
+                    if fast_request is not None:
+                        # The child reads only the validated snapshot. The original
+                        # request is re-hashed after the run, so a caller cannot
+                        # rewrite the terms of the run while the device is held.
+                        assert fast_repo is not None and fast_caches is not None
+                        snapshot = Path(tmp) / "fast_request.json"
+                        snapshot.write_bytes(fast_request.raw)
+                        snapshot.chmod(0o400)
+                        run_env[FAST_REQUEST_ENV] = str(snapshot)
+                        run_env[FAST_REQUEST_SOURCE_ENV] = str(source)
+                        run_env["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(fast_repo)
+                        run_env["TILELANG_CACHE_DIR"] = str(fast_caches["tilelang"])
+                        run_env["CANNBENCH_CACHE_DIR"] = str(fast_caches["reference"])
+                        run_env.pop(FAST_REQUEST_LEGACY_ENV, None)
+                        run_env.pop(FAST_MICRO_PROBE_LEGACY_ENV, None)
 
-                if fast:
-                    cmd = " ".join(
-                        [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider",
-                         f"--junit-xml={shlex.quote(str(report))}"]
-                        + [shlex.quote(t) for t in tests]
-                    )
-                else:
-                    probe_path = Path(tmp) / "probe.py"
-                    probe_path.write_text(DEVICE_PROBE, encoding="utf-8")
-                    cmd = f"{shlex.quote(str(python))} {shlex.quote(str(probe_path))}"
-                    if tests:
-                        cmd += " && " + " ".join(
-                            [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider"]
+                    if fast:
+                        cmd = " ".join(
+                            [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider",
+                             f"--junit-xml={shlex.quote(str(report))}"]
                             + [shlex.quote(t) for t in tests]
                         )
-                remaining = max(1.0, timeout - (time.monotonic() - started))
-                try:
-                    completed = adapter_runtime.run_host_bash(
-                        cmd,
-                        cwd=source,
-                        env=run_env,
-                        cann_setup=cann_setup,
-                        conda_sh=conda_sh,
-                        conda_env=conda_env,
-                        timeout=remaining,
-                        isolate_temp=True,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    # run_host_bash SIGTERM/SIGKILLs the whole process group and
-                    # reaps it before raising, so no profiling child survives
-                    # this return and the msprof lock is safe to release.
-                    occ, win = finalize_window()
-                    if exc.stderr:
-                        sys.stderr.write(_redact_llm_credential(exc.stderr, credential)[-4000:])
-                    print(f"{PROG}: device run timed out after {timeout}s", file=sys.stderr)
-                    binding_obs: dict[str, object] = {}
-                    binding_artifacts: list[dict[str, str]] = []
-                    binding_failures: list[str] = []
+                    else:
+                        probe_path = Path(tmp) / "probe.py"
+                        probe_path.write_text(DEVICE_PROBE, encoding="utf-8")
+                        cmd = f"{shlex.quote(str(python))} {shlex.quote(str(probe_path))}"
+                        if tests:
+                            cmd += " && " + " ".join(
+                                [shlex.quote(str(python)), "-m", "pytest", "-p", "no:cacheprovider"]
+                                + [shlex.quote(t) for t in tests]
+                            )
+                    remaining = max(1.0, timeout - (time.monotonic() - started))
+                    try:
+                        try:
+                            completed = _run_host_bash_monitored(
+                                cmd,
+                                mode="fast" if fast_request is not None else "device",
+                                device=device,
+                                monitor_sink=health_sink,
+                                external_probe_limit=1 if fast_request is not None else None,
+                                cwd=source,
+                                env=run_env,
+                                cann_setup=cann_setup,
+                                conda_sh=conda_sh,
+                                conda_env=conda_env,
+                                timeout=remaining,
+                                isolate_temp=True,
+                            )
+                        except subprocess.TimeoutExpired as exc:
+                            # run_host_bash SIGTERM/SIGKILLs the whole process group and
+                            # reaps it before raising, so no profiling child survives
+                            # this return and the msprof lock is safe to release.
+                            occ, win = finalize_window()
+                            if exc.stderr:
+                                sys.stderr.write(_redact_llm_credential(exc.stderr, credential)[-4000:])
+                            print(f"{PROG}: device run timed out after {timeout}s", file=sys.stderr)
+                            binding_obs: dict[str, object] = {}
+                            binding_artifacts: list[dict[str, str]] = []
+                            binding_failures: list[str] = []
+                            if fast_request is not None:
+                                binding_obs, binding_artifacts, binding_failures = _fast_verify_binding(
+                                    fast_request, source
+                                )
+                            if fast:
+                                obs = {
+                                    "exitCodeZero": False,
+                                    "errorCategory": "deadline",
+                                    "testsCollected": 0,
+                                    "testsPassed": 0,
+                                    "testsFailed": 0,
+                                    "testsSkipped": 0,
+                                    "healthMonitoring": health_sink,
+                                    **_window_evidence(occ, win),
+                                    **binding_obs,
+                                }
+                            else:
+                                obs = {
+                                    "exitCodeZero": False,
+                                    "errorCategory": "deadline",
+                                    "healthMonitoring": health_sink,
+                                    **dict.fromkeys(DEVICE_PROBE_FLAGS, False),
+                                    **_window_evidence(occ, win),
+                                }
+                                if tl_identity is not None:
+                                    obs["tilelangReused"] = False
+                            if fast_request is not None:
+                                obs["fastBindingFailures"] = binding_failures
+                                obs["fastRunTimedOut"] = True
+                                obs["artifacts"] = binding_artifacts
+                                obs.update(
+                                    _fast_failure_fields(
+                                        binding_obs, binding_failures, ok=False, timed_out=True
+                                    )
+                                )
+                            if tl_identity is not None:
+                                obs["tilelang"] = tl_identity
+                            obs["environment"] = _environment_observations(values)
+                            return 1, obs
+                    finally:
+                        if win is None:
+                            occ, win = finalize_window()
+
+                    binding_obs = {}
+                    binding_artifacts = []
+                    binding_failures = []
                     if fast_request is not None:
                         binding_obs, binding_artifacts, binding_failures = _fast_verify_binding(
                             fast_request, source
                         )
                     if fast:
+                        counts = _junit_counts(report)
+                        if counts is None:
+                            sys.stderr.write(
+                                _redact_llm_credential(
+                                    completed.stderr or completed.stdout, credential
+                                )[-4000:]
+                            )
+                            print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
+                            counts = {"collected": 0, "passed": 0, "failed": 0, "skipped": 0}
+                        ok = (
+                            completed.returncode == 0
+                            and counts["collected"] > 0
+                            and counts["failed"] == 0
+                            and counts["skipped"] < counts["collected"]
+                            and not binding_failures
+                        )
+                        if not ok:
+                            if binding_failures:
+                                print(
+                                    f"{PROG}: fast request binding failed: {', '.join(binding_failures)}",
+                                    file=sys.stderr,
+                                )
+                            sys.stderr.write(
+                                _redact_llm_credential(
+                                    completed.stdout + "\n" + completed.stderr, credential
+                                )[-4000:]
+                            )
                         obs = {
-                            "exitCodeZero": False,
-                            "testsCollected": 0,
-                            "testsPassed": 0,
-                            "testsFailed": 0,
-                            "testsSkipped": 0,
+                            "exitCodeZero": ok,
+                            "errorCategory": "none" if ok else "candidate",
+                            "testsCollected": counts["collected"],
+                            "testsPassed": counts["passed"],
+                            "testsFailed": counts["failed"],
+                            "testsSkipped": counts["skipped"],
+                            "environment": _environment_observations(values),
+                            "healthMonitoring": health_sink,
                             **_window_evidence(occ, win),
                             **binding_obs,
                         }
-                    else:
-                        obs = {
-                            "exitCodeZero": False,
-                            **dict.fromkeys(DEVICE_PROBE_FLAGS, False),
-                            **_window_evidence(occ, win),
-                        }
-                        if tl_identity is not None:
-                            obs["tilelangReused"] = False
-                    if fast_request is not None:
-                        obs["fastBindingFailures"] = binding_failures
-                        obs["fastRunTimedOut"] = True
-                        obs["artifacts"] = binding_artifacts
-                        obs.update(
-                            _fast_failure_fields(
-                                binding_obs, binding_failures, ok=False, timed_out=True
+                        if fast_request is not None:
+                            obs["fastBindingFailures"] = binding_failures
+                            obs["artifacts"] = binding_artifacts
+                            obs.update(
+                                _fast_failure_fields(
+                                    binding_obs, binding_failures, ok=ok, timed_out=False
+                                )
                             )
-                        )
-                    if tl_identity is not None:
-                        obs["tilelang"] = tl_identity
-                    obs["environment"] = _environment_observations(values)
-                    return 1, obs
+                        if tl_identity is not None:
+                            obs["tilelang"] = tl_identity
+                        return (0 if ok else (completed.returncode or 1)), obs
 
-                occ, win = finalize_window()
-                binding_obs = {}
-                binding_artifacts = []
-                binding_failures = []
-                if fast_request is not None:
-                    binding_obs, binding_artifacts, binding_failures = _fast_verify_binding(
-                        fast_request, source
-                    )
-                if fast:
-                    counts = _junit_counts(report)
-                    if counts is None:
-                        sys.stderr.write(
-                            _redact_llm_credential(
-                                completed.stderr or completed.stdout, credential
-                            )[-4000:]
-                        )
-                        print(f"{PROG}: missing JUnit report at {report}", file=sys.stderr)
-                        counts = {"collected": 0, "passed": 0, "failed": 0, "skipped": 0}
-                    ok = (
-                        completed.returncode == 0
-                        and counts["collected"] > 0
-                        and counts["failed"] == 0
-                        and counts["skipped"] < counts["collected"]
-                        and not binding_failures
+                    if completed.stderr.strip():
+                        sys.stderr.write(_redact_llm_credential(completed.stderr, credential)[-4000:])
+
+                    parsed = _extract_last_json(completed.stdout, "npuAvailable")
+                    tilelang_reused_ok = True if tl_identity is None else (parsed.get("tilelangReused") is True)
+                    ok = completed.returncode == 0 and bool(parsed) and tilelang_reused_ok and all(
+                        parsed.get(k) is True for k in DEVICE_PROBE_FLAGS
                     )
                     if not ok:
-                        if binding_failures:
-                            print(
-                                f"{PROG}: fast request binding failed: {', '.join(binding_failures)}",
-                                file=sys.stderr,
-                            )
-                        sys.stderr.write(
-                            _redact_llm_credential(
-                                completed.stdout + "\n" + completed.stderr, credential
-                            )[-4000:]
-                        )
+                        sys.stderr.write(_redact_llm_credential(completed.stdout or "", credential)[-4000:])
+
                     obs = {
                         "exitCodeZero": ok,
-                        "testsCollected": counts["collected"],
-                        "testsPassed": counts["passed"],
-                        "testsFailed": counts["failed"],
-                        "testsSkipped": counts["skipped"],
+                        "errorCategory": "none" if ok else "candidate",
                         "environment": _environment_observations(values),
+                        "healthMonitoring": health_sink,
+                        **{key: bool(parsed.get(key, False)) for key in DEVICE_PROBE_FLAGS},
                         **_window_evidence(occ, win),
-                        **binding_obs,
                     }
-                    if fast_request is not None:
-                        obs["fastBindingFailures"] = binding_failures
-                        obs["artifacts"] = binding_artifacts
-                        obs.update(
-                            _fast_failure_fields(
-                                binding_obs, binding_failures, ok=ok, timed_out=False
-                            )
-                        )
                     if tl_identity is not None:
+                        obs["tilelangReused"] = bool(parsed.get("tilelangReused", False))
+                        obs["tilelangVersion"] = _redact_llm_credential(
+                            str(parsed.get("tilelangVersion", "")), credential
+                        )
                         obs["tilelang"] = tl_identity
                     return (0 if ok else (completed.returncode or 1)), obs
-
-                if completed.stderr.strip():
-                    sys.stderr.write(_redact_llm_credential(completed.stderr, credential)[-4000:])
-
-                parsed = _extract_last_json(completed.stdout, "npuAvailable")
-                tilelang_reused_ok = True if tl_identity is None else (parsed.get("tilelangReused") is True)
-                ok = completed.returncode == 0 and bool(parsed) and tilelang_reused_ok and all(
-                    parsed.get(k) is True for k in DEVICE_PROBE_FLAGS
-                )
-                if not ok:
-                    sys.stderr.write(_redact_llm_credential(completed.stdout or "", credential)[-4000:])
-
-                obs = {
-                    "exitCodeZero": ok,
-                    "environment": _environment_observations(values),
-                    **{key: bool(parsed.get(key, False)) for key in DEVICE_PROBE_FLAGS},
-                    **_window_evidence(occ, win),
-                }
-                if tl_identity is not None:
-                    obs["tilelangReused"] = bool(parsed.get("tilelangReused", False))
-                    obs["tilelangVersion"] = _redact_llm_credential(
-                        str(parsed.get("tilelangVersion", "")), credential
-                    )
-                    obs["tilelang"] = tl_identity
-                return (0 if ok else (completed.returncode or 1)), obs
+    except BridgeError as exc:
+        obs = {
+            "exitCodeZero": False,
+            "errorCategory": exc.category,
+            "failureCategory": exc.category,
+            "error": str(exc),
+            "windowOpened": win is not None,
+            "windowReleased": win is not None,
+            "occupancyRecorded": False,
+            "healthMonitoring": health_sink,
+            "environment": _environment_observations(values),
+        }
+        if win is not None:
+            obs.update(_window_evidence(occ, win))
+        if exc.occupancy:
+            obs["deviceOccupancy"] = exc.occupancy
+            obs["occupancyRecorded"] = (
+                obs["occupancyRecorded"]
+                or exc.occupancy in {"free", "unknown"}
+                or exc.occupancy.startswith("shared(")
+            )
+        rc_out = (
+            1
+            if (exc.category == "deadline" and obs.get("windowOpened"))
+            else adapter_runtime.BLOCKED_ENV
+        )
+        return rc_out, obs
 
 
 def _lease_wait_seconds() -> float:
@@ -5701,7 +5788,9 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
         with _phase(phases, "device-workload"):
             deadline.require("device lease")
             lease_wait = deadline.cap(_lease_wait_seconds())
-            with _open_device_window(device, wait_seconds=lease_wait) as finalize_window:
+            with _open_device_window(
+                device, wait_seconds=lease_wait, require_idle=True
+            ) as finalize_window:
                 try:
                     if deadline.remaining() <= 0:
                         raise BridgeError(
@@ -5730,6 +5819,7 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                             mode="l3",
                             device=device,
                             monitor_sink=health_sink,
+                            external_probe_limit=2,
                             phase_getter=lambda: phases[-1]["name"] if phases else None,
                         )
                     except subprocess.TimeoutExpired as exc:
@@ -5852,7 +5942,10 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                 "byKind": ev_cache.get("byKind"),
             }
     if obs["errorCategory"] != "none":
-        rc = 1 if obs.get("windowOpened") else 75
+        if obs["errorCategory"] == "occupancy":
+            rc = adapter_runtime.BLOCKED_ENV
+        else:
+            rc = 1 if obs.get("windowOpened") else adapter_runtime.BLOCKED_ENV
     # Promotion clients treat "numeric" and "candidate" as candidate failures.
     # "coverage", "environment", "occupancy", "deadline", "signal", and "infra"
     # are infrastructure blocks that preserve the candidate.
@@ -6220,7 +6313,7 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         # locks protect different resources and are paid from the same budget.
         with _phase(phases, "msprof-lock"):
             with _open_msprof_lock(
-                locking.lock_root(),
+                locking.device_lock_root(),
                 timeout_seconds=max(1.0, deadline.cap(_lease_wait_seconds())),
             ):
                 with _phase(phases, "device-lease"):
