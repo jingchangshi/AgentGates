@@ -575,6 +575,26 @@ class WorkerBackstopCase(EnvironmentCase):
         self.assertEqual(int(match.group(1)), systemd_units.backstop_seconds())
         self.assertGreater(int(match.group(1)), 7200)
 
+    def test_main_wires_device_lock_root_cli_and_env_fallback(self):
+        from agent_gates import systemd_units
+        with patch.object(systemd_units, 'unit_dir', return_value=self.root), \
+                patch.object(systemd_units, 'run'):
+            rc = systemd_units.main([
+                '--python', sys.executable,
+                '--device-lock-root', '/var/lock/agent-gates',
+            ])
+        self.assertEqual(rc, 0)
+        unit = (self.root / systemd_units.UNIT_NAME).read_text()
+        self.assertIn('Environment=AGENT_GATES_DEVICE_LOCK_ROOT=/var/lock/agent-gates', unit)
+
+        with patch.dict(os.environ, {'AGENT_GATES_DEVICE_LOCK_ROOT': '/tmp/shared-locks'}, clear=False), \
+                patch.object(systemd_units, 'unit_dir', return_value=self.root), \
+                patch.object(systemd_units, 'run'):
+            rc_env = systemd_units.main(['--python', sys.executable])
+        self.assertEqual(rc_env, 0)
+        unit_env = (self.root / systemd_units.UNIT_NAME).read_text()
+        self.assertIn('Environment=AGENT_GATES_DEVICE_LOCK_ROOT=/tmp/shared-locks', unit_env)
+
 
 if __name__ == '__main__':
     unittest.main()

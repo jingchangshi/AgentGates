@@ -65,6 +65,43 @@ def device_lock_root(environ=None) -> Path:
     return path
 
 
+def is_shared_device_lock_root(root: Path | None = None, environ=None) -> bool:
+    """Return True when root matches the explicit shared AGENT_GATES_DEVICE_LOCK_ROOT."""
+    source = os.environ if environ is None else environ
+    explicit = (source.get(DEVICE_LOCK_ROOT_ENV) or "").strip()
+    if not explicit:
+        return False
+    if root is None:
+        return True
+    return Path(root).resolve() == Path(explicit).expanduser().resolve()
+
+
+def ensure_lock_dir(directory: Path, *, shared: bool = False) -> None:
+    """Create a lock directory with 0o1777 (shared) or 0o700 (private) permissions."""
+    mode = 0o1777 if shared else 0o700
+    directory.mkdir(parents=True, exist_ok=True, mode=mode)
+    if shared:
+        try:
+            if directory.stat().st_uid == os.geteuid():
+                os.chmod(directory, 0o1777)
+        except OSError:
+            pass
+
+
+def open_lock_file(path: Path, *, shared: bool = False) -> int:
+    """Open or create a lock file with 0o666 (shared) or 0o600 (private) permissions."""
+    ensure_lock_dir(path.parent, shared=shared)
+    file_mode = 0o666 if shared else 0o600
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, file_mode)
+    if shared:
+        try:
+            if os.fstat(fd).st_uid == os.geteuid():
+                os.fchmod(fd, 0o666)
+        except OSError:
+            pass
+    return fd
+
+
 def lock_path(resource: str, root: Path | None = None) -> Path:
     """The file one resource's lease lives in.
 
@@ -89,9 +126,8 @@ class ResourceLock:
         self.fd = None
 
     def __enter__(self):
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
-        self.fd = os.open(self.path, flags, 0o600)
+        shared = is_shared_device_lock_root(self.root)
+        self.fd = open_lock_file(self.path, shared=shared)
         started = time.monotonic()
         deadline = started + self.timeout
         while True:

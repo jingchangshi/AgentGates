@@ -498,9 +498,24 @@ class FastRequestCase(unittest.TestCase):
     def run_fast(self, *, env=None, extra_env=None):
         run_env = dict(self.environment() if env is None else env)
         run_env.update(extra_env or {})
+        free_processes = {
+            "ok": True,
+            "processTableSeen": True,
+            "processes": [],
+            "error": None,
+        }
         with self._in_source(), \
                 patch.dict(os.environ, run_env, clear=True), \
                 patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                patch.object(
+                    GATE, "_probe_npu_mapping",
+                    return_value={"ok": True, "npuId": 1, "error": None},
+                ), \
+                patch.object(
+                    GATE, "_probe_device_health",
+                    return_value={"ok": True, "healthKind": "ok", "healthValue": "OK", "error": None},
+                ), \
+                patch.object(GATE, "_probe_device_processes", return_value=free_processes), \
                 patch.object(GATE.locking, "lock_root", return_value=self.lock_root):
             return GATE.run_device(GATE.machine_values(), 60.0, fast=True)
 
@@ -1128,6 +1143,70 @@ class FastRequestCase(unittest.TestCase):
         self.assertEqual(calls[0][1]["TF_SURROGATE_BATCH_REQUEST"], str(legacy))
         self.assertEqual(calls[0][1]["TF_MICRO_PROBE_REQUEST"], str(legacy))
         self.assertFalse((self.lock_root / ".msprof.lock").exists())
+
+    def test_device_fast_blocks_preoccupied_card_and_outputs_occupancy_json(self):
+        import io
+        from contextlib import redirect_stdout
+
+        self.write_request(REQUEST_ID, self.batch_request())
+        env = self.environment(REQUEST_ID)
+        env["TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE"] = "0"
+        stdout = io.StringIO()
+        with self._in_source(), \
+                patch.dict(os.environ, env, clear=True), \
+                patch.object(GATE.adapter_runtime, "processes_on", return_value=([4321], 1)), \
+                patch.object(GATE.locking, "lock_root", return_value=self.lock_root), \
+                redirect_stdout(stdout):
+            rc = GATE.main(["--device-fast", "--timeout", "30"])
+        self.assertEqual(rc, 75)
+        obs = json.loads(stdout.getvalue().strip())
+        self.assertEqual(obs["errorCategory"], "occupancy")
+        self.assertEqual(obs["failureCategory"], "occupancy")
+        self.assertEqual(obs["deviceOccupancy"], "shared(1)")
+        self.assertTrue(obs["occupancyRecorded"])
+        self.assertFalse(obs["windowOpened"])
+
+    def test_device_fast_window_intrusion_outputs_occupancy_json_and_exits_75(self):
+        import io
+        from contextlib import redirect_stdout
+
+        self.write_request(REQUEST_ID, self.batch_request())
+        env = self.environment(REQUEST_ID)
+
+        def intrusion_abort(_cmd, **kwargs):
+            kwargs["monitor_sink"].update({
+                "abort": {
+                    "kind": "external_occupancy",
+                    "reason": "FAST lost exclusivity after the lease opened",
+                    "phase": None,
+                    "device": "1",
+                    "npuId": 1,
+                    "occupancy": "shared(1)",
+                },
+                "outcome": "aborted",
+            })
+            raise GATE.BridgeError(
+                "runtime health abort (external_occupancy)",
+                category="occupancy",
+                occupancy="shared(1)",
+            )
+
+        stdout = io.StringIO()
+        with self._in_source(), \
+                patch.dict(os.environ, env, clear=True), \
+                patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                patch.object(GATE, "_run_host_bash_monitored", side_effect=intrusion_abort), \
+                patch.object(GATE.locking, "lock_root", return_value=self.lock_root), \
+                redirect_stdout(stdout):
+            rc = GATE.main(["--device-fast", "--timeout", "30"])
+        self.assertEqual(rc, 75)
+        obs = json.loads(stdout.getvalue().strip())
+        self.assertEqual(obs["errorCategory"], "occupancy")
+        self.assertEqual(obs["failureCategory"], "occupancy")
+        self.assertEqual(obs["deviceOccupancy"], "shared(1)")
+        self.assertTrue(obs["windowOpened"])
+        self.assertTrue(obs["windowReleased"])
+        self.assertEqual(obs["healthMonitoring"]["abort"]["kind"], "external_occupancy")
 
     @contextmanager
     def _record_host_call(self):

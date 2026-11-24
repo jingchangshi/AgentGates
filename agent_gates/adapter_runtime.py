@@ -13,7 +13,11 @@ import subprocess
 import tempfile
 import time
 
+from . import locking
+
 BLOCKED_ENV = 75
+SMI_TRANSIENT_RETRY_CODES = frozenset({215})
+SMI_RETRY_BACKOFF_SECONDS = (0.15, 0.35)
 
 SAFE_BUILD_SUBDIR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -130,20 +134,28 @@ def _run_smi(args: list[str], *, smi_cmd: str | None = None, timeout: float = 15
     resolved = shutil.which(cmd) if "/" not in cmd else (cmd if Path(cmd).exists() else None)
     if resolved is None:
         raise BlockedEnv(f"Ascend SMI tool not found on host: {cmd}")
-    try:
-        completed = subprocess.run(
-            [resolved, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise BlockedEnv(f"{cmd} {' '.join(args)} failed: {exc}") from exc
-    if completed.returncode != 0:
+    for attempt in range(len(SMI_RETRY_BACKOFF_SECONDS) + 1):
+        try:
+            completed = subprocess.run(
+                [resolved, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BlockedEnv(f"{cmd} {' '.join(args)} failed: {exc}") from exc
+        if completed.returncode == 0:
+            return completed.stdout or ""
+        if (
+            completed.returncode in SMI_TRANSIENT_RETRY_CODES
+            and attempt < len(SMI_RETRY_BACKOFF_SECONDS)
+        ):
+            time.sleep(SMI_RETRY_BACKOFF_SECONDS[attempt])
+            continue
         detail = (completed.stderr or completed.stdout or "").strip()[:300]
         raise BlockedEnv(f"{cmd} {' '.join(args)} exited {completed.returncode}: {detail}")
-    return completed.stdout or ""
+    raise AssertionError("unreachable")
 
 
 def npu_id_of_physical(device: int, *, smi_cmd: str | None = None) -> int:
@@ -225,9 +237,9 @@ def device_window(
 ):
     """Acquire an advisory flock on npu-<device>.lock and check occupancy."""
     directory = Path(lock_root)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shared = locking.is_shared_device_lock_root(directory)
     lock_path = directory / f"npu-{device}.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fd = locking.open_lock_file(lock_path, shared=shared)
     deadline = time.monotonic() + max(0.0, float(wait_seconds))
     try:
         while True:

@@ -307,14 +307,30 @@ def main(argv=None) -> int:
     parser.add_argument("--workdir", default="/", help="Worker WorkingDirectory")
     parser.add_argument("--config", default=None, help="AGENT_GATES_CONFIG path")
     parser.add_argument("--adapters-root", default=None, help="AGENT_GATES_ADAPTERS_ROOT path")
+    parser.add_argument(
+        "--device-lock-root",
+        default=None,
+        help="AGENT_GATES_DEVICE_LOCK_ROOT path",
+    )
     parser.add_argument("--timeout", type=int, default=None, help="RuntimeMaxSec override")
     args = parser.parse_args(argv)
+    device_lock_root = (
+        args.device_lock_root
+        if args.device_lock_root is not None
+        else os.environ.get("AGENT_GATES_DEVICE_LOCK_ROOT")
+    )
+    extra_env = (
+        {"AGENT_GATES_DEVICE_LOCK_ROOT": device_lock_root.strip()}
+        if device_lock_root and device_lock_root.strip()
+        else None
+    )
     path = install(
         args.python,
         timeout_seconds=args.timeout,
         workdir=args.workdir,
         config_path=args.config,
         adapters_root=args.adapters_root,
+        extra_env=extra_env,
     )
     print(path)
     return 0

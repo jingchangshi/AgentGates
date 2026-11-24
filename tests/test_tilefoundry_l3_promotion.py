@@ -1263,6 +1263,55 @@ class L3PromotionCase(_Fixture, unittest.TestCase):
         self.assertTrue(obs["occupancyRecorded"])
         self.assertIsNone(runner.seen.workload_env)
 
+    def test_l3_blocks_on_shared_device_without_exclusive_flag(self):
+        env = self.environment(TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE="0")
+        runner = self.fake_runner()
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(
+                    GATE.adapter_runtime, "processes_on", return_value=([123], 1)
+                ), \
+                patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=runner), \
+                self.in_source():
+            rc, obs = GATE.run_l3_promotion(self.values(), 60.0)
+        self.assertEqual(rc, 75)
+        self.assertEqual(obs["errorCategory"], "occupancy")
+        self.assertEqual(obs["deviceOccupancy"], "shared(1)")
+        self.assertFalse(obs["windowOpened"])
+        self.assertIsNone(runner.seen.workload_env)
+
+    def test_l3_mid_run_external_occupancy_returns_75_not_1(self):
+        def occupancy_abort(cmd, **kwargs):
+            kwargs["monitor_sink"].update({
+                "abort": {
+                    "kind": "external_occupancy",
+                    "reason": "L3 lost exclusivity after the lease opened",
+                    "phase": "device-workload",
+                    "device": "1",
+                    "npuId": 7,
+                    "occupancy": "shared(1)",
+                },
+                "outcome": "aborted",
+            })
+            raise GATE.BridgeError(
+                "runtime health abort (external_occupancy)",
+                category="occupancy",
+                occupancy="shared(1)",
+            )
+
+        runner = self.fake_runner()
+        with patch.dict(os.environ, self.environment(), clear=True), \
+                patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=runner), \
+                patch.object(GATE, "_run_host_bash_monitored", side_effect=occupancy_abort), \
+                self.in_source():
+            rc, obs = GATE.run_l3_promotion(self.values(), 60.0)
+        self.assertEqual(rc, 75)
+        self.assertEqual(obs["errorCategory"], "occupancy")
+        self.assertEqual(obs["failureCategory"], "occupancy")
+        self.assertEqual(obs["deviceOccupancy"], "shared(1)")
+        self.assertTrue(obs["windowOpened"])
+        self.assertTrue(obs["windowReleased"])
+
     def test_candidate_kernel_compile_and_idempotence_failures_classify_as_candidate(self):
         junit_original = self.junit_xml
 
