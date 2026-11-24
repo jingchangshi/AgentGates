@@ -18,7 +18,7 @@
     "engineeringCore": ">=2.0.0"
   },
   "files": {
-    "scripts/tilefoundry_host_gate.py": "c63bf4752ee81b225fb026d9e6daa4fd21955abd751bd27f229ddf084100bc40",
+    "scripts/tilefoundry_host_gate.py": "9b8b047a2fcb8d57ea170eb5499de5773da6f91667c4b9a0f53cb84b3b812836",
     "scripts/host_control.sh": "683a3b9f562dd2bf47149d52ebf638428236bfd49665644d1dca4c39bf73d029"
   },
   "recipes": [

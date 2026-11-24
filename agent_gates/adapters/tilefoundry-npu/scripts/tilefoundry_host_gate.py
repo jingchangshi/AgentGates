@@ -848,6 +848,7 @@ ERROR_CATEGORIES = (
     "occupancy",
     "deadline",
     "numeric",
+    "candidate",
     "coverage",
     "signal",
     "infra",
@@ -5154,6 +5155,125 @@ def _l3_producer_block_kind(rows: list[dict]) -> str | None:
     return None
 
 
+_CANDIDATE_KERNEL_STAGES = frozenset({"kernel", "compile", "cache_idempotence"})
+_CANDIDATE_KERNEL_DETAIL_SIGNALS = (
+    "exceeded vf stack size",
+    "ascend compilation failed",
+    "bisheng",
+    "ld.lld",
+    "undefined symbol",
+    "tvmerror",
+    "l3 cache idempotence violation",
+    "syntaxerror",
+    "nameerror",
+    "typeerror",
+    "attributeerror",
+    "keyerror",
+    "valueerror",
+    "importerror",
+    "ub overflow",
+    "out of ubuf",
+    "kernel launch",
+)
+_INFRA_KERNEL_DETAIL_EXCLUDES = (
+    "device offline",
+    "device unavailable",
+    "npu-smi",
+    "drverror",
+    "e39999",
+    "ez9999",
+    "aclrtgetdevice",
+    "timeout",
+    "reference cache",
+    "no space left",
+    "permission denied",
+    "segmentation fault",
+    "bus error",
+)
+
+
+def _is_candidate_kernel_failure_row(
+    row: dict,
+    *,
+    node_records: dict[str, dict],
+    junit_rows: list[dict],
+) -> bool:
+    """Return True iff *row* binds a deterministic candidate compile/kernel/cache defect."""
+    role = str(row.get("role") or "").strip().lower()
+    if role == "baseline":
+        return False
+    stage = str(row.get("stage") or "").strip().lower()
+    if stage not in _CANDIDATE_KERNEL_STAGES:
+        return False
+    node_name = row.get("node")
+    if not isinstance(node_name, str) or not node_name:
+        return False
+    if not any(
+        j.get("status") == "failed" and j.get("name") == node_name
+        for j in junit_rows
+    ):
+        return False
+    case_id = row.get("case")
+    if case_id is not None:
+        node = node_records.get(node_name)
+        cases = node.get("cases") if isinstance(node, dict) else None
+        if (
+            not isinstance(cases, dict)
+            or str(cases.get(str(case_id)) or "").strip().lower() not in {"failed", "error"}
+        ):
+            return False
+    detail_text = f"{row.get('exceptionType') or ''} {row.get('detail') or ''}".lower()
+    if any(excl in detail_text for excl in _INFRA_KERNEL_DETAIL_EXCLUDES):
+        return False
+    kind = str(row.get("kind") or "").strip().lower()
+    if kind == "candidate" and (role == "candidate" or stage in {"kernel", "compile"}):
+        return True
+    return any(sig in detail_text for sig in _CANDIDATE_KERNEL_DETAIL_SIGNALS)
+
+
+def _l3_candidate_kernel_failure(
+    evidence: dict | None, junit_rows: list[dict]
+) -> dict | None:
+    """Return a deterministic candidate compile/kernel/idempotence failure if unambiguous.
+
+    Any genuine non-candidate infrastructure or coverage failure row outranks
+    candidate kernel failures so hardware/environment/coverage blocks stay intact.
+    """
+    if not isinstance(evidence, dict):
+        return None
+    failures = _l3_failure_rows(evidence)
+    if not failures:
+        return None
+    node_records = {
+        str(node.get("name")): node
+        for node in _as_list(evidence.get("nodes"))
+        if isinstance(node, dict) and node.get("name")
+    }
+    matched: list[dict] = []
+    for row in failures:
+        if _is_candidate_kernel_failure_row(
+            row, node_records=node_records, junit_rows=junit_rows
+        ):
+            matched.append(row)
+            continue
+        kind = str(row.get("kind") or "").strip().lower()
+        if kind in {"infrastructure", "coverage"}:
+            return None
+    if not matched:
+        return None
+    first = matched[0]
+    return {
+        "kind": "candidate",
+        "category": "candidate",
+        "role": first.get("role") or "candidate",
+        "stage": str(first.get("stage") or "").strip().lower(),
+        "node": first.get("node"),
+        "case": None if first.get("case") is None else str(first.get("case")),
+        "detail": first.get("detail"),
+        "exceptionType": first.get("exceptionType"),
+    }
+
+
 def _l3_candidate_numeric_failure(
     evidence: dict | None, junit_rows: list[dict]
 ) -> dict | None:
@@ -5312,8 +5432,9 @@ def _l3_classify(
     failure_rows = _l3_failure_rows(ev)
     producer_block = _l3_producer_block_kind(failure_rows)
     numeric_failure = _l3_candidate_numeric_failure(ev, rows)
+    kernel_failure = _l3_candidate_kernel_failure(ev, rows)
     junit_failed = [row for row in rows if row["status"] == "failed"]
-    if junit_failed and numeric_failure is None:
+    if junit_failed and numeric_failure is None and kernel_failure is None:
         notes.append(
             "JUnit failure(s) have no matching producer candidate/numeric "
             "comparison failure: "
@@ -5323,6 +5444,11 @@ def _l3_classify(
         notes.append(
             "producer candidate numeric failure: "
             f"{numeric_failure.get('node')}:{numeric_failure.get('case')}"
+        )
+    if kernel_failure is not None:
+        notes.append(
+            f"producer candidate {kernel_failure.get('stage')} failure: "
+            f"{kernel_failure.get('node')}:{kernel_failure.get('case')}"
         )
     interrupted_category = str(ev_interruption.get("errorCategory") or "").strip()
     coverage_complete = bool(
@@ -5369,6 +5495,8 @@ def _l3_classify(
         category = "coverage"
     elif any(row["status"] == "error" for row in rows):
         category = "infra"
+    elif kernel_failure is not None and identity_ok and rc != 0:
+        category = "candidate"
     elif junit_failed:
         # No valid producer marker binds this failure to the candidate. Use
         # the producer's structured kind; an unclassified failure is infra.
@@ -5725,9 +5853,9 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
             }
     if obs["errorCategory"] != "none":
         rc = 1 if obs.get("windowOpened") else 75
-    # Promotion clients treat only "numeric" as a candidate failure. "coverage",
-    # "environment", "occupancy", "deadline", "signal", and "infra" are
-    # infrastructure blocks that preserve the candidate.
+    # Promotion clients treat "numeric" and "candidate" as candidate failures.
+    # "coverage", "environment", "occupancy", "deadline", "signal", and "infra"
+    # are infrastructure blocks that preserve the candidate.
     obs["failureCategory"] = (
         None if obs["errorCategory"] in {None, "none"} else obs["errorCategory"]
     )
