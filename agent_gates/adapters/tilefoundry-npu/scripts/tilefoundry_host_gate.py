@@ -104,6 +104,9 @@ TOOLCHAIN_KEYS = (
     *OPTIONAL_AGENT_LLM_KEYS,
     *OPTIONAL_PROXY_KEYS,
     "TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT",
+    "TILEFOUNDRY_NPU_OCCUPANCY_POLICY",
+    "TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS",
+    "TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB",
     "TILEFOUNDRY_NPU_CANN_SERIES",
     "TILEFOUNDRY_NPU_TILELANG_REPO",
     "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
@@ -2461,14 +2464,44 @@ def _device_occupancy(device: str) -> str:
     return "free" if not processes else f"shared({len(processes)})"
 
 
+def _device_occupancy_details(device: str) -> tuple[str, list[dict[str, str]], int]:
+    try:
+        processes, _ = adapter_runtime.processes_on(int(device))
+    except adapter_runtime.BlockedEnv as exc:
+        if exclusive_requested():
+            raise BridgeError(str(exc), category="occupancy", occupancy="unknown") from exc
+        return "unknown", [], 0
+    occ = "free" if not processes else f"shared({len(processes)})"
+    total_mem_mb = 0
+    for row in processes:
+        try:
+            total_mem_mb += int(row.get("memoryMb") or 0)
+        except (TypeError, ValueError):
+            pass
+    return occ, processes, total_mem_mb
+
+
+OCCUPANCY_POLICIES = frozenset({"exclusive", "shared_quiet"})
+SHARED_MAX_EXT_PROCS_DEFAULT = 6
+SHARED_MAX_HBM_MB_DEFAULT = 16384
+
+
 def _quarantine_path(lease_path: str | Path) -> Path:
     return Path(f"{lease_path}{QUARANTINE_SUFFIX}")
 
 
-def _l4_idle_preflight(device: str, *, confirmations: int) -> dict:
-    """Refuse official L4 timing while another process holds the leased card."""
+def _l4_idle_preflight(
+    device: str,
+    *,
+    confirmations: int,
+    occupancy_policy: str = "exclusive",
+    max_ext_procs: int = SHARED_MAX_EXT_PROCS_DEFAULT,
+    max_hbm_mb: int = SHARED_MAX_HBM_MB_DEFAULT,
+) -> dict:
+    """Refuse official L4 timing while disallowed occupancy holds the leased card."""
     streak = 0
     processes: list[dict[str, str]] = []
+    total_mem_mb = 0
     npu_id = 0
     for attempt in range(1, confirmations + 1):
         try:
@@ -2479,7 +2512,24 @@ def _l4_idle_preflight(device: str, *, confirmations: int) -> dict:
                 category="occupancy",
                 occupancy="unknown",
             ) from exc
-        if not processes:
+        total_mem_mb = 0
+        for row in processes:
+            try:
+                total_mem_mb += int(row.get("memoryMb") or 0)
+            except (TypeError, ValueError):
+                pass
+        if occupancy_policy == "shared_quiet":
+            if total_mem_mb <= max_hbm_mb and len(processes) <= max_ext_procs:
+                return {
+                    "npuId": npu_id,
+                    "occupancy": "free" if not processes else f"shared({len(processes)})",
+                    "policy": "shared_quiet",
+                    "externalProcessCount": len(processes),
+                    "externalMemoryMb": total_mem_mb,
+                    "attempts": attempt,
+                    "confirmations": confirmations,
+                }
+        elif not processes:
             return {
                 "npuId": npu_id,
                 "occupancy": "free",
@@ -2492,6 +2542,14 @@ def _l4_idle_preflight(device: str, *, confirmations: int) -> dict:
     summary = ", ".join(
         f"pid={row.get('pid')}({row.get('name')})" for row in processes[:6]
     )
+    if occupancy_policy == "shared_quiet":
+        raise BridgeError(
+            "official L4 timing under shared_quiet exceeded budget: external process(es) "
+            f"{summary} ({len(processes)} procs, {total_mem_mb}MB; limit {max_ext_procs} procs / "
+            f"{max_hbm_mb}MB) remained on NPU {npu_id} for {streak} consecutive probes",
+            category="occupancy",
+            occupancy=f"shared({len(processes)})",
+        )
     raise BridgeError(
         "official L4 timing requires an idle card: external process(es) "
         f"{summary} remained on NPU {npu_id} for {streak} consecutive probes",
@@ -2754,6 +2812,10 @@ def _open_device_window(
     warmup_seconds: float | None = None,
     wait_seconds: float | None = None,
     require_idle: bool = False,
+    occupancy_policy: str = "exclusive",
+    max_ext_procs: int = SHARED_MAX_EXT_PROCS_DEFAULT,
+    max_hbm_mb: int = SHARED_MAX_HBM_MB_DEFAULT,
+    enforce_proc_count: bool = True,
 ):
     lease_path = os.environ.get("AGENT_GATES_DEVICE_LEASE_PATH", "").strip()
     lease_resource = os.environ.get("AGENT_GATES_DEVICE_LEASE_RESOURCE", f"npu:{device}").strip()
@@ -2799,17 +2861,39 @@ def _open_device_window(
 
         opened = time.monotonic()
         window_started = _timestamp()
-        occ = _device_occupancy(device)
+        ext_procs: list[dict[str, str]] = []
+        ext_mem_mb = 0
+        if occupancy_policy == "shared_quiet":
+            occ, ext_procs, ext_mem_mb = _device_occupancy_details(device)
+        else:
+            occ = _device_occupancy(device)
         probe_seconds = round(time.monotonic() - opened, 3)
-        if require_idle or exclusive_requested():
+        if exclusive_requested():
             if occ != "free":
-                reason = (
-                    "requires an idle device"
-                    if require_idle
-                    else "TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE is set"
-                )
                 raise BridgeError(
-                    f"device {lease_resource} is {occ} and {reason}",
+                    f"device {lease_resource} is {occ} and TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE is set",
+                    category="occupancy",
+                    occupancy=occ,
+                )
+        elif occupancy_policy == "shared_quiet":
+            if require_idle:
+                if occ == "unknown":
+                    raise BridgeError(
+                        f"device {lease_resource} occupancy is unknown under shared_quiet",
+                        category="occupancy",
+                        occupancy="unknown",
+                    )
+                if ext_mem_mb > max_hbm_mb or (enforce_proc_count and len(ext_procs) > max_ext_procs):
+                    raise BridgeError(
+                        f"device {lease_resource} exceeds shared_quiet budget ({occ}, "
+                        f"{ext_mem_mb}MB; limit {max_ext_procs} procs / {max_hbm_mb}MB)",
+                        category="occupancy",
+                        occupancy=occ,
+                    )
+        elif require_idle:
+            if occ != "free":
+                raise BridgeError(
+                    f"device {lease_resource} is {occ} and requires an idle device",
                     category="occupancy",
                     occupancy=occ,
                 )
@@ -2828,7 +2912,11 @@ def _open_device_window(
             }
             if warmup_seconds is not None:
                 win["warmupSeconds"] = round(float(warmup_seconds), 3)
-            if require_idle:
+            if occupancy_policy != "exclusive":
+                win["occupancyPolicy"] = occupancy_policy
+                win["externalProcessCount"] = len(ext_procs)
+                win["externalMemoryMb"] = ext_mem_mb
+            elif require_idle:
                 win["requiredIdle"] = True
             if quarantine is not None:
                 win["quarantine"] = {
@@ -3391,11 +3479,19 @@ class _RunHealthMonitor:
         token: str,
         phase_getter: Callable[[], str | None] | None = None,
         external_limit: int | None = None,
+        occupancy_policy: str = "exclusive",
+        shared_max_ext_procs: int = SHARED_MAX_EXT_PROCS_DEFAULT,
+        shared_max_hbm_mb: int = SHARED_MAX_HBM_MB_DEFAULT,
+        allow_external_in_shared: bool = False,
     ) -> None:
         self.device = device
         self.mode = mode
         self.token = token
         self.phase_getter = phase_getter
+        self.occupancy_policy = occupancy_policy
+        self.shared_max_ext_procs = max(1, int(shared_max_ext_procs))
+        self.shared_max_hbm_mb = max(256, int(shared_max_hbm_mb))
+        self.allow_external_in_shared = bool(allow_external_in_shared)
         self.started = time.monotonic()
         self.probe_interval = max(0.01, float(HEALTH_PROBE_INTERVAL_SECONDS))
         self.probe_timeout = max(0.05, float(HEALTH_PROBE_TIMEOUT_SECONDS))
@@ -3678,15 +3774,44 @@ class _RunHealthMonitor:
             self.occupancy = "free"
 
         if self.external_pids:
-            self.external_streak += 1
-            if self.mode in {"fast", "l3", "l4"} and self.external_streak >= self.external_limit:
-                self._abort_run(
-                    "external_occupancy",
-                    f"{self.mode.upper()} lost exclusivity after the lease opened: external device "
-                    f"process(es) {self.external_pids[:8]} remained on NPU {self.npu_id} "
-                    f"for {self.external_streak} consecutive probes",
-                    occupancy=f"shared({len(self.external_pids)})",
-                )
+            if self.occupancy_policy == "shared_quiet":
+                if self.allow_external_in_shared:
+                    self.external_streak = 0
+                else:
+                    ext_pid_strs = {str(pid) for pid in self.external_pids}
+                    ext_mem_mb = 0
+                    for proc_row in occupancy.get("processes") or []:
+                        if str(proc_row.get("pid") or "").strip() in ext_pid_strs:
+                            try:
+                                ext_mem_mb += int(proc_row.get("memoryMb") or 0)
+                            except (TypeError, ValueError):
+                                pass
+                    if (
+                        ext_mem_mb > self.shared_max_hbm_mb
+                        or len(self.external_pids) > self.shared_max_ext_procs + 4
+                    ):
+                        self.external_streak += 1
+                        if self.mode in {"fast", "l3", "l4"} and self.external_streak >= self.external_limit:
+                            self._abort_run(
+                                "external_occupancy",
+                                f"{self.mode.upper()} under shared_quiet exceeded heavy contention "
+                                f"limit ({len(self.external_pids)} procs, {ext_mem_mb}MB > "
+                                f"{self.shared_max_ext_procs + 4} procs / {self.shared_max_hbm_mb}MB) "
+                                f"on NPU {self.npu_id} for {self.external_streak} consecutive probes",
+                                occupancy=f"shared({len(self.external_pids)})",
+                            )
+                    else:
+                        self.external_streak = 0
+            else:
+                self.external_streak += 1
+                if self.mode in {"fast", "l3", "l4"} and self.external_streak >= self.external_limit:
+                    self._abort_run(
+                        "external_occupancy",
+                        f"{self.mode.upper()} lost exclusivity after the lease opened: external device "
+                        f"process(es) {self.external_pids[:8]} remained on NPU {self.npu_id} "
+                        f"for {self.external_streak} consecutive probes",
+                        occupancy=f"shared({len(self.external_pids)})",
+                    )
         else:
             self.external_streak = 0
 
@@ -3782,6 +3907,10 @@ def _run_host_bash_monitored(
     phase_getter: Callable[[], str | None] | None = None,
     lease_path: str | None = None,
     external_probe_limit: int | None = None,
+    occupancy_policy: str = "exclusive",
+    shared_max_ext_procs: int = SHARED_MAX_EXT_PROCS_DEFAULT,
+    shared_max_hbm_mb: int = SHARED_MAX_HBM_MB_DEFAULT,
+    allow_external_in_shared: bool = False,
     **kwargs,
 ) -> subprocess.CompletedProcess[str]:
     """Run one existing host command while sampling this run's health.
@@ -3803,6 +3932,10 @@ def _run_host_bash_monitored(
         token=token,
         phase_getter=phase_getter,
         external_limit=external_probe_limit,
+        occupancy_policy=occupancy_policy,
+        shared_max_ext_procs=shared_max_ext_procs,
+        shared_max_hbm_mb=shared_max_hbm_mb,
+        allow_external_in_shared=allow_external_in_shared,
     )
     resolved_lease = lease_path
     if resolved_lease is None:
@@ -4288,6 +4421,55 @@ def l4_external_probe_limit(values: dict[str, str]) -> int:
     return value
 
 
+def occupancy_policy(values: dict[str, str]) -> str:
+    """Resolve the device-window occupancy admission policy."""
+    raw = (values.get("TILEFOUNDRY_NPU_OCCUPANCY_POLICY") or "").strip().lower()
+    if not raw:
+        return "exclusive"
+    if raw not in OCCUPANCY_POLICIES:
+        raise BridgeError(
+            "TILEFOUNDRY_NPU_OCCUPANCY_POLICY must be one of "
+            f"{sorted(OCCUPANCY_POLICIES)}: {raw!r}"
+        )
+    return raw
+
+
+def shared_max_ext_procs(values: dict[str, str]) -> int:
+    """Resolve max external device process count admitted under shared_quiet."""
+    raw = (values.get("TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS") or "").strip()
+    if not raw:
+        return SHARED_MAX_EXT_PROCS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS must be an integer: {raw!r}"
+        ) from exc
+    if value < 1:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS must be at least 1: {raw!r}"
+        )
+    return value
+
+
+def shared_max_hbm_mb(values: dict[str, str]) -> int:
+    """Resolve max total external device HBM (MB) admitted under shared_quiet."""
+    raw = (values.get("TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB") or "").strip()
+    if not raw:
+        return SHARED_MAX_HBM_MB_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB must be an integer: {raw!r}"
+        ) from exc
+    if value < 256:
+        raise BridgeError(
+            f"TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB must be at least 256: {raw!r}"
+        )
+    return value
+
+
 def check_config(
     *,
     check_device: bool = False,
@@ -4305,6 +4487,9 @@ def check_config(
         _binary_flag(values, "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE")
         l3_timeout(values)
         l4_external_probe_limit(values)
+        occupancy_policy(values)
+        shared_max_ext_procs(values)
+        shared_max_hbm_mb(values)
         cann = Path(_required(values, "TILEFOUNDRY_NPU_CANN_SETUP"))
         if not cann.is_file():
             raise BridgeError(f"TILEFOUNDRY_NPU_CANN_SETUP does not exist: {cann}")
@@ -4830,6 +5015,9 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
         if msprof_lock
         else nullcontext()
     )
+    policy = occupancy_policy(values)
+    max_procs = shared_max_ext_procs(values)
+    max_hbm = shared_max_hbm_mb(values)
     require_idle_window = bool(fast_request is not None)
     health_sink: dict = {}
     occ = "not_checked"
@@ -4837,7 +5025,12 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
     try:
         with lock:
             with _open_device_window(
-                device, require_idle=require_idle_window
+                device,
+                require_idle=require_idle_window,
+                occupancy_policy=policy,
+                max_ext_procs=max_procs,
+                max_hbm_mb=max_hbm,
+                enforce_proc_count=True,
             ) as finalize_window:
                 with tempfile.TemporaryDirectory(prefix="tilefoundry-npu-") as tmp:
                     report = Path(tmp) / "junit.xml"
@@ -4902,6 +5095,10 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                                 device=device,
                                 monitor_sink=health_sink,
                                 external_probe_limit=1 if fast_request is not None else None,
+                                occupancy_policy=policy,
+                                shared_max_ext_procs=max_procs,
+                                shared_max_hbm_mb=max_hbm,
+                                allow_external_in_shared=False,
                                 cwd=source,
                                 env=run_env,
                                 cann_setup=cann_setup,
@@ -5785,11 +5982,20 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                     "L3 preflight failed: " + "; ".join(errors or [f"exit {checked.returncode}"])
                 )
 
+        policy = occupancy_policy(values)
+        max_procs = shared_max_ext_procs(values)
+        max_hbm = shared_max_hbm_mb(values)
         with _phase(phases, "device-workload"):
             deadline.require("device lease")
             lease_wait = deadline.cap(_lease_wait_seconds())
             with _open_device_window(
-                device, wait_seconds=lease_wait, require_idle=True
+                device,
+                wait_seconds=lease_wait,
+                require_idle=True,
+                occupancy_policy=policy,
+                max_ext_procs=max_procs,
+                max_hbm_mb=max_hbm,
+                enforce_proc_count=False,
             ) as finalize_window:
                 try:
                     if deadline.remaining() <= 0:
@@ -5820,6 +6026,10 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                             device=device,
                             monitor_sink=health_sink,
                             external_probe_limit=2,
+                            occupancy_policy=policy,
+                            shared_max_ext_procs=max_procs,
+                            shared_max_hbm_mb=max_hbm,
+                            allow_external_in_shared=True,
                             phase_getter=lambda: phases[-1]["name"] if phases else None,
                         )
                     except subprocess.TimeoutExpired as exc:
@@ -6041,12 +6251,19 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
     health_sink: dict = obs["healthMonitoring"]
     if tl_identity is not None:
         obs["tilelang"] = tl_identity
+    policy = occupancy_policy(values)
+    max_procs = shared_max_ext_procs(values)
+    max_hbm = shared_max_hbm_mb(values)
     try:
         deadline.require("device lease")
         with _open_device_window(
             device,
             wait_seconds=deadline.cap(_lease_wait_seconds()),
             require_idle=True,
+            occupancy_policy=policy,
+            max_ext_procs=max_procs,
+            max_hbm_mb=max_hbm,
+            enforce_proc_count=False,
         ) as finalize_window:
             try:
                 with _phase(phases, "inspect"):
@@ -6133,6 +6350,10 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
                                     mode="l4",
                                     device=device,
                                     monitor_sink=health_sink,
+                                    occupancy_policy=policy,
+                                    shared_max_ext_procs=max_procs,
+                                    shared_max_hbm_mb=max_hbm,
+                                    allow_external_in_shared=True,
                                     phase_getter=(
                                         lambda: phases[-1]["name"] if phases else None
                                     ),
@@ -6203,6 +6424,10 @@ def run_cannbench_prep(values: dict[str, str], timeout: float) -> tuple[int, dic
                             mode="l4",
                             device=device,
                             monitor_sink=health_sink,
+                            occupancy_policy=policy,
+                            shared_max_ext_procs=max_procs,
+                            shared_max_hbm_mb=max_hbm,
+                            allow_external_in_shared=True,
                             phase_getter=(
                                 lambda: phases[-1]["name"] if phases else None
                             ),
@@ -6307,6 +6532,9 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     health_sink: dict = obs["healthMonitoring"]
     if tl_identity is not None:
         obs["tilelang"] = tl_identity
+    policy = occupancy_policy(values)
+    max_procs = shared_max_ext_procs(values)
+    max_hbm = shared_max_hbm_mb(values)
     try:
         deadline.require("official CANNBench run")
         # Host profiler serialization comes before the device lease; the two
@@ -6321,6 +6549,10 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                         device,
                         wait_seconds=deadline.cap(_lease_wait_seconds()),
                         require_idle=True,
+                        occupancy_policy=policy,
+                        max_ext_procs=max_procs,
+                        max_hbm_mb=max_hbm,
+                        enforce_proc_count=True,
                     ) as finalize_window:
                         try:
                             with _phase(phases, "inspect"):
@@ -6351,7 +6583,11 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
 
                             with _phase(phases, "idle-preflight"):
                                 obs["idlePreflight"] = _l4_idle_preflight(
-                                    device, confirmations=external_probe_limit
+                                    device,
+                                    confirmations=external_probe_limit,
+                                    occupancy_policy=policy,
+                                    max_ext_procs=max_procs,
+                                    max_hbm_mb=max_hbm,
                                 )
 
                             runner_cfg = {
@@ -6418,6 +6654,10 @@ def run_cannbench(values: dict[str, str], timeout: float) -> tuple[int, dict]:
                                             device=device,
                                             monitor_sink=health_sink,
                                             external_probe_limit=external_probe_limit,
+                                            occupancy_policy=policy,
+                                            shared_max_ext_procs=max_procs,
+                                            shared_max_hbm_mb=max_hbm,
+                                            allow_external_in_shared=False,
                                             phase_getter=(
                                                 lambda: phases[-1]["name"] if phases else None
                                             ),

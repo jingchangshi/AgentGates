@@ -1197,3 +1197,232 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertEqual(getattr(caught.exception, "occupancy", None), "shared(1)")
         self.assertEqual(sink["abort"]["kind"], "external_occupancy")
         self.assertIsNone(self.external.poll())
+
+    def test_occupancy_policy_parsing_and_validation(self):
+        self.assertEqual(GATE.occupancy_policy({}), "exclusive")
+        self.assertEqual(
+            GATE.occupancy_policy({"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": "SHARED_QUIET"}),
+            "shared_quiet",
+        )
+        self.assertEqual(GATE.shared_max_ext_procs({}), 6)
+        self.assertEqual(
+            GATE.shared_max_ext_procs({"TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS": "4"}), 4
+        )
+        self.assertEqual(GATE.shared_max_hbm_mb({}), 16384)
+        self.assertEqual(
+            GATE.shared_max_hbm_mb({"TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB": "8192"}), 8192
+        )
+        for bad in (
+            {"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": "anything"},
+            {"TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS": "0"},
+            {"TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS": "abc"},
+            {"TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB": "128"},
+            {"TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB": "xyz"},
+        ):
+            with self.assertRaises(GATE.BridgeError):
+                if "TILEFOUNDRY_NPU_OCCUPANCY_POLICY" in bad:
+                    GATE.occupancy_policy(bad)
+                elif "TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS" in bad:
+                    GATE.shared_max_ext_procs(bad)
+                else:
+                    GATE.shared_max_hbm_mb(bad)
+
+    def test_shared_quiet_admission_records_honest_shared_and_rejects_heavy_hbm(self):
+        light_procs = [
+            {"pid": "111", "name": "python", "memoryMb": "1024"},
+            {"pid": "222", "name": "python", "memoryMb": "2048"},
+        ]
+        heavy_procs = [
+            {"pid": "333", "name": "python", "memoryMb": "47134"},
+        ]
+        with patch.object(
+            GATE.adapter_runtime, "processes_on", return_value=(light_procs, 1)
+        ), self.lease_environment():
+            with GATE._open_device_window(
+                "1",
+                wait_seconds=0,
+                require_idle=True,
+                occupancy_policy="shared_quiet",
+                max_ext_procs=6,
+                max_hbm_mb=16384,
+            ) as finalize:
+                occ, win = finalize()
+            self.assertEqual(occ, "shared(2)")
+            self.assertEqual(win["occupancy"], "shared(2)")
+            self.assertEqual(win["occupancyPolicy"], "shared_quiet")
+            self.assertEqual(win["externalProcessCount"], 2)
+            self.assertEqual(win["externalMemoryMb"], 3072)
+            self.assertNotIn("requiredIdle", win)
+
+            l4_preflight = GATE._l4_idle_preflight(
+                "1",
+                confirmations=3,
+                occupancy_policy="shared_quiet",
+                max_ext_procs=6,
+                max_hbm_mb=16384,
+            )
+            self.assertEqual(l4_preflight["occupancy"], "shared(2)")
+            self.assertEqual(l4_preflight["policy"], "shared_quiet")
+            self.assertEqual(l4_preflight["externalMemoryMb"], 3072)
+
+        with patch.object(
+            GATE.adapter_runtime, "processes_on", return_value=(heavy_procs, 0)
+        ), self.lease_environment():
+            with self.assertRaises(GATE.BridgeError) as caught:
+                with GATE._open_device_window(
+                    "0",
+                    wait_seconds=0,
+                    require_idle=True,
+                    occupancy_policy="shared_quiet",
+                    max_ext_procs=6,
+                    max_hbm_mb=16384,
+                ):
+                    pass
+            self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+            self.assertEqual(getattr(caught.exception, "occupancy", None), "shared(1)")
+
+    def test_shared_quiet_monitor_allows_light_tolerates_l3_and_aborts_heavy_hbm(self):
+        self.external = subprocess.Popen(
+            ["/bin/sleep", "30"],
+            start_new_session=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        light_row = {
+            "ok": True,
+            "processTableSeen": True,
+            "processes": [{"pid": str(self.external.pid), "name": "sleep", "memoryMb": "1024"}],
+            "error": None,
+        }
+        heavy_row = {
+            "ok": True,
+            "processTableSeen": True,
+            "processes": [{"pid": str(self.external.pid), "name": "sleep", "memoryMb": "20480"}],
+            "error": None,
+        }
+        health = self._sequence([_row("ok", "OK")], _row("ok", "OK"))
+
+        # 1. fast under shared_quiet with light background completes cleanly.
+        sink_light: dict = {}
+        with patch.object(
+            GATE.adapter_runtime,
+            "processes_on",
+            return_value=([{"pid": str(self.external.pid), "name": "sleep", "memoryMb": "1024"}], 1),
+        ), patch.object(
+            GATE, "_probe_npu_mapping", return_value={"ok": True, "npuId": 1, "error": None}
+        ), patch.object(
+            GATE, "_probe_device_health", side_effect=health
+        ), patch.object(
+            GATE, "_probe_device_processes", return_value=light_row
+        ), patch.object(GATE, "HEALTH_POLL_SECONDS", 0.05), patch.object(
+            GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 0.1
+        ), self.lease_environment():
+            with GATE._open_device_window(
+                "1", wait_seconds=0, require_idle=True, occupancy_policy="shared_quiet"
+            ):
+                done = GATE._run_host_bash_monitored(
+                    "sleep 0.3",
+                    cwd=self.root,
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+                    cann_setup=None,
+                    conda_sh=None,
+                    conda_env=None,
+                    timeout=10,
+                    isolate_temp=True,
+                    mode="fast",
+                    device="1",
+                    monitor_sink=sink_light,
+                    external_probe_limit=1,
+                    occupancy_policy="shared_quiet",
+                    shared_max_ext_procs=6,
+                    shared_max_hbm_mb=16384,
+                    allow_external_in_shared=False,
+                )
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(sink_light["outcome"], "completed")
+        self.assertNotIn("abort", sink_light)
+
+        # 2. fast under shared_quiet aborts when mid-run external HBM exceeds budget.
+        sink_heavy: dict = {}
+        with patch.object(
+            GATE.adapter_runtime, "processes_on", return_value=([], 1)
+        ), patch.object(
+            GATE, "_probe_npu_mapping", return_value={"ok": True, "npuId": 1, "error": None}
+        ), patch.object(
+            GATE, "_probe_device_health", side_effect=health
+        ), patch.object(
+            GATE, "_probe_device_processes", return_value=heavy_row
+        ), patch.object(GATE, "HEALTH_POLL_SECONDS", 0.05), patch.object(
+            GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 0.1
+        ), self.lease_environment():
+            with self.assertRaises(GATE.BridgeError) as caught:
+                with GATE._open_device_window(
+                    "1", wait_seconds=0, require_idle=True, occupancy_policy="shared_quiet"
+                ):
+                    GATE._run_host_bash_monitored(
+                        "sleep 5",
+                        cwd=self.root,
+                        env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+                        cann_setup=None,
+                        conda_sh=None,
+                        conda_env=None,
+                        timeout=10,
+                        isolate_temp=True,
+                        mode="fast",
+                        device="1",
+                        monitor_sink=sink_heavy,
+                        external_probe_limit=1,
+                        occupancy_policy="shared_quiet",
+                        shared_max_ext_procs=6,
+                        shared_max_hbm_mb=16384,
+                        allow_external_in_shared=False,
+                    )
+        self.assertEqual(getattr(caught.exception, "category", None), "occupancy")
+        self.assertEqual(sink_heavy["abort"]["kind"], "external_occupancy")
+
+        # 3. l3 ignores proc-count cap at admission and allow_external_in_shared tolerates mid-run heavy HBM.
+        many_light_procs = [
+            {"pid": str(self.external.pid), "name": "sleep", "memoryMb": "128"}
+            for _ in range(8)
+        ]
+        sink_l3: dict = {}
+        with patch.object(
+            GATE.adapter_runtime,
+            "processes_on",
+            return_value=(many_light_procs, 1),
+        ), patch.object(
+            GATE, "_probe_npu_mapping", return_value={"ok": True, "npuId": 1, "error": None}
+        ), patch.object(
+            GATE, "_probe_device_health", side_effect=health
+        ), patch.object(
+            GATE, "_probe_device_processes", return_value=heavy_row
+        ), patch.object(GATE, "HEALTH_POLL_SECONDS", 0.05), patch.object(
+            GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 0.1
+        ), self.lease_environment():
+            with GATE._open_device_window(
+                "1",
+                wait_seconds=0,
+                require_idle=True,
+                occupancy_policy="shared_quiet",
+                enforce_proc_count=False,
+            ):
+                done_l3 = GATE._run_host_bash_monitored(
+                    "sleep 0.3",
+                    cwd=self.root,
+                    env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+                    cann_setup=None,
+                    conda_sh=None,
+                    conda_env=None,
+                    timeout=10,
+                    isolate_temp=True,
+                    mode="l3",
+                    device="1",
+                    monitor_sink=sink_l3,
+                    external_probe_limit=2,
+                    occupancy_policy="shared_quiet",
+                    shared_max_ext_procs=6,
+                    shared_max_hbm_mb=16384,
+                    allow_external_in_shared=True,
+                )
+        self.assertEqual(done_l3.returncode, 0)
+        self.assertEqual(sink_l3["outcome"], "completed")
+        self.assertNotIn("abort", sink_l3)
