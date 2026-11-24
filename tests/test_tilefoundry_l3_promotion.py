@@ -1263,6 +1263,134 @@ class L3PromotionCase(_Fixture, unittest.TestCase):
         self.assertTrue(obs["occupancyRecorded"])
         self.assertIsNone(runner.seen.workload_env)
 
+    def test_candidate_kernel_compile_and_idempotence_failures_classify_as_candidate(self):
+        junit_original = self.junit_xml
+
+        def first_failed(**kwargs):
+            return junit_original(statuses={
+                name: ("failed" if name == AR_TESTS[0] else "passed")
+                for name in AR_TESTS
+            })
+
+        candidate_cases = (
+            (
+                "explicit_candidate_kernel",
+                self.producer_failure(
+                    kind="candidate",
+                    category="exception",
+                    stage="kernel",
+                    role="candidate",
+                    node=AR_TESTS[0],
+                    case="1",
+                    exception_type="RuntimeError",
+                    detail="exceeded vf stack size (0) during bisheng compile",
+                ),
+            ),
+            (
+                "legacy_infra_marked_vf_stack_overflow",
+                self.producer_failure(
+                    kind="infrastructure",
+                    category="exception",
+                    stage="kernel",
+                    role="candidate",
+                    node=AR_TESTS[0],
+                    case="1",
+                    exception_type="RuntimeError",
+                    detail="Ascend compilation failed: exceeded vf stack size (0)",
+                ),
+            ),
+            (
+                "l3_cache_idempotence_violation",
+                self.producer_failure(
+                    kind="infrastructure",
+                    category="assertion",
+                    stage="cache_idempotence",
+                    node=AR_TESTS[0],
+                    case=None,
+                    exception_type="ClassifiedTestFailure",
+                    detail="L3 cache idempotence violation (Delta|Cache|=1)",
+                ),
+            ),
+        )
+        for label, failure in candidate_cases:
+            with self.subTest(case=label):
+                self.evidence = self.failure_evidence([failure])
+                self.junit_xml = first_failed  # type: ignore[method-assign]
+                rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+                self.assertEqual(rc, 1)
+                self.assertFalse(obs["promotionEligible"])
+                self.assertEqual(obs["errorCategory"], "candidate")
+                self.assertEqual(obs["failureCategory"], "candidate")
+
+    def test_baseline_hardware_and_interrupted_kernel_failures_stay_non_candidate(self):
+        junit_original = self.junit_xml
+
+        def first_failed(**kwargs):
+            return junit_original(statuses={
+                name: ("failed" if name == AR_TESTS[0] else "passed")
+                for name in AR_TESTS
+            })
+
+        baseline_fail = self.producer_failure(
+            kind="infrastructure",
+            category="exception",
+            stage="kernel",
+            role="baseline",
+            node=AR_TESTS[0],
+            case="1",
+            exception_type="RuntimeError",
+            detail="exceeded vf stack size (0)",
+        )
+        self.evidence = self.failure_evidence([baseline_fail])
+        self.junit_xml = first_failed  # type: ignore[method-assign]
+        rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+        self.assertEqual(rc, 1)
+        self.assertEqual(obs["failureCategory"], "environment")
+
+        hw_fail = self.producer_failure(
+            kind="infrastructure",
+            category="exception",
+            stage="kernel",
+            role="candidate",
+            node=AR_TESTS[0],
+            case="1",
+            exception_type="RuntimeError",
+            detail="aclrtGetDevice failed: device offline E39999",
+        )
+        self.evidence = self.failure_evidence([hw_fail])
+        rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+        self.assertEqual(rc, 1)
+        self.assertEqual(obs["failureCategory"], "environment")
+
+        kernel_fail = self.producer_failure(
+            kind="candidate",
+            category="exception",
+            stage="kernel",
+            role="candidate",
+            node=AR_TESTS[0],
+            case="1",
+            exception_type="RuntimeError",
+            detail="exceeded vf stack size (0)",
+        )
+        base_interrupted = self.failure_evidence([kernel_fail])
+
+        def interrupted_evidence(env):
+            packet = base_interrupted(env)
+            packet["interruption"]["errorCategory"] = "signal"
+            return packet
+
+        self.evidence = interrupted_evidence  # type: ignore[method-assign]
+        rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+        self.assertEqual(rc, 1)
+        self.assertEqual(obs["failureCategory"], "environment")
+
+        # Bare JUnit failure without producer marker must still remain "infra".
+        self.evidence = _Fixture.evidence.__get__(self, _Fixture)
+        self.junit_xml = first_failed  # type: ignore[method-assign]
+        rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+        self.assertEqual(rc, 1)
+        self.assertEqual(obs["failureCategory"], "infra")
+
 
 class L4IdlePolicyCase(_Fixture, unittest.TestCase):
     def test_prep_blocks_before_inspection_on_a_shared_device(self):
