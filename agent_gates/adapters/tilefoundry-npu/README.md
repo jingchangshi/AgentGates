@@ -150,6 +150,47 @@ conflicting exports in the launching environment):
   `TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO`:
   optional absolute host paths to read-only Ascend 950 reference checkouts forwarded when non-empty.
 
+### Shared hosts (`shared_quiet`)
+
+Two keys decide whether a device window may share its card with processes that
+do not carry this run's token. Both are machine facts and belong in `env.sh`:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `TILEFOUNDRY_NPU_OCCUPANCY_POLICY` | `exclusive` | `shared_quiet` enables the budgets below |
+| `TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS` | `6` | external processes admitted at lease time |
+| `TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB` | `16384` | external HBM admitted at lease time |
+| `TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT` | `3` | consecutive probes before a run-time abort |
+
+Admission and the run-time guard are deliberately asymmetric. At lease time an
+L4 refuses a card whose external HBM exceeds `SHARED_MAX_HBM_MB` or whose
+external process count exceeds `SHARED_MAX_EXT_PROCS`. While the run is live the
+monitor aborts only when external HBM exceeds the same budget or the external
+process count exceeds `SHARED_MAX_EXT_PROCS + 4`, sustained for
+`L4_EXTERNAL_PROBE_LIMIT` consecutive probes, so a short co-tenant burst does not
+discard a valid measurement. Receipts stay honest either way:
+`deviceWindow.occupancy` is `shared(N)` when the card was shared at admission,
+and `occupancyPolicy`, `externalProcessCount` and `externalMemoryMb` are recorded.
+
+Sizing is a measurement, not a guess. Read the HBM that the server's co-tenant
+jobs actually hold: a job at about 17.5 GiB is admitted only when
+`SHARED_MAX_HBM_MB >= 18432`, and at that setting two such jobs are refused by
+design. A two-card host with mixed tenants used `2` processes / `18432` MB; the
+shipped defaults stay conservative because the policy is opt-in.
+
+Timing impact should be quantified per host before trusting shared timings. Run
+the same candidate twice, once on a quiet card and once with a bounded synthetic
+co-tenant (same account, known HBM and compute duty), and compare per-case
+`elapsed_us`. A measured example: no change at 1 GiB / 10% duty, about +4% median
+and +9% P90 at 4 GiB / 25% duty. Timing validity is still enforced by the
+official `allTimingsValid` flag, but a `shared(N)` timing result is provisional:
+prefer a quiet window for a release-grade number.
+
+`require_exclusive_device = true` in the AgentGates `[devices]` configuration
+short-circuits this policy: it exports
+`TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE=1` and every non-free card is refused
+before the budgets are consulted. Set it to `false` to use `shared_quiet`.
+
 ### Multi-Worktree Zero-Lock Concurrency
 
 AgentGates acquires `source:<dir>` and `build:<dir>/build` locks scoped to

@@ -280,3 +280,25 @@ TILEFOUNDRY_NPU_CANN_SERIES=
 TILEFOUNDRY_NPU_TILELANG_REPO=
 TILEFOUNDRY_NPU_CANNBOT_DSL_REPO=
 TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO=
+
+# Optional device-window occupancy policy. Empty means "exclusive": an L4
+# requires an idle card. "shared_quiet" admits an L4 while at most
+# SHARED_MAX_EXT_PROCS external processes and SHARED_MAX_HBM_MB of external HBM
+# are present, and lets the run-time monitor abort only on heavy contention.
+# Receipts record occupancy="shared(N)" and the policy; timings are provisional.
+# `require_exclusive_device = true` in the AgentGates [devices] configuration
+# overrides this policy and refuses a shared card before the budgets apply.
+TILEFOUNDRY_NPU_OCCUPANCY_POLICY=
+
+# Optional positive integer process count admitted at lease time (default 6).
+# The run-time guard aborts above MAX_EXT_PROCS + 4 processes.
+TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS=
+
+# Optional integer >= 256, default 16384. Size it from the HBM a co-tenant job
+# actually holds: a job at about 17.5 GiB needs at least 18432 to be admitted,
+# and two such jobs are then refused by design.
+TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB=
+
+# Optional positive integer, default 3: consecutive occupancy probes that must
+# agree before the run-time monitor aborts the run.
+TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT=
