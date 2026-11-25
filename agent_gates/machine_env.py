@@ -239,6 +239,30 @@ TILEFOUNDRY_NPU_KEYS = (
     'TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS',
 )
 
+# MegaKernel host adapter: CANN + Python 3.11 conda megakernel-npu env + LLVM;
+# sourceWrite=false so builds stage incrementally into MEGAKERNEL_NPU_WORK_ROOT
+# and ninja concurrency is strictly capped to <= 16 cores.
+MEGAKERNEL_NPU_KEYS = (
+    'MEGAKERNEL_NPU_CANN_SETUP',
+    'MEGAKERNEL_NPU_CONDA_SH',
+    'MEGAKERNEL_NPU_CONDA_ENV',
+    'MEGAKERNEL_NPU_CONDA_ENVS_PATH',
+    'MEGAKERNEL_NPU_PYTHON',
+    'MEGAKERNEL_NPU_LLVM_SYSPATH',
+    'MEGAKERNEL_NPU_WORK_ROOT',
+    'MEGAKERNEL_NPU_RUNTIME_HOME',
+    'MEGAKERNEL_NPU_BISHENGIR_BIN',
+    'MEGAKERNEL_NPU_CMAKE_BIN',
+    'MEGAKERNEL_NPU_BUILD_SUBDIR',
+    'MEGAKERNEL_NPU_NINJA_JOBS',
+    'MEGAKERNEL_NPU_LINK_JOBS',
+    'MEGAKERNEL_NPU_ENABLE_ASCENDC_OPS',
+    'MEGAKERNEL_NPU_BUILD_SHMEM',
+    'MEGAKERNEL_NPU_CPU_TESTS',
+    'MEGAKERNEL_NPU_DEVICE_TESTS',
+    'MEGAKERNEL_NPU_DEVICE_TEST_MODE',
+)
+
 # The adapter ID -> the prefix it owns, the selector variable it honours and the
 # machine file the checkout keeps beside its template.
 ADAPTERS = {
@@ -292,6 +316,12 @@ ADAPTERS = {
         'selector': 'TILEFOUNDRY_NPU_ENV_FILE',
         'directory': 'tilefoundry-npu',
         'keys': TILEFOUNDRY_NPU_KEYS,
+    },
+    'megakernel-npu': {
+        'prefix': 'MEGAKERNEL_NPU_',
+        'selector': 'MEGAKERNEL_NPU_ENV_FILE',
+        'directory': 'megakernel-npu',
+        'keys': MEGAKERNEL_NPU_KEYS,
     },
 }
 

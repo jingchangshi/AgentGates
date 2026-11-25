@@ -258,6 +258,12 @@ class PackagingCase(unittest.TestCase):
             self.assertNotIn(value, text)
         self.assertNotRegex(text, r'TILEFOUNDRY_NPU_DEVICE_ID=[0-9]')
 
+    def test_megakernel_example_configuration_holds_no_machine_value(self):
+        text = (ADAPTERS / 'megakernel-npu' / 'env.example.sh').read_text()
+        for value in ('s00653124', '/home/', '/data/pri', '/data/miniconda3'):
+            self.assertNotIn(value, text)
+        self.assertNotRegex(text, r'MEGAKERNEL_NPU_DEVICE_ID=[0-9]')
+
 
 if __name__ == '__main__':
     unittest.main()

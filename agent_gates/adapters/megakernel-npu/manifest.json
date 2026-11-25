@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "id": "megakernel-npu",
+  "version": "1.0.0",
+  "capabilities": [
+    "build",
+    "cpu-regression",
+    "device-regression"
+  ],
+  "skills": [],
+  "permissions": {
+    "sourceWrite": false,
+    "hostExecution": true
+  },
+  "runtimeCompatibility": {
+    "engineeringCore": ">=2.0.0"
+  },
+  "files": {
+    "scripts/megakernel_npu_gate.py": "13f11ffaa324628eabf925754080570215f630f86a6fd9c439c056293c75cfc2"
+  },
+  "recipes": [
+    {
+      "id": "megakernel-npu.build",
+      "cwd": "source",
+      "timeout": 3600,
+      "device": "none",
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/megakernel_npu_gate.py",
+        "--build",
+        "--timeout",
+        "3300"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/megakernel_npu_gate.py",
+        "--check-config-build"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "megakernel-npu.cpu",
+      "cwd": "source",
+      "timeout": 660,
+      "device": "none",
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/megakernel_npu_gate.py",
+        "--cpu",
+        "--timeout",
+        "600"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/megakernel_npu_gate.py",
+        "--check-config-cpu"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    },
+    {
+      "id": "megakernel-npu.device",
+      "cwd": "source",
+      "timeout": 1260,
+      "deviceWindow": {
+        "waitSeconds": 60
+      },
+      "argv": [
+        "python3",
+        "-B",
+        "{pack}/scripts/megakernel_npu_gate.py",
+        "--device",
+        "--timeout",
+        "1200"
+      ],
+      "configCheck": [
+        "python3",
+        "-B",
+        "{pack}/scripts/megakernel_npu_gate.py",
+        "--check-config-device"
+      ],
+      "blockedExitCodes": [
+        75
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "megakernel-npu-build",
+      "recipeId": "megakernel-npu.build",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "nativeLibraryPresent": true,
+        "optToolsPresent": true,
+        "megakernelBitcodePresent": true,
+        "tritonDistImported": true,
+        "modelBuilderImported": true
+      }
+    },
+    {
+      "id": "megakernel-npu-cpu",
+      "recipeId": "megakernel-npu.cpu",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "testsCollectedPositive": true,
+        "notAllSkipped": true,
+        "testsFailed": 0
+      }
+    },
+    {
+      "id": "megakernel-npu-device",
+      "recipeId": "megakernel-npu.device",
+      "gateType": "deterministic-test",
+      "observationChecks": {
+        "exitCodeZero": true,
+        "tritonDistImported": true,
+        "modelBuilderImported": true,
+        "npuAvailable": true,
+        "deviceCountOne": true,
+        "tensorOnDevice": true,
+        "numericalOk": true,
+        "synchronizeOk": true,
+        "deviceMemoryPositive": true,
+        "windowOpened": true,
+        "windowReleased": true,
+        "occupancyRecorded": true
+      },
+      "dependsOn": [
+        "megakernel-npu-cpu"
+      ]
+    }
+  ]
+}
