@@ -10,9 +10,10 @@
 | `tla-npu` | `agent_gates/adapters/tla-npu/env.sh` | `TLA_NPU_ENV_FILE` |
 | `forgekernel-ascend-npu` | `agent_gates/adapters/forgekernel-ascend-npu/env.sh` | `FK_ASCEND_ENV_FILE` |
 | `bska-npu` | `agent_gates/adapters/bska-npu/env.sh` | `BSKA_NPU_ENV_FILE` |
+| `megakernel-npu` | `agent_gates/adapters/megakernel-npu/env.sh` | `MEGAKERNEL_NPU_ENV_FILE` |
 
 > [!WARNING]
-> **Docker 模式已隔离（`DOCKER_MODE_DISABLED`）**：`tilelang-hivm`、`tilelang-hivm-npu` 及 `ascendnpu-ir` 容器路由已禁用。本文仅说明当前活跃的 6 个宿主机 Adapter 配置。
+> **Docker 模式已隔离（`DOCKER_MODE_DISABLED`）**：`tilelang-hivm`、`tilelang-hivm-npu` 及 `ascendnpu-ir` 容器路由已禁用。本文仅说明当前活跃的宿主机 Adapter 配置。
 
 ---
 
@@ -141,7 +142,18 @@ that environment comes from the systemd user worker.
 
 ---
 
-## 七、配置自检与常见报错排查
+## 七、`megakernel-npu`（Triton-distributed-ascend / MegaKernel）
+
+模板文件：[`env.example.sh`](../../agent_gates/adapters/megakernel-npu/env.example.sh)
+
+- 必填键：`MEGAKERNEL_NPU_CANN_SETUP`、`MEGAKERNEL_NPU_CONDA_SH`、`MEGAKERNEL_NPU_CONDA_ENV`（Python 3.11 + `torch==2.7.1` + `torch_npu==2.7.1.post4`）。
+- `--build` 必填键：`MEGAKERNEL_NPU_LLVM_SYSPATH`（预编译 LLVM 路径）、`MEGAKERNEL_NPU_WORK_ROOT`（位于 `--source` 之外，存放增量舞台树 `stage/` 与 wheel）。
+- 并发上限：`MEGAKERNEL_NPU_NINJA_JOBS` 硬性限制在 `1..16`（默认 `16`），`MEGAKERNEL_NPU_LINK_JOBS` 限制在 `1..4`（默认 `2`）。
+- 测试与运行时可选键：`MEGAKERNEL_NPU_RUNTIME_HOME`（`MEGA_KERNEL_HOME` 回调目录）、`MEGAKERNEL_NPU_CPU_TESTS`、`MEGAKERNEL_NPU_DEVICE_TESTS`、`MEGAKERNEL_NPU_DEVICE_TEST_MODE`（`auto`/`script`/`pytest`）、`MEGAKERNEL_NPU_ENABLE_ASCENDC_OPS`、`MEGAKERNEL_NPU_BUILD_SHMEM`。
+
+---
+
+## 八、配置自检与常见报错排查
 
 在正式提交任务前，务必使用 `doctor` 验证对应 Adapter（不触发编译或上卡任务）：
 
