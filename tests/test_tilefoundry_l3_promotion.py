@@ -1312,6 +1312,132 @@ class L3PromotionCase(_Fixture, unittest.TestCase):
         self.assertTrue(obs["windowOpened"])
         self.assertTrue(obs["windowReleased"])
 
+    def _cleanup_proc(self, proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def _run_l3_shared_quiet_with_monitor(self, *, probe_mem_sequence, workload_sleep):
+        ext_proc = subprocess.Popen(
+            ["/bin/sleep", "30"],
+            start_new_session=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        self.addCleanup(self._cleanup_proc, ext_proc)
+        seen = _Seen()
+        probe_mems_seen = []
+
+        def probe_processes(_npu_id, _timeout):
+            idx = min(len(probe_mems_seen), len(probe_mem_sequence) - 1)
+            mem_mb = probe_mem_sequence[idx]
+            probe_mems_seen.append(mem_mb)
+            return {
+                "ok": True,
+                "processTableSeen": True,
+                "processes": [{
+                    "pid": str(ext_proc.pid),
+                    "name": "sleep",
+                    "memoryMb": str(mem_mb),
+                }],
+                "error": None,
+            }
+
+        def run_host_bash(cmd, *, cwd, env, **kwargs):
+            seen.commands.append((cmd, dict(env)))
+            args = cmd.split()
+            script = Path(args[2]).name
+            if script == "preflight.py":
+                Path(args[3]).write_text(
+                    json.dumps(self.preflight_facts(env, seen)), encoding="utf-8"
+                )
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            completed = subprocess.run(
+                ["/bin/sleep", workload_sleep], env=env, check=False
+            )
+            if completed.returncode == 0:
+                Path(args[3]).write_text(
+                    json.dumps(self.workload_facts(env, seen)), encoding="utf-8"
+                )
+                Path(args[4]).write_text(self.junit_xml(), encoding="utf-8")
+                Path(env["TF_L3_EVIDENCE_PATH"]).write_text(
+                    json.dumps(self.evidence(env)), encoding="utf-8"
+                )
+            return types.SimpleNamespace(
+                returncode=completed.returncode, stdout="", stderr=""
+            )
+
+        env = self.environment()
+        admission_procs = [
+            {"pid": str(ext_proc.pid), "name": "sleep", "memoryMb": "4096"}
+        ]
+        health_ok = {"ok": True, "healthKind": "ok", "healthValue": "OK", "error": None}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(
+                    GATE.adapter_runtime,
+                    "processes_on",
+                    return_value=(admission_procs, 1),
+                ), \
+                patch.object(
+                    GATE.adapter_runtime, "run_host_bash", side_effect=run_host_bash
+                ), \
+                patch.object(
+                    GATE,
+                    "_probe_npu_mapping",
+                    return_value={"ok": True, "npuId": 1, "error": None},
+                ), \
+                patch.object(GATE, "_probe_device_health", return_value=health_ok), \
+                patch.object(
+                    GATE, "_probe_device_processes", side_effect=probe_processes
+                ), \
+                patch.object(GATE, "HEALTH_POLL_SECONDS", 0.05), \
+                patch.object(GATE, "HEALTH_PROBE_INTERVAL_SECONDS", 0.05), \
+                patch.object(GATE, "HEALTH_PID_RESCAN_SECONDS", 0.05), \
+                self.in_source():
+            values = self.values()
+            values["TILEFOUNDRY_NPU_OCCUPANCY_POLICY"] = "shared_quiet"
+            rc, obs = GATE.run_l3_promotion(values, 60.0)
+        return rc, obs, probe_mems_seen
+
+    def test_l3_promotion_shared_quiet_aborts_on_hbm_spike(self):
+        rc, obs, probe_mems = self._run_l3_shared_quiet_with_monitor(
+            probe_mem_sequence=[4096, 32768, 32768, 32768],
+            workload_sleep="10",
+        )
+        self.assertEqual(rc, 75)
+        self.assertEqual(obs["errorCategory"], "occupancy")
+        self.assertEqual(obs["failureCategory"], "occupancy")
+        self.assertEqual(obs["deviceOccupancy"], "shared(1)")
+        self.assertTrue(obs["windowOpened"])
+        self.assertTrue(obs["windowReleased"])
+        self.assertEqual(obs["healthMonitoring"]["outcome"], "aborted")
+        self.assertEqual(
+            obs["healthMonitoring"]["abort"]["kind"], "external_occupancy"
+        )
+        self.assertEqual(obs["healthMonitoring"]["abort"]["occupancy"], "shared(1)")
+        self.assertEqual(probe_mems, [4096, 32768, 32768])
+
+    def test_l3_promotion_shared_quiet_passes_under_steady_quiet_load(self):
+        rc, obs, probe_mems = self._run_l3_shared_quiet_with_monitor(
+            probe_mem_sequence=[4096],
+            workload_sleep="0.35",
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(obs["exitCodeZero"])
+        self.assertTrue(obs["promotionEligible"])
+        self.assertTrue(obs["occupancyRecorded"])
+        self.assertEqual(obs["deviceWindow"]["occupancy"], "shared(1)")
+        self.assertEqual(obs["deviceWindow"]["occupancyPolicy"], "shared_quiet")
+        self.assertTrue(obs["windowOpened"])
+        self.assertTrue(obs["windowReleased"])
+        self.assertEqual(obs["healthMonitoring"]["outcome"], "completed")
+        self.assertNotIn("abort", obs["healthMonitoring"])
+        self.assertGreaterEqual(len(probe_mems), 2)
+        self.assertTrue(all(mem == 4096 for mem in probe_mems))
+
     def test_candidate_kernel_compile_and_idempotence_failures_classify_as_candidate(self):
         junit_original = self.junit_xml
 

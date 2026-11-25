@@ -5995,7 +5995,7 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                 occupancy_policy=policy,
                 max_ext_procs=max_procs,
                 max_hbm_mb=max_hbm,
-                enforce_proc_count=False,
+                enforce_proc_count=True,
             ) as finalize_window:
                 try:
                     if deadline.remaining() <= 0:
@@ -6029,7 +6029,7 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                             occupancy_policy=policy,
                             shared_max_ext_procs=max_procs,
                             shared_max_hbm_mb=max_hbm,
-                            allow_external_in_shared=True,
+                            allow_external_in_shared=False,
                             phase_getter=lambda: phases[-1]["name"] if phases else None,
                         )
                     except subprocess.TimeoutExpired as exc:
