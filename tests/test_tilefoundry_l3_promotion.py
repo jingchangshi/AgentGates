@@ -1566,6 +1566,126 @@ class L3PromotionCase(_Fixture, unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(obs["failureCategory"], "infra")
 
+    def test_l3_numeric_failure_at_case3_not_preempted_by_downstream_missing_cases(self):
+        required_cases = [str(i) for i in range(16)]
+        case_states = {"0": "passed", "1": "passed", "2": "passed", "3": "failed"}
+        candidate_fail = self.candidate_failure(node=AR_TESTS[0], case="3")
+        collateral_missing = self.producer_failure(
+            kind="coverage",
+            category="missing_case",
+            stage="coverage",
+            node=AR_TESTS[0],
+            case="4",
+            detail=f"{AR_TESTS[0]}:4 was not completed",
+        )
+        base_builder = self.failure_evidence(
+            [candidate_fail, collateral_missing],
+            node_states={AR_TESTS[0]: case_states},
+        )
+
+        def build_evidence(env):
+            packet = base_builder(env)
+            packet["nodes"][0]["status"] = "failed"
+            packet["nodes"][0]["requiredCases"] = list(required_cases)
+            packet["coverage"]["qualified"] = False
+            packet["coverage"]["cases"] = {
+                "expected": 16,
+                "completed": 4,
+                "missing": [f"{AR_TESTS[0]}:{i}" for i in range(4, 16)],
+                "unexpected": [],
+            }
+            return packet
+
+        junit_original = self.junit_xml
+
+        def first_failed(**kwargs):
+            return junit_original(statuses={
+                name: ("failed" if name == AR_TESTS[0] else "passed")
+                for name in AR_TESTS
+            })
+
+        self.evidence = build_evidence  # type: ignore[method-assign]
+        self.junit_xml = first_failed  # type: ignore[method-assign]
+        rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+        self.assertEqual(rc, 1)
+        self.assertFalse(obs["promotionEligible"])
+        self.assertEqual(obs["errorCategory"], "numeric")
+        self.assertEqual(obs["failureCategory"], "numeric")
+        self.assertEqual(obs["evidence"]["timing"]["startedAt"], "2026-01-01T00:00:00Z")
+        self.assertEqual(obs["evidence"]["timing"]["finishedAt"], "2026-01-01T00:01:00Z")
+
+        # Direct _l3_classify / _l3_evidence_summary check.
+        ev_packet = build_evidence({})
+        junit = GATE._l3_junit_from_xml(first_failed()) if hasattr(GATE, "_l3_junit_from_xml") else None
+        if junit is None:
+            xml_path = self.root / "direct_junit.xml"
+            xml_path.write_text(first_failed(), encoding="utf-8")
+            junit = GATE._l3_junit(xml_path)
+        category, coverage_complete, eligible, _notes = GATE._l3_classify(
+            rc=1,
+            expected=AR_TESTS,
+            junit=junit,
+            evidence=ev_packet,
+            task="level4/attention_residual",
+            operator="attention_residual",
+            candidate=self.candidate.resolve(),
+            candidate_digest=hashlib.sha256(self.candidate.read_bytes()).hexdigest(),
+            python=self.python.resolve(),
+        )
+        self.assertEqual(category, "numeric")
+        self.assertFalse(coverage_complete)
+        self.assertFalse(eligible)
+        summary = GATE._l3_evidence_summary(
+            ev_packet,
+            expected_module=self.candidate.resolve(),
+            candidate_relative="examples/ascend950pr_ops/attention_residual/kernels.py",
+            candidate_digest=hashlib.sha256(self.candidate.read_bytes()).hexdigest(),
+        )
+        assert summary is not None
+        self.assertEqual(summary["timing"], ev_packet["timing"])
+
+    def test_l3_missing_case_on_separate_unfailed_node_still_blocks_as_coverage(self):
+        candidate_fail = self.candidate_failure(node=AR_TESTS[0], case="3")
+        collateral_missing = self.producer_failure(
+            kind="coverage",
+            category="missing_case",
+            stage="coverage",
+            node=AR_TESTS[0],
+            case="4",
+            detail=f"{AR_TESTS[0]}:4 was not completed",
+        )
+        separate_missing = self.producer_failure(
+            kind="coverage",
+            category="missing_case",
+            stage="coverage",
+            node=AR_TESTS[1],
+            case="15",
+            detail=f"{AR_TESTS[1]}:15 was not completed",
+        )
+        base_builder = self.failure_evidence(
+            [candidate_fail, collateral_missing, separate_missing],
+            node_states={
+                AR_TESTS[0]: {"0": "passed", "1": "passed", "2": "passed", "3": "failed"},
+                AR_TESTS[1]: {"1": "passed"},
+            },
+        )
+
+        junit_original = self.junit_xml
+
+        def first_failed(**kwargs):
+            return junit_original(statuses={
+                name: ("failed" if name == AR_TESTS[0] else "passed")
+                for name in AR_TESTS
+            })
+
+        self.evidence = base_builder  # type: ignore[method-assign]
+        self.junit_xml = first_failed  # type: ignore[method-assign]
+        rc, obs = self.run_l3(self.fake_runner(workload_rc=1))
+        self.assertEqual(rc, 1)
+        self.assertFalse(obs["promotionEligible"])
+        self.assertEqual(obs["errorCategory"], "coverage")
+        self.assertEqual(obs["failureCategory"], "coverage")
+
 
 class L4IdlePolicyCase(_Fixture, unittest.TestCase):
     def test_prep_blocks_before_inspection_on_a_shared_device(self):

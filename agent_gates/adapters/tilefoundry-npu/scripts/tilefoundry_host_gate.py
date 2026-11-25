@@ -2454,30 +2454,39 @@ def _cpu_observations(succeeded: bool, collected: int, passed: int, failed: int,
     }
 
 
-def _device_occupancy(device: str) -> str:
+def _device_occupancy_snapshot(
+    device: str, *, raise_on_blocked_exclusive: bool = False
+) -> tuple[str, list[dict[str, str]], int, int | None]:
     try:
-        processes, _ = adapter_runtime.processes_on(int(device))
+        processes, npu_id = adapter_runtime.processes_on(int(device))
     except adapter_runtime.BlockedEnv as exc:
         if exclusive_requested():
-            raise BridgeError(str(exc)) from exc
-        return "unknown"
-    return "free" if not processes else f"shared({len(processes)})"
-
-
-def _device_occupancy_details(device: str) -> tuple[str, list[dict[str, str]], int]:
-    try:
-        processes, _ = adapter_runtime.processes_on(int(device))
-    except adapter_runtime.BlockedEnv as exc:
-        if exclusive_requested():
+            if raise_on_blocked_exclusive:
+                raise BridgeError(str(exc)) from exc
             raise BridgeError(str(exc), category="occupancy", occupancy="unknown") from exc
-        return "unknown", [], 0
+        return "unknown", [], 0, None
     occ = "free" if not processes else f"shared({len(processes)})"
     total_mem_mb = 0
     for row in processes:
+        if not isinstance(row, dict):
+            continue
         try:
             total_mem_mb += int(row.get("memoryMb") or 0)
         except (TypeError, ValueError):
             pass
+    return occ, processes, total_mem_mb, int(npu_id)
+
+
+def _device_occupancy(device: str) -> str:
+    occ, _, _, _ = _device_occupancy_snapshot(device, raise_on_blocked_exclusive=True)
+    return occ
+
+
+_RAW_DEVICE_OCCUPANCY = _device_occupancy
+
+
+def _device_occupancy_details(device: str) -> tuple[str, list[dict[str, str]], int]:
+    occ, processes, total_mem_mb, _ = _device_occupancy_snapshot(device)
     return occ, processes, total_mem_mb
 
 
@@ -2863,8 +2872,13 @@ def _open_device_window(
         window_started = _timestamp()
         ext_procs: list[dict[str, str]] = []
         ext_mem_mb = 0
+        npu_id: int | None = None
         if occupancy_policy == "shared_quiet":
-            occ, ext_procs, ext_mem_mb = _device_occupancy_details(device)
+            occ, ext_procs, ext_mem_mb, npu_id = _device_occupancy_snapshot(device)
+        elif _device_occupancy is _RAW_DEVICE_OCCUPANCY:
+            occ, _, _, npu_id = _device_occupancy_snapshot(
+                device, raise_on_blocked_exclusive=True
+            )
         else:
             occ = _device_occupancy(device)
         probe_seconds = round(time.monotonic() - opened, 3)
@@ -2910,6 +2924,8 @@ def _open_device_window(
                 "probeSeconds": probe_seconds,
                 "occupancy": occ,
             }
+            if npu_id is not None:
+                win["npuId"] = npu_id
             if warmup_seconds is not None:
                 win["warmupSeconds"] = round(float(warmup_seconds), 3)
             if occupancy_policy != "exclusive":
@@ -3155,6 +3171,47 @@ def _health_value_from_info(text: str, npu_id: int) -> str | None:
             if match and cells[2]:
                 health.setdefault(int(match.group(1)), cells[2])
     return health.get(npu_id)
+
+
+_USAGE_AICORE_RATE = re.compile(r"Aicore\s+Usage\s+Rate\(\%\)\s*:\s*(\d+)", re.IGNORECASE)
+_USAGE_HBM_BANDWIDTH_RATE = re.compile(
+    r"HBM\s+Bandwidth\s+Usage\s+Rate\(\%\)\s*:\s*(\d+)", re.IGNORECASE
+)
+
+
+def _probe_npu_usages(
+    npu_id: int, chip_id: int | None = None, timeout: float = 3.0
+) -> dict[str, int]:
+    """Probe AICore and HBM bandwidth usage percentages via npu-smi, degrading to {}."""
+    smi = adapter_runtime.smi_command()
+    base_cmd = [smi, "info", "-t", "usages", "-i", str(npu_id)]
+    if chip_id is not None:
+        result = _bounded_smi_command([*base_cmd, "-c", str(chip_id)], timeout)
+        if result.get("error") is not None or result.get("timedOut") or result.get("unreaped"):
+            return {}
+        combined = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}"
+        if result.get("returncode") != 0 or "does not support" in combined.lower():
+            result = _bounded_smi_command(base_cmd, timeout)
+    else:
+        result = _bounded_smi_command(base_cmd, timeout)
+
+    if (
+        result.get("error") is not None
+        or result.get("timedOut")
+        or result.get("unreaped")
+        or result.get("returncode") != 0
+    ):
+        return {}
+
+    stdout = result.get("stdout") or ""
+    usages: dict[str, int] = {}
+    aicore_match = _USAGE_AICORE_RATE.search(stdout)
+    if aicore_match is not None:
+        usages["aicoreUsagePct"] = int(aicore_match.group(1))
+    hbm_match = _USAGE_HBM_BANDWIDTH_RATE.search(stdout)
+    if hbm_match is not None:
+        usages["hbmBandwidthUsagePct"] = int(hbm_match.group(1))
+    return usages
 
 
 def _probe_device_health(npu_id: int, timeout: float) -> dict:
@@ -4710,13 +4767,25 @@ def _redact_llm_credential(text: str | bytes, credential: str) -> str:
     return text
 
 
-def _window_evidence(occupancy: str, window: dict) -> dict:
-    return {
+def _window_evidence(
+    occupancy: str, window: dict, *, npu_id: int | None = None
+) -> dict:
+    evidence: dict[str, object] = {
         "windowOpened": True,
         "windowReleased": True,
         "occupancyRecorded": occupancy in {"free", "unknown"} or occupancy.startswith("shared("),
         "deviceWindow": window,
     }
+    resolved_npu_id = npu_id
+    if resolved_npu_id is None and isinstance(window, dict):
+        resolved_npu_id = _int_or_none(
+            window.get("npuId") if "npuId" in window else window.get("npu_id")
+        )
+    if resolved_npu_id is not None:
+        usages = _probe_npu_usages(resolved_npu_id)
+        if usages:
+            evidence.update(usages)
+    return evidence
 
 
 @contextmanager
@@ -4951,6 +5020,7 @@ def _l3_evidence_summary(
         "referenceCache": _as_dict(evidence.get("referenceCache")),
         "writeErrors": list(_as_list(evidence.get("writeErrors"))),
         "interruption": _as_dict(evidence.get("interruption")),
+        "timing": _as_dict(evidence.get("timing")),
         "phase": evidence.get("phase"),
         # Producer-structured failure classification. Only a candidate/numeric
         # comparison failure may become a candidate verdict; everything else
@@ -5429,14 +5499,38 @@ def _l3_failure_rows(evidence: dict | None) -> list[dict]:
     return unique
 
 
+def _candidate_failed_node_names(rows: list[dict]) -> set[str]:
+    """Return pytest node names that recorded an explicit candidate failure row."""
+    return {
+        str(row.get("node")).strip()
+        for row in rows
+        if isinstance(row, dict)
+        and str(row.get("kind") or "").strip().lower() == "candidate"
+        and str(row.get("node") or "").strip()
+    }
+
+
+def _is_collateral_missing_case(row: dict, candidate_nodes: set[str]) -> bool:
+    """Return True only for downstream missing_case rows on an already failed candidate node."""
+    if str(row.get("kind") or "").strip().lower() != "coverage":
+        return False
+    if str(row.get("category") or "").strip().lower() != "missing_case":
+        return False
+    node_name = str(row.get("node") or "").strip()
+    return bool(node_name and node_name in candidate_nodes)
+
+
 def _l3_producer_block_kind(rows: list[dict]) -> str | None:
-    """Producer's own precedence: infrastructure/coverage outrank candidate."""
-    kinds = {str(row.get("kind") or "").strip().lower() for row in rows}
-    if "infrastructure" in kinds:
-        return "infrastructure"
-    if "coverage" in kinds:
-        return "coverage"
-    return None
+    """Producer's own precedence: infrastructure/non-collateral coverage outrank candidate."""
+    cand_nodes = _candidate_failed_node_names(rows)
+    has_coverage_block = False
+    for row in rows:
+        kind = str(row.get("kind") or "").strip().lower()
+        if kind == "infrastructure":
+            return "infrastructure"
+        if kind == "coverage" and not _is_collateral_missing_case(row, cand_nodes):
+            has_coverage_block = True
+    return "coverage" if has_coverage_block else None
 
 
 _CANDIDATE_KERNEL_STAGES = frozenset({"kernel", "compile", "cache_idempotence"})
@@ -5533,12 +5627,15 @@ def _l3_candidate_kernel_failure(
         for node in _as_list(evidence.get("nodes"))
         if isinstance(node, dict) and node.get("name")
     }
+    cand_nodes = _candidate_failed_node_names(failures)
     matched: list[dict] = []
     for row in failures:
         if _is_candidate_kernel_failure_row(
             row, node_records=node_records, junit_rows=junit_rows
         ):
             matched.append(row)
+            continue
+        if _is_collateral_missing_case(row, cand_nodes):
             continue
         kind = str(row.get("kind") or "").strip().lower()
         if kind in {"infrastructure", "coverage"}:
