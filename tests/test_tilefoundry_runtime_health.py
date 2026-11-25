@@ -1426,3 +1426,132 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertEqual(done_l3.returncode, 0)
         self.assertEqual(sink_l3["outcome"], "completed")
         self.assertNotIn("abort", sink_l3)
+
+    def test_probe_npu_usages_parses_rates_and_omits_c_when_chip_id_none(self):
+        calls: list[list[str]] = []
+        sample_output = (
+            "\tNPU ID                         : 0\n"
+            "\tHBM Usage Rate(%)              : 3\n"
+            "\tAicore Usage Rate(%)           : 17\n"
+            "\tHBM Bandwidth Usage Rate(%)    : 42\n"
+        )
+
+        def fake_cmd(argv, _timeout):
+            calls.append(list(argv))
+            return {
+                "argv": argv,
+                "pid": 201,
+                "returncode": 0,
+                "stdout": sample_output,
+                "stderr": "",
+                "seconds": 0.01,
+                "timedOut": False,
+                "unreaped": False,
+                "wchan": None,
+                "error": None,
+            }
+
+        with patch.object(GATE, "_bounded_host_command", side_effect=fake_cmd):
+            usages = GATE._probe_npu_usages(0)
+        self.assertEqual(usages, {"aicoreUsagePct": 17, "hbmBandwidthUsagePct": 42})
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("-c", calls[0])
+        self.assertEqual(calls[0][-4:], ["-t", "usages", "-i", "0"])
+
+    def test_probe_npu_usages_retries_without_c_when_unsupported(self):
+        calls: list[list[str]] = []
+        success_output = (
+            "\tNPU ID                         : 0\n"
+            "\tAicore Usage Rate(%)           : 5\n"
+            "\tHBM Bandwidth Usage Rate(%)    : 12\n"
+        )
+
+        def fake_cmd(argv, _timeout):
+            calls.append(list(argv))
+            if "-c" in argv:
+                return {
+                    "argv": argv,
+                    "pid": 202,
+                    "returncode": 255,
+                    "stdout": "This device does not support input parameter of -c.\n",
+                    "stderr": "",
+                    "seconds": 0.01,
+                    "timedOut": False,
+                    "unreaped": False,
+                    "wchan": None,
+                    "error": None,
+                }
+            return {
+                "argv": argv,
+                "pid": 203,
+                "returncode": 0,
+                "stdout": success_output,
+                "stderr": "",
+                "seconds": 0.01,
+                "timedOut": False,
+                "unreaped": False,
+                "wchan": None,
+                "error": None,
+            }
+
+        with patch.object(GATE, "_bounded_host_command", side_effect=fake_cmd):
+            usages = GATE._probe_npu_usages(0, chip_id=0)
+        self.assertEqual(usages, {"aicoreUsagePct": 5, "hbmBandwidthUsagePct": 12})
+        self.assertEqual(len(calls), 2)
+        self.assertIn("-c", calls[0])
+        self.assertNotIn("-c", calls[1])
+
+    def test_probe_npu_usages_degrades_gracefully_and_window_evidence_attaches(self):
+        def failing_cmd(argv, _timeout):
+            return {
+                "argv": argv,
+                "pid": 204,
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "unsupported",
+                "seconds": 0.01,
+                "timedOut": False,
+                "unreaped": False,
+                "wchan": None,
+                "error": None,
+            }
+
+        with patch.object(GATE, "_bounded_host_command", side_effect=failing_cmd):
+            self.assertEqual(GATE._probe_npu_usages(0), {})
+
+        def timeout_cmd(argv, _timeout):
+            return {
+                "argv": argv,
+                "pid": 205,
+                "returncode": None,
+                "stdout": "",
+                "stderr": "",
+                "seconds": 3.0,
+                "timedOut": True,
+                "unreaped": False,
+                "wchan": None,
+                "error": "probe timed out",
+            }
+
+        with patch.object(GATE, "_bounded_host_command", side_effect=timeout_cmd):
+            self.assertEqual(GATE._probe_npu_usages(0, chip_id=0), {})
+
+        win = {"resource": "npu:0", "npuId": 0, "occupancy": "free"}
+        with patch.object(
+            GATE,
+            "_probe_npu_usages",
+            return_value={"aicoreUsagePct": 23, "hbmBandwidthUsagePct": 61},
+        ):
+            ev = GATE._window_evidence("free", win)
+        self.assertTrue(ev["windowOpened"])
+        self.assertTrue(ev["windowReleased"])
+        self.assertTrue(ev["occupancyRecorded"])
+        self.assertEqual(ev["deviceWindow"], win)
+        self.assertEqual(ev["aicoreUsagePct"], 23)
+        self.assertEqual(ev["hbmBandwidthUsagePct"], 61)
+
+        with patch.object(GATE, "_probe_npu_usages", return_value={}):
+            ev_empty = GATE._window_evidence("free", win)
+        self.assertNotIn("aicoreUsagePct", ev_empty)
+        self.assertNotIn("hbmBandwidthUsagePct", ev_empty)
+
