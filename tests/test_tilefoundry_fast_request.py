@@ -1257,6 +1257,35 @@ class FastRequestCase(unittest.TestCase):
                 self.assertNotIn("deviceRejected", obs)
                 self.assertNotIn("deviceFaultSignature", obs)
 
+    def test_batch_accepts_optional_positive_poison_pill_timeout_sec_and_rejects_invalid(self):
+        payload = self.batch_request()
+        payload["batches"][0]["poison_pill_timeout_sec"] = 12.5
+        self.write_request(REQUEST_ID, payload)
+        with self._in_source(), \
+                patch.dict(os.environ, self.environment(REQUEST_ID), clear=True), \
+                patch.object(GATE.locking, "lock_root", return_value=self.lock_root):
+            loaded = GATE._load_fast_request(
+                self.src,
+                GATE.machine_values(),
+                (f"fast/{REQUEST_ID}", f"build/agent_gates/fast/{REQUEST_ID}.request.json"),
+            )
+            self.assertIsNotNone(loaded)
+
+        for bad_val in (0, -5.0, True, "10"):
+            with self.subTest(bad_val=bad_val):
+                bad_payload = self.batch_request()
+                bad_payload["batches"][0]["poison_pill_timeout_sec"] = bad_val
+                self.write_request(REQUEST_ID, bad_payload)
+                with self._in_source(), \
+                        patch.dict(os.environ, self.environment(REQUEST_ID), clear=True), \
+                        patch.object(GATE.locking, "lock_root", return_value=self.lock_root):
+                    with self.assertRaises(GATE.BridgeError):
+                        GATE._load_fast_request(
+                            self.src,
+                            GATE.machine_values(),
+                            (f"fast/{REQUEST_ID}", f"build/agent_gates/fast/{REQUEST_ID}.request.json"),
+                        )
+
     @contextmanager
     def _record_host_call(self):
         real = GATE.adapter_runtime.run_host_bash

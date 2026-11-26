@@ -1916,7 +1916,19 @@ def _load_fast_request(
                 raw_batch,
                 context=context,
                 required=("operator_name", "entrypoint", "candidates", "anchors"),
+                optional=("poison_pill_timeout_sec",),
             )
+            if "poison_pill_timeout_sec" in batch:
+                pill_timeout = batch["poison_pill_timeout_sec"]
+                if (
+                    isinstance(pill_timeout, bool)
+                    or not isinstance(pill_timeout, (int, float))
+                    or not math.isfinite(pill_timeout)
+                    or pill_timeout <= 0.0
+                ):
+                    raise BridgeError(
+                        f"fast request {context}.poison_pill_timeout_sec must be a finite positive number"
+                    )
             operator = _fast_name(batch["operator_name"], field=f"{context}.operator_name")
             if operator in operators:
                 raise BridgeError(f"fast request duplicates operator {operator!r}")
