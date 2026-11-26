@@ -1555,3 +1555,110 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertNotIn("aicoreUsagePct", ev_empty)
         self.assertNotIn("hbmBandwidthUsagePct", ev_empty)
 
+    def test_detect_npu_device_fault_signatures_and_non_matches(self):
+        positives = (
+            ("E39006", "EE9999: E39006 init failed", ""),
+            (
+                "Inner_Error_Failed_Send_OPP_To_Device",
+                "",
+                "Inner_Error_Failed_Send_OPP_To_Device while loading",
+            ),
+            ("TsdOpen failed", "TsdOpen failed, devId=0", ""),
+            ("tdt error", "", "TDT error occurred on channel"),
+            ("507033", "aclrtSynchronizeStream failed, error code: 507033", ""),
+            ("ACL_ERROR_RT_DEVICE", "ret=ACL_ERROR_RT_DEVICE", ""),
+            ("ACL_ERROR_RT_DEVICE_FAILURE", "", "status=ACL_ERROR_RT_DEVICE_FAILURE"),
+            ("drvError", "drvError=0x4 during submit", ""),
+            ("HCCL_E_INTERNAL", "", "HCCL_E_INTERNAL: link down"),
+            ("uncorrectable ecc", "HBM uncorrectable ecc detected", ""),
+            ("ecc error", "", "fatal ECC error on chip 0"),
+        )
+        for expected, out, err in positives:
+            with self.subTest(expected=expected):
+                sig = GATE._detect_npu_device_fault(out, err)
+                self.assertIsNotNone(sig)
+                assert sig is not None
+                self.assertEqual(sig.lower(), expected.lower())
+
+        negatives = (
+            ("RuntimeError: AICore trap at pc=0x10", ""),
+            ("", "AssertionError: numeric mismatch max_diff=0.25"),
+            ("max_abs_diff=0.5 > tol=1e-3", "candidate failed"),
+            ("sha256=deadbeef507033cafe", ""),
+            ("", ""),
+        )
+        for out, err in negatives:
+            with self.subTest(out=out, err=err):
+                self.assertIsNone(GATE._detect_npu_device_fault(out, err))
+
+    def test_device_probe_classifies_npu_device_fault_as_75_and_aicore_trap_as_1(self):
+        src = self.root / "tf-src"
+        (src / "src" / "tilefoundry").mkdir(parents=True)
+        cann = self.root / "set_env.sh"
+        cann.write_text(":\n", encoding="utf-8")
+        conda_sh = self.root / "conda.sh"
+        conda_sh.write_text("conda() { :; }\n", encoding="utf-8")
+        env_file = self.root / "machine.env"
+        env_file.write_text(
+            "".join(
+                f"{k}={v}\n"
+                for k, v in {
+                    "TILEFOUNDRY_NPU_CANN_SETUP": str(cann),
+                    "TILEFOUNDRY_NPU_CONDA_SH": str(conda_sh),
+                    "TILEFOUNDRY_NPU_CONDA_ENV": "tilefoundry-npu",
+                    "TILEFOUNDRY_NPU_PYTHON": sys.executable,
+                }.items()
+            ),
+            encoding="utf-8",
+        )
+        run_env = {
+            "TILEFOUNDRY_NPU_ENV_FILE": str(env_file),
+            "TILEFOUNDRY_NPU_DEVICE_ID": "1",
+            "AGENT_GATES_DEVICE_LEASE_PATH": str(self.lease),
+            "AGENT_GATES_DEVICE_LEASE_RESOURCE": "npu:1",
+            "AGENT_GATES_DEVICE_LEASE_WAIT_SECONDS": "0",
+        }
+        old_cwd = os.getcwd()
+        os.chdir(src)
+        self.addCleanup(os.chdir, old_cwd)
+
+        for sig, out, err in (
+            ("E39006", "E39006: device init failed", ""),
+            ("TsdOpen failed", "", "TsdOpen failed on device 1"),
+            ("507033", "aclrtSynchronizeStream failed ret=507033", ""),
+        ):
+            with self.subTest(sig=sig):
+                completed = subprocess.CompletedProcess(
+                    args=["bash"], returncode=1, stdout=out, stderr=err
+                )
+                with patch.dict(os.environ, run_env, clear=True), \
+                        patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                        patch.object(GATE, "_run_host_bash_monitored", return_value=completed), \
+                        patch.object(GATE.locking, "lock_root", return_value=self.root / "locks"):
+                    rc, obs = GATE.run_device(GATE.machine_values(), 60.0, fast=False)
+                self.assertEqual(rc, 75)
+                self.assertFalse(obs["exitCodeZero"])
+                self.assertTrue(obs["windowOpened"])
+                self.assertEqual(obs["errorCategory"], "device_fault")
+                self.assertEqual(obs["failureCategory"], "device_fault")
+                self.assertIs(obs["deviceRejected"], True)
+                self.assertEqual(obs["deviceFaultSignature"], sig)
+
+        trap = subprocess.CompletedProcess(
+            args=["bash"],
+            returncode=1,
+            stdout="",
+            stderr='RuntimeError: AICore trap during kernel execution',
+        )
+        with patch.dict(os.environ, run_env, clear=True), \
+                patch.object(GATE.adapter_runtime, "processes_on", return_value=([], 1)), \
+                patch.object(GATE, "_run_host_bash_monitored", return_value=trap), \
+                patch.object(GATE.locking, "lock_root", return_value=self.root / "locks"):
+            rc, obs = GATE.run_device(GATE.machine_values(), 60.0, fast=False)
+        self.assertEqual(rc, 1)
+        self.assertFalse(obs["exitCodeZero"])
+        self.assertEqual(obs["errorCategory"], "candidate")
+        self.assertNotIn("deviceRejected", obs)
+        self.assertNotIn("deviceFaultSignature", obs)
+
+

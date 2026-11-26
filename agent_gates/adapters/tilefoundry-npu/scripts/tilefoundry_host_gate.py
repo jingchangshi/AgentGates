@@ -5044,6 +5044,44 @@ def _l3_evidence_summary(
     }
 
 
+_NPU_DEVICE_FAULT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bE39006\b"),
+    re.compile(r"\bInner_Error_Failed_Send_OPP_To_Device\b"),
+    re.compile(r"\bTsdOpen\s+failed\b", re.IGNORECASE),
+    re.compile(r"\btdt\s+error\b", re.IGNORECASE),
+    re.compile(r"\b507033\b"),
+    re.compile(r"\bACL_ERROR_RT_DEVICE[A-Z0-9_]*\b"),
+    re.compile(r"\bdrvError\b"),
+    re.compile(r"\bHCCL_E_INTERNAL\b"),
+    re.compile(r"\buncorrectable\s+ecc(?:\s+error)?\b", re.IGNORECASE),
+    re.compile(r"\becc\s+error\b", re.IGNORECASE),
+)
+
+
+def _detect_npu_device_fault(stdout: str, stderr: str) -> str | None:
+    """Detect deterministic CANN/driver/TSD/HCCN/ECC device fault signatures."""
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    if not combined:
+        return None
+    for pattern in _NPU_DEVICE_FAULT_PATTERNS:
+        match = pattern.search(combined)
+        if match is not None:
+            return match.group(0)
+    return None
+
+
+def _apply_npu_device_fault(obs: dict, sig: str, *, l3: bool = False) -> None:
+    """Attach canonical NPU device fault classification fields to an observation."""
+    obs["errorCategory"] = "device_fault"
+    obs["failureCategory"] = "device_fault"
+    obs["deviceRejected"] = True
+    obs["deviceFaultSignature"] = sig
+    obs["exitCodeZero"] = False
+    if l3:
+        obs["promotionEligible"] = False
+        obs["coverageComplete"] = False
+
+
 def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) -> tuple[int, dict]:
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
@@ -5288,6 +5326,16 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                             )
                         if tl_identity is not None:
                             obs["tilelang"] = tl_identity
+                        device_fault = (
+                            _detect_npu_device_fault(
+                                completed.stdout or "", completed.stderr or ""
+                            )
+                            if not ok
+                            else None
+                        )
+                        if device_fault is not None:
+                            _apply_npu_device_fault(obs, device_fault)
+                            return adapter_runtime.BLOCKED_ENV, obs
                         return (0 if ok else (completed.returncode or 1)), obs
 
                     if completed.stderr.strip():
@@ -5315,6 +5363,16 @@ def run_device(values: dict[str, str], timeout: float, *, fast: bool = False) ->
                             str(parsed.get("tilelangVersion", "")), credential
                         )
                         obs["tilelang"] = tl_identity
+                    device_fault = (
+                        _detect_npu_device_fault(
+                            completed.stdout or "", completed.stderr or ""
+                        )
+                        if not ok
+                        else None
+                    )
+                    if device_fault is not None:
+                        _apply_npu_device_fault(obs, device_fault)
+                        return adapter_runtime.BLOCKED_ENV, obs
                     return (0 if ok else (completed.returncode or 1)), obs
     except BridgeError as exc:
         obs = {
@@ -6176,6 +6234,12 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
             )
             obs["evidence"] = evidence_summary
             rc = 0 if eligible else 1
+            if completed.returncode != 0 or not eligible:
+                sig = _detect_npu_device_fault(
+                    completed.stdout or "", completed.stderr or ""
+                )
+                if sig is not None:
+                    _apply_npu_device_fault(obs, sig, l3=True)
     except BridgeError as exc:
         obs["errorCategory"] = exc.category
         obs["error"] = str(exc)
@@ -6249,13 +6313,13 @@ def run_l3_promotion(values: dict[str, str], timeout: float) -> tuple[int, dict]
                 "byKind": ev_cache.get("byKind"),
             }
     if obs["errorCategory"] != "none":
-        if obs["errorCategory"] == "occupancy":
+        if obs["errorCategory"] in {"occupancy", "device_fault"}:
             rc = adapter_runtime.BLOCKED_ENV
         else:
             rc = 1 if obs.get("windowOpened") else adapter_runtime.BLOCKED_ENV
     # Promotion clients treat "numeric" and "candidate" as candidate failures.
-    # "coverage", "environment", "occupancy", "deadline", "signal", and "infra"
-    # are infrastructure blocks that preserve the candidate.
+    # "coverage", "environment", "occupancy", "device_fault", "deadline",
+    # "signal", and "infra" are infrastructure blocks that preserve the candidate.
     obs["failureCategory"] = (
         None if obs["errorCategory"] in {None, "none"} else obs["errorCategory"]
     )
