@@ -1686,6 +1686,96 @@ class L3PromotionCase(_Fixture, unittest.TestCase):
         self.assertEqual(obs["errorCategory"], "coverage")
         self.assertEqual(obs["failureCategory"], "coverage")
 
+    def test_l3_npu_device_fault_returns_75_regardless_of_window_opened(self):
+        cases = (
+            ("E39006", "EE9999 E39006 init failed\n", ""),
+            ("TsdOpen failed", "", "TsdOpen failed, devId=1\n"),
+            ("507033", "aclrtSynchronizeStream error 507033\n", ""),
+        )
+        for sig, out, err in cases:
+            with self.subTest(sig=sig):
+                def fault_runner(cmd, *, cwd, env, **kwargs):
+                    script = Path(cmd.split()[2]).name
+                    if script == "preflight.py":
+                        facts_path = Path(cmd.split()[3])
+                        facts_path.write_text(
+                            json.dumps(self.preflight_facts(env, _Seen())),
+                            encoding="utf-8",
+                        )
+                        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+                    return types.SimpleNamespace(returncode=1, stdout=out, stderr=err)
+
+                rc, obs = self.run_l3(fault_runner)
+                self.assertEqual(rc, 75)
+                self.assertTrue(obs["windowOpened"])
+                self.assertFalse(obs["exitCodeZero"])
+                self.assertFalse(obs["promotionEligible"])
+                self.assertFalse(obs["coverageComplete"])
+                self.assertEqual(obs["errorCategory"], "device_fault")
+                self.assertEqual(obs["failureCategory"], "device_fault")
+                self.assertIs(obs["deviceRejected"], True)
+                self.assertEqual(obs["deviceFaultSignature"], sig)
+
+    def test_l3_aicore_trap_and_assertion_error_remain_candidate_or_numeric_rc_1(self):
+        junit_original = self.junit_xml
+
+        def first_failed(**kwargs):
+            return junit_original(statuses={
+                name: ("failed" if name == AR_TESTS[0] else "passed")
+                for name in AR_TESTS
+            })
+
+        kernel_fail = self.producer_failure(
+            kind="candidate",
+            category="exception",
+            stage="kernel",
+            role="candidate",
+            node=AR_TESTS[0],
+            case="1",
+            exception_type="RuntimeError",
+            detail="AICore trap",
+        )
+
+        def trap_runner(cmd, *, cwd, env, **kwargs):
+            base = self.fake_runner(workload_rc=1)(cmd, cwd=cwd, env=env, **kwargs)
+            if Path(cmd.split()[2]).name != "preflight.py":
+                return types.SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr='RuntimeError: AICore trap during kernel launch\n',
+                )
+            return base
+
+        with patch.object(self, "junit_xml", first_failed), \
+                patch.object(self, "evidence", self.failure_evidence([kernel_fail])):
+            rc, obs = self.run_l3(trap_runner)
+        self.assertEqual(rc, 1)
+        self.assertTrue(obs["windowOpened"])
+        self.assertEqual(obs["errorCategory"], "candidate")
+        self.assertEqual(obs["failureCategory"], "candidate")
+        self.assertNotIn("deviceRejected", obs)
+        self.assertNotIn("deviceFaultSignature", obs)
+
+        def assertion_runner(cmd, *, cwd, env, **kwargs):
+            base = self.fake_runner(workload_rc=1)(cmd, cwd=cwd, env=env, **kwargs)
+            if Path(cmd.split()[2]).name != "preflight.py":
+                return types.SimpleNamespace(
+                    returncode=1,
+                    stdout="AssertionError: numeric mismatch max_diff=0.5\n",
+                    stderr="",
+                )
+            return base
+
+        with patch.object(self, "junit_xml", first_failed), \
+                patch.object(self, "evidence", self.numeric_evidence(node=AR_TESTS[0], case="1")):
+            rc, obs = self.run_l3(assertion_runner)
+        self.assertEqual(rc, 1)
+        self.assertTrue(obs["windowOpened"])
+        self.assertEqual(obs["errorCategory"], "numeric")
+        self.assertEqual(obs["failureCategory"], "numeric")
+        self.assertNotIn("deviceRejected", obs)
+        self.assertNotIn("deviceFaultSignature", obs)
+
 
 class L4IdlePolicyCase(_Fixture, unittest.TestCase):
     def test_prep_blocks_before_inspection_on_a_shared_device(self):

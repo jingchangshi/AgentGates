@@ -1208,6 +1208,55 @@ class FastRequestCase(unittest.TestCase):
         self.assertTrue(obs["windowReleased"])
         self.assertEqual(obs["healthMonitoring"]["abort"]["kind"], "external_occupancy")
 
+    def test_device_fast_classifies_npu_device_fault_signatures_as_blocked_env_75(self):
+        cases = (
+            ("E39006", "stdout", 'print("EE9999 E39006: Inner_Error_Failed_Send_OPP_To_Device")'),
+            ("TsdOpen failed", "stderr", 'import sys; print("TsdOpen failed, devId=1", file=sys.stderr)'),
+            ("507033", "stdout", 'print("aclrtSynchronizeStream failed, ret=507033")'),
+        )
+        for sig, stream_name, emit in cases:
+            with self.subTest(sig=sig, stream=stream_name):
+                (self.src / f"build/agent_gates/fast/{REQUEST_ID}.response.json").unlink(
+                    missing_ok=True
+                )
+                self.write_test_file(
+                    f"def test_surrogate_anchor_batch_npu() -> None:\n"
+                    f"    {emit}\n"
+                    f"    raise RuntimeError('npu runtime failed')\n"
+                )
+                self.write_request(REQUEST_ID, self.batch_request())
+                rc, obs = self.run_fast()
+                self.assertEqual(rc, 75)
+                self.assertFalse(obs["exitCodeZero"])
+                self.assertTrue(obs["windowOpened"])
+                self.assertEqual(obs["errorCategory"], "device_fault")
+                self.assertEqual(obs["failureCategory"], "device_fault")
+                self.assertIs(obs["deviceRejected"], True)
+                self.assertEqual(obs["deviceFaultSignature"], sig)
+
+    def test_device_fast_keeps_aicore_trap_and_assertion_error_as_candidate(self):
+        for exc_expr in ('RuntimeError("AICore trap")', 'AssertionError("numeric mismatch")'):
+            with self.subTest(exc=exc_expr):
+                (self.src / f"build/agent_gates/fast/{REQUEST_ID}.response.json").unlink(
+                    missing_ok=True
+                )
+                self.write_test_file(
+                    CANDIDATE_FAILURE_RESPONSE.replace(
+                        'raise AssertionError("fast batch candidate(s) failed")',
+                        f"raise {exc_expr}",
+                    )
+                )
+                self.write_request(
+                    REQUEST_ID, self.batch_request(require_all_passed=True)
+                )
+                rc, obs = self.run_fast()
+                self.assertEqual(rc, 1)
+                self.assertFalse(obs["exitCodeZero"])
+                self.assertEqual(obs["errorCategory"], "candidate")
+                self.assertEqual(obs["failureCategory"], "candidate")
+                self.assertNotIn("deviceRejected", obs)
+                self.assertNotIn("deviceFaultSignature", obs)
+
     @contextmanager
     def _record_host_call(self):
         real = GATE.adapter_runtime.run_host_bash
