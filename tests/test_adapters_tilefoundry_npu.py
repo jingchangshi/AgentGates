@@ -458,6 +458,98 @@ class CheckConfigAndRunCase(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_run_cpu_runs_v56_hygiene_lints_when_present_and_fast_fails(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.src)
+            self.write_env()
+            scripts_dir = self.src / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            dsm_lint = scripts_dir / "dsm_lower_triangular_lint.py"
+            test_lint = scripts_dir / "test_hygiene_lint.py"
+
+            def _make_cpu_runner(failing_script: str | None = None):
+                seen_cmds: list[tuple[str, Path]] = []
+
+                def _runner(cmd, *, cwd, env, **kwargs):
+                    seen_cmds.append((cmd, cwd))
+                    if failing_script and failing_script in cmd:
+                        return types.SimpleNamespace(
+                            returncode=1,
+                            stdout=f"{failing_script}: violation found\n",
+                            stderr="",
+                        )
+                    for part in cmd.split():
+                        if part.startswith("--junit-xml="):
+                            xml_path = Path(part.split("=", 1)[1].strip("'\""))
+                            xml_path.write_text(
+                                '<testsuite tests="2" failures="0" errors="0" skipped="0"></testsuite>',
+                                encoding="utf-8",
+                            )
+                    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                return seen_cmds, _runner
+
+            # 1. Absent lint scripts (older TileFoundry commits): skipped cleanly.
+            seen_absent, runner_absent = _make_cpu_runner()
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=runner_absent):
+                rc, obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc, 0)
+            self.assertTrue(obs["exitCodeZero"])
+            self.assertEqual(len(seen_absent), 1)
+            self.assertIn("-m pytest", seen_absent[0][0])
+
+            # 2. Both lint scripts present and passing: both run before pytest.
+            dsm_lint.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            test_lint.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            seen_pass, runner_pass = _make_cpu_runner()
+            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                    patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=runner_pass):
+                rc, obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+            self.assertEqual(rc, 0)
+            self.assertTrue(obs["exitCodeZero"])
+            self.assertEqual(len(seen_pass), 3)
+            self.assertIn("dsm_lower_triangular_lint.py", seen_pass[0][0])
+            self.assertIn(str(self.py), seen_pass[0][0])
+            self.assertEqual(seen_pass[0][1], self.src.resolve())
+            self.assertIn("test_hygiene_lint.py", seen_pass[1][0])
+            self.assertIn(str(self.py), seen_pass[1][0])
+            self.assertEqual(seen_pass[1][1], self.src.resolve())
+            self.assertIn("-m pytest", seen_pass[2][0])
+
+            # 3. Either lint failing fast-fails before pytest is ever launched.
+            for failing in ("dsm_lower_triangular_lint.py", "test_hygiene_lint.py"):
+                with self.subTest(failing=failing):
+                    seen_fail, runner_fail = _make_cpu_runner(failing)
+                    stderr = io.StringIO()
+                    with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True), \
+                            patch.object(sys, "stderr", stderr), \
+                            patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=runner_fail):
+                        rc, obs = GATE.run_cpu(GATE.machine_values(), 30.0)
+                    self.assertEqual(rc, 1)
+                    self.assertFalse(obs["exitCodeZero"])
+                    self.assertEqual(obs["testsCollected"], 0)
+                    self.assertFalse(obs["testsCollectedPositive"])
+                    self.assertFalse(obs["notAllSkipped"])
+                    self.assertFalse(any("-m pytest" in cmd for cmd, _cwd in seen_fail))
+                    self.assertIn(failing, stderr.getvalue())
+                    self.assertIn("violation found", stderr.getvalue())
+        finally:
+            os.chdir(old_cwd)
+
+    def test_occupancy_policy_defaults_to_shared_quiet_and_honors_exclusive(self):
+        self.assertEqual(GATE.occupancy_policy({}), "shared_quiet")
+        self.assertEqual(GATE.occupancy_policy({"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": ""}), "shared_quiet")
+        self.assertEqual(
+            GATE.occupancy_policy({"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": "exclusive"}),
+            "exclusive",
+        )
+        self.assertEqual(
+            GATE.occupancy_policy({"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": "shared_quiet"}),
+            "shared_quiet",
+        )
+
 
 class CannbenchIntegrationCase(unittest.TestCase):
     def setUp(self):

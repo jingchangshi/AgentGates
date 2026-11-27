@@ -1199,7 +1199,11 @@ class RuntimeHealthCase(unittest.TestCase):
         self.assertIsNone(self.external.poll())
 
     def test_occupancy_policy_parsing_and_validation(self):
-        self.assertEqual(GATE.occupancy_policy({}), "exclusive")
+        self.assertEqual(GATE.occupancy_policy({}), "shared_quiet")
+        self.assertEqual(
+            GATE.occupancy_policy({"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": "EXCLUSIVE"}),
+            "exclusive",
+        )
         self.assertEqual(
             GATE.occupancy_policy({"TILEFOUNDRY_NPU_OCCUPANCY_POLICY": "SHARED_QUIET"}),
             "shared_quiet",

@@ -1272,7 +1272,9 @@ class L3PromotionCase(_Fixture, unittest.TestCase):
                 ), \
                 patch.object(GATE.adapter_runtime, "run_host_bash", side_effect=runner), \
                 self.in_source():
-            rc, obs = GATE.run_l3_promotion(self.values(), 60.0)
+            values = self.values()
+            values["TILEFOUNDRY_NPU_OCCUPANCY_POLICY"] = "exclusive"
+            rc, obs = GATE.run_l3_promotion(values, 60.0)
         self.assertEqual(rc, 75)
         self.assertEqual(obs["errorCategory"], "occupancy")
         self.assertEqual(obs["deviceOccupancy"], "shared(1)")
@@ -1781,6 +1783,7 @@ class L4IdlePolicyCase(_Fixture, unittest.TestCase):
     def test_prep_blocks_before_inspection_on_a_shared_device(self):
         with patch.dict(os.environ, self.environment(), clear=True):
             values = self.values()
+        values["TILEFOUNDRY_NPU_OCCUPANCY_POLICY"] = "exclusive"
         inspect = patch.object(GATE, "_inspect_conda_cannbench_env")
         with patch.dict(os.environ, self.environment(), clear=True), \
                 patch.object(
@@ -1798,6 +1801,7 @@ class L4IdlePolicyCase(_Fixture, unittest.TestCase):
     def test_official_run_blocks_before_inspection_on_a_shared_device(self):
         with patch.dict(os.environ, self.environment(), clear=True):
             values = self.values()
+        values["TILEFOUNDRY_NPU_OCCUPANCY_POLICY"] = "exclusive"
         inspect = patch.object(GATE, "_inspect_conda_cannbench_env")
         with patch.dict(os.environ, self.environment(), clear=True), \
                 patch.object(

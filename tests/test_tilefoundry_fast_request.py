@@ -1154,7 +1154,11 @@ class FastRequestCase(unittest.TestCase):
         stdout = io.StringIO()
         with self._in_source(), \
                 patch.dict(os.environ, env, clear=True), \
-                patch.object(GATE.adapter_runtime, "processes_on", return_value=([4321], 1)), \
+                patch.object(
+                    GATE.adapter_runtime,
+                    "processes_on",
+                    return_value=([{"pid": "4321", "name": "python", "memoryMb": "32768"}], 1),
+                ), \
                 patch.object(GATE.locking, "lock_root", return_value=self.lock_root), \
                 redirect_stdout(stdout):
             rc = GATE.main(["--device-fast", "--timeout", "30"])

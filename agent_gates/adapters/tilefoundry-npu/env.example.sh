@@ -281,10 +281,10 @@ TILEFOUNDRY_NPU_TILELANG_REPO=
 TILEFOUNDRY_NPU_CANNBOT_DSL_REPO=
 TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO=
 
-# Optional device-window occupancy policy. Empty means "exclusive": an L4
-# requires an idle card. "shared_quiet" admits an L4 while at most
-# SHARED_MAX_EXT_PROCS external processes and SHARED_MAX_HBM_MB of external HBM
-# are present, and lets the run-time monitor abort only on heavy contention.
+# Optional device-window occupancy policy. Empty means "shared_quiet": an L4
+# admits at most SHARED_MAX_EXT_PROCS external processes and SHARED_MAX_HBM_MB
+# of external HBM, and lets the run-time monitor abort only on heavy contention.
+# Set to "exclusive" to require an idle card (zero external processes).
 # Receipts record occupancy="shared(N)" and the policy; timings are provisional.
 # `require_exclusive_device = true` in the AgentGates [devices] configuration
 # overrides this policy and refuses a shared card before the budgets apply.

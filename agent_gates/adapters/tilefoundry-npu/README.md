@@ -157,7 +157,7 @@ do not carry this run's token. Both are machine facts and belong in `env.sh`:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `TILEFOUNDRY_NPU_OCCUPANCY_POLICY` | `exclusive` | `shared_quiet` enables the budgets below |
+| `TILEFOUNDRY_NPU_OCCUPANCY_POLICY` | `shared_quiet` | `shared_quiet` (default) enables the budgets below; set `exclusive` to require an idle card |
 | `TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS` | `6` | external processes admitted at lease time |
 | `TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB` | `16384` | external HBM admitted at lease time |
 | `TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT` | `3` | consecutive probes before a run-time abort |
@@ -176,7 +176,7 @@ Sizing is a measurement, not a guess. Read the HBM that the server's co-tenant
 jobs actually hold: a job at about 17.5 GiB is admitted only when
 `SHARED_MAX_HBM_MB >= 18432`, and at that setting two such jobs are refused by
 design. A two-card host with mixed tenants used `2` processes / `18432` MB; the
-shipped defaults stay conservative because the policy is opt-in.
+shipped defaults stay conservative.
 
 Timing impact should be quantified per host before trusting shared timings. Run
 the same candidate twice, once on a quiet card and once with a bounded synthetic
@@ -189,7 +189,8 @@ prefer a quiet window for a release-grade number.
 `require_exclusive_device = true` in the AgentGates `[devices]` configuration
 short-circuits this policy: it exports
 `TILEFOUNDRY_NPU_REQUIRE_EXCLUSIVE_DEVICE=1` and every non-free card is refused
-before the budgets are consulted. Set it to `false` to use `shared_quiet`.
+before the budgets are consulted. Set `TILEFOUNDRY_NPU_OCCUPANCY_POLICY=exclusive`
+in `env.sh` (or `require_exclusive_device = true`) to require an idle card.
 
 ### Multi-Worktree Zero-Lock Concurrency
 

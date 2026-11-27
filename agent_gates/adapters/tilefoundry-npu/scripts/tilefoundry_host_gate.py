@@ -4494,7 +4494,7 @@ def occupancy_policy(values: dict[str, str]) -> str:
     """Resolve the device-window occupancy admission policy."""
     raw = (values.get("TILEFOUNDRY_NPU_OCCUPANCY_POLICY") or "").strip().lower()
     if not raw:
-        return "exclusive"
+        return "shared_quiet"
     if raw not in OCCUPANCY_POLICIES:
         raise BridgeError(
             "TILEFOUNDRY_NPU_OCCUPANCY_POLICY must be one of "
@@ -4623,6 +4623,63 @@ def check_config(
     return 0
 
 
+CPU_HYGIENE_LINT_SCRIPTS = (
+    "scripts/dsm_lower_triangular_lint.py",
+    "scripts/test_hygiene_lint.py",
+)
+
+
+def _run_cpu_hygiene_lints(
+    source: Path,
+    *,
+    python: Path,
+    env: dict[str, str],
+    conda_sh: Path,
+    conda_env: str,
+    deadline: _Deadline,
+    timeout: float,
+) -> bool:
+    """Run whole-tree V56 architecture/test hygiene lints present in source."""
+    for rel in CPU_HYGIENE_LINT_SCRIPTS:
+        lint_path = source / rel
+        if not lint_path.is_file():
+            continue
+        cmd = f"{shlex.quote(str(python))} {shlex.quote(str(lint_path))}"
+        try:
+            completed = adapter_runtime.run_host_bash(
+                cmd,
+                cwd=source,
+                env=dict(env),
+                cann_setup=None,
+                conda_sh=conda_sh,
+                conda_env=conda_env,
+                timeout=max(1.0, deadline.remaining()),
+                isolate_temp=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if exc.stderr:
+                sys.stderr.write(str(exc.stderr)[-4000:])
+            print(
+                f"{PROG}: CPU hygiene lint {rel} timed out after {timeout}s",
+                file=sys.stderr,
+            )
+            return False
+        if completed.returncode != 0:
+            output = "\n".join(
+                part for part in (completed.stdout, completed.stderr) if part
+            )
+            if output:
+                sys.stderr.write(
+                    output[-4000:] + ("\n" if not output.endswith("\n") else "")
+                )
+            print(
+                f"{PROG}: CPU hygiene lint failed ({rel}, exit {completed.returncode})",
+                file=sys.stderr,
+            )
+            return False
+    return True
+
+
 def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
     source = _source_root()
     tl_identity = tilelang_reuse_identity(values)
@@ -4648,6 +4705,21 @@ def run_cpu(values: dict[str, str], timeout: float) -> tuple[int, dict]:
         base_env["PYTHONPATH"] = _effective_pythonpath(tl_identity)
         if tl_identity is not None:
             base_env.setdefault("USE_CUDA", "0")
+        if not _run_cpu_hygiene_lints(
+            source,
+            python=python,
+            env=base_env,
+            conda_sh=conda_sh,
+            conda_env=conda_env,
+            deadline=deadline,
+            timeout=timeout,
+        ):
+            lint_obs = _cpu_observations(False, 0, 0, 0, 0)
+            lint_obs["cpuWorkers"] = len(shards)
+            lint_obs["environment"] = _environment_observations(values)
+            if tl_identity is not None:
+                lint_obs["tilelang"] = tl_identity
+            return 1, lint_obs
         if len(shards) > 1:
             base_env.update(CPU_WORKER_THREAD_ENV)
 
