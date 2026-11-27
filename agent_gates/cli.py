@@ -49,6 +49,11 @@ def parser():
             command.add_argument("--target")
             command.add_argument("--candidate")
             command.add_argument(
+                "--source",
+                type=Path,
+                help="linked git worktree root belonging to --workspace; omit for the registered root",
+            )
+            command.add_argument(
                 "--device-id",
                 help="authorized NPU card for this execution; omit for the configured default")
         if name in {"status", "wait", "cancel"}:
@@ -62,6 +67,11 @@ def parser():
             command.add_argument("--run-id", required=True)
             command.add_argument("--target")
             command.add_argument("--candidate")
+            command.add_argument(
+                "--source",
+                type=Path,
+                help="linked git worktree root belonging to --workspace; omit for the registered root",
+            )
     return root
 
 
@@ -183,10 +193,12 @@ def _async_command(args):
     """Run one asynchronous verb; every failure becomes a stable error code."""
     try:
         manager = ExecutionManager()
+        source_root = str(args.source) if getattr(args, "source", None) is not None else None
         if args.command == "submit":
             request = ExecutionRequest(workspace=args.workspace, adapter=args.adapter,
                                        gates=args.gate, request_id=args.request_id,
                                        target=args.target, candidate=args.candidate,
+                                       source_root=source_root,
                                        device_id=args.device_id)
             return _emit(manager.submit(request), args)
         if args.command == "status":
@@ -200,7 +212,8 @@ def _async_command(args):
             return _emit(manager.cancel(args.execution_id), args)
         requirement = VerificationRequirement(workspace=args.workspace, adapter=args.adapter,
                                               required_gates=args.gate, run_id=args.run_id,
-                                              target=args.target, candidate=args.candidate)
+                                              target=args.target, candidate=args.candidate,
+                                              source_root=source_root)
         result = verify_requirements(requirement, config=manager.config,
                                      registry=manager.registry, store=manager.evidence)
         return _emit(result, args, status_ok=result.satisfied)

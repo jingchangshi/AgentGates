@@ -28,7 +28,7 @@ from .evidence import EvidenceStore
 from .execution_store import AdmissionLock, EXECUTION_ID, ExecutionStore, new_execution_id
 from .manifest import ManifestError
 from .registry import Registry
-from .source_identity import snapshot
+from .source_identity import resolve_workspace_source, snapshot
 
 # A wait is always bounded. The MCP wait tool must never hold a single call
 # open until a compiler finishes; callers poll instead.
@@ -86,8 +86,20 @@ class ExecutionManager:
 
     # ── validation ──────────────────────────────────────────────────────────
 
+    def _resolve_source(self, workspace, requested_source) -> Path:
+        try:
+            return resolve_workspace_source(
+                workspace.source_root,
+                requested_source,
+                allow_worktrees=workspace.allow_worktrees,
+            )
+        except (OSError, ValueError) as exc:
+            raise api.APIError(
+                api.ErrorCode.INVALID_REQUEST, str(exc), field="source_root"
+            ) from None
+
     def _resolve(self, workspace_id: str, adapter_id: str, gates: list,
-                 target=None, candidate=None):
+                 target=None, candidate=None, source_root=None):
         """Validate a request against the registry, refusing with stable codes."""
         try:
             workspace = self.config.workspace(workspace_id)
@@ -120,6 +132,7 @@ class ExecutionManager:
                     "gate(s) not permitted for workspace " + repr(workspace_id) + ": "
                     + ", ".join(denied),
                     details={"allowed": sorted(workspace.allowed_gates)})
+        effective_source = self._resolve_source(workspace, source_root)
         # Gate dependencies are resolved by the manifest, so asking for only the
         # dependent gate silently runs its prerequisites too. That is correct for
         # execution, and the receipt records them, so verify_requirements can
@@ -127,7 +140,7 @@ class ExecutionManager:
         ordered = manifest.order(gates)
         for gate_id in ordered:
             recipe = manifest.resolve_recipe(
-                manifest.gates[gate_id]["recipeId"], workspace.source_root
+                manifest.gates[gate_id]["recipeId"], effective_source
             )
             if is_quarantined_recipe(manifest.id, recipe.id, recipe.argv):
                 raise api.APIError(
@@ -140,11 +153,11 @@ class ExecutionManager:
         # returned binding carries the candidate bytes, not just its path.
         try:
             binding = dynamic_target.resolve_request(
-                manifest, ordered, workspace.source_root,
+                manifest, ordered, effective_source,
                 target=target, candidate=candidate)
         except dynamic_target.TargetRequestError as exc:
             raise api.APIError(api.ErrorCode.INVALID_REQUEST, str(exc)) from None
-        return workspace, manifest, ordered, binding
+        return workspace, manifest, ordered, binding, effective_source
 
     def _device_for(self, adapter_id: str, requested_device):
         """Choose the NPU device a request will use.
@@ -215,9 +228,9 @@ class ExecutionManager:
         worker can never run a request the store does not describe.
         """
         self.store.initialize()
-        workspace, manifest, ordered, binding = self._resolve(
+        workspace, manifest, ordered, binding, effective_source = self._resolve(
             request.workspace, request.adapter, list(request.gates),
-            request.target, request.candidate)
+            request.target, request.candidate, source_root=request.source_root)
         resolved_device = self._device_for(request.adapter, request.device_id)
         # Whether this execution will actually bind the card. A device Adapter
         # may also ship host-only recipes (`"device": "none"`), and the Engine
@@ -226,7 +239,7 @@ class ExecutionManager:
         # device run without refusing a genuinely device-less one.
         device_required = resolved_device is not None and any(
             manifest.resolve_recipe(manifest.gates[gate_id]["recipeId"],
-                                    workspace.source_root).uses_device
+                                    effective_source).uses_device
             for gate_id in ordered)
         # A host-only profile binds no card: the Engine takes no lease and
         # publishes no authorizedDeviceId, so submit must not claim hardware the
@@ -238,7 +251,7 @@ class ExecutionManager:
         # executed. Storing only paths would bind the request to whatever bytes
         # happen to be on disk when a busy worker gets to it.
         try:
-            source_identity = snapshot(workspace.source_root)
+            source_identity = snapshot(effective_source)
         except (OSError, ValueError) as exc:
             raise api.APIError(
                 api.ErrorCode.INVALID_REQUEST,
@@ -258,6 +271,7 @@ class ExecutionManager:
                             and list(bound.get("requested_gates") or []) == list(request.gates)
                             and bound.get("target") == request.target
                             and bound.get("candidate") == request.candidate
+                            and bound.get("source_root") == str(effective_source)
                             # The resolved card is part of the request identity,
                             # not the raw spelling: replaying the same request id
                             # on a different card is a different execution, while
@@ -314,7 +328,7 @@ class ExecutionManager:
                 # against. The worker re-verifies both before it runs a gate.
                 "dynamic_target": binding,
                 "source_identity": source_identity,
-                "source_root": str(workspace.source_root),
+                "source_root": str(effective_source),
                 "adapter_manifest_sha256": manifest.manifest_hash,
                 "config_digest": self.config.config_digest,
                 "submitted_at": time.time(),
@@ -329,6 +343,7 @@ class ExecutionManager:
                 "requestId": request.request_id,
                 "target": request.target,
                 "candidate": request.candidate,
+                "sourceRoot": str(effective_source),
                 # The card this execution is bound to. The Engine records the
                 # same id as authorizedDeviceId in the receipt, and the adapter
                 # receives it through its device variable.
@@ -412,6 +427,7 @@ class ExecutionManager:
             exit_reason=status.get("exitReason"),
             target=status.get("target"),
             candidate=status.get("candidate"),
+            source_root=status.get("sourceRoot"),
             device_id=status.get("deviceId"),
         )
 
@@ -599,6 +615,8 @@ class ExecutionManager:
             # The card resolved at admission is the card this execution reports,
             # even if the crash lost the status field that first carried it.
             fields["deviceId"] = record.get("device_id")
+        if "source_root" in record:
+            fields["sourceRoot"] = record.get("source_root")
         return self.store.transition(
             execution_id, api.ExecutionState.FINISHED,
             event="recovered_from_receipt", **fields)

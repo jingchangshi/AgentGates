@@ -196,6 +196,7 @@ class WorkspaceInfo(_Model):
     source_root: str
     adapters: list[AdapterInfo] = Field(default_factory=list)
     allowed_gates: list[str] | None = None
+    allow_worktrees: bool = True
 
 
 class DoctorCheck(_Model):
@@ -253,6 +254,10 @@ class ExecutionRequest(_Model):
     the authorized set (`devices.allowed_npu_devices`) and the bounded 0-63 id
     space, so this field can only pick among cards the operator already allowed.
     Omitting it keeps the deterministic configured default.
+
+    `source_root` may only name the registered root or a bidirectionally
+    verified linked git worktree of that workspace when `allow_worktrees` is
+    enabled (omitting uses the registered root), preserving C2 boundedness.
     """
 
     workspace: str
@@ -262,6 +267,7 @@ class ExecutionRequest(_Model):
     target: str | None = None
     candidate: str | None = None
     device_id: str | None = None
+    source_root: str | None = None
 
 
 class GateResult(_Model):
@@ -293,6 +299,7 @@ class ExecutionStatus(_Model):
     target: str | None = None
     candidate: str | None = None
     device_id: str | None = None
+    source_root: str | None = None
 
 
 class ExecutionResult(_Model):
@@ -319,6 +326,7 @@ class ExecutionResult(_Model):
     target: str | None = None
     candidate: str | None = None
     device_id: str | None = None
+    source_root: str | None = None
 
 
 # ── evidence verification ────────────────────────────────────────────────────
@@ -352,6 +360,7 @@ class VerificationRequirement(_Model):
     # so the refusal token can name which half was missing.
     target: str | None = None
     candidate: str | None = None
+    source_root: str | None = None
 
 
 class RequirementVerificationResult(_Model):
@@ -374,6 +383,7 @@ class RequirementVerificationResult(_Model):
     required_gates: list[str] = Field(default_factory=list)
     target: str | None = None
     candidate: str | None = None
+    source_root: str | None = None
 
 
 # ── wait ─────────────────────────────────────────────────────────────────────

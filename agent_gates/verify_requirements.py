@@ -23,7 +23,7 @@ from . import dynamic_target
 from .evidence import EvidenceStore
 from .manifest import ManifestError
 from .registry import Registry
-from .source_identity import source_root, snapshot
+from .source_identity import resolve_workspace_source, source_root, snapshot
 
 PASS = api.GateStatus.PASS
 
@@ -33,7 +33,8 @@ def _now():
 
 
 def _result(*, workspace, adapter, required_gates, run_id, failures, status,
-            matched=None, identity=None, satisfied=False, target=None, candidate=None):
+            matched=None, identity=None, satisfied=False, target=None, candidate=None,
+            source_root=None):
     return api.RequirementVerificationResult(
         satisfied=satisfied,
         status=status,
@@ -47,6 +48,7 @@ def _result(*, workspace, adapter, required_gates, run_id, failures, status,
         required_gates=list(required_gates),
         target=target,
         candidate=candidate,
+        source_root=source_root,
     )
 
 
@@ -66,12 +68,15 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     required = list(requirement.required_gates)
     run_id = requirement.run_id
     target, candidate = requirement.target, requirement.candidate
+    resolved_source_str = None
 
-    def refuse(failures, status=api.GateStatus.INVALID_EVIDENCE, matched=None, identity=None):
+    def refuse(failures, status=api.GateStatus.INVALID_EVIDENCE, matched=None, identity=None,
+               source_root=None):
         return _result(workspace=workspace_id, adapter=adapter_id, required_gates=required,
                        run_id=run_id, failures=failures, status=status,
                        matched=matched, identity=identity, satisfied=False,
-                       target=target, candidate=candidate)
+                       target=target, candidate=candidate,
+                       source_root=resolved_source_str if source_root is None else source_root)
 
     # ── request shape ────────────────────────────────────────────────────────
     if not required:
@@ -97,9 +102,20 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     except Exception as exc:  # ConfigError
         return refuse([f"UNKNOWN_WORKSPACE: {exc}"], api.GateStatus.INVALID_EVIDENCE)
     try:
-        current_root = source_root(workspace.source_root)
+        effective_source = resolve_workspace_source(
+            workspace.source_root,
+            requirement.source_root,
+            allow_worktrees=workspace.allow_worktrees,
+        )
+    except (OSError, ValueError) as exc:
+        if requirement.source_root is not None:
+            return refuse([f"WORKSPACE_SOURCE_NOT_ALLOWED: {exc}"], api.GateStatus.INVALID_EVIDENCE)
+        return refuse([f"WORKSPACE_SOURCE_UNREADABLE: {exc}"], api.GateStatus.BLOCKED_ENV)
+    try:
+        current_root = source_root(effective_source)
     except (OSError, ValueError) as exc:
         return refuse([f"WORKSPACE_SOURCE_UNREADABLE: {exc}"], api.GateStatus.BLOCKED_ENV)
+    resolved_source_str = str(current_root)
     if adapter_id not in workspace.adapters:
         # (4) the adapter must be one this workspace is allowed to use.
         return refuse([f"ADAPTER_NOT_REGISTERED_FOR_WORKSPACE: {adapter_id}"])
@@ -195,4 +211,4 @@ def verify_requirements(requirement: api.VerificationRequirement, *, config,
     return _result(workspace=workspace_id, adapter=adapter_id, required_gates=required,
                    run_id=run_id, failures=[], status=api.GateStatus.PASS,
                    matched=matched, identity=identity, satisfied=True,
-                   target=target, candidate=candidate)
+                   target=target, candidate=candidate, source_root=resolved_source_str)

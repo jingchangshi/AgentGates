@@ -17,6 +17,115 @@ def git(repo: Path, *args):
     return subprocess.run(["git", *GIT_SAFE, "-C", str(repo), *args], capture_output=True, env=environment, timeout=120)
 
 
+def resolve_git_common_dir(path: Path) -> Path | None:
+    """Return the resolved Git common directory for `path`, or None."""
+    result = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if result.returncode != 0:
+        return None
+    raw = os.fsdecode(result.stdout.rstrip(b"\n")).strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).resolve(strict=True)
+    except OSError:
+        return None
+
+
+def list_linked_worktrees(repo: Path) -> frozenset[Path]:
+    """Return all resolved worktree root paths registered with `repo`."""
+    result = git(repo, "worktree", "list", "--porcelain", "-z")
+    if result.returncode != 0:
+        return frozenset()
+    prefix = b"worktree "
+    paths: set[Path] = set()
+    for token in result.stdout.split(b"\0"):
+        if not token.startswith(prefix):
+            continue
+        raw = os.fsdecode(token[len(prefix):])
+        if not raw:
+            continue
+        try:
+            paths.add(Path(raw).resolve(strict=True))
+        except OSError:
+            continue
+    return frozenset(paths)
+
+
+def _canonical_source_directory(value: str | Path) -> Path:
+    """Validate and resolve a user-supplied source directory without following symlinks."""
+    if isinstance(value, Path):
+        raw_str = str(value)
+    elif isinstance(value, str):
+        raw_str = value
+    else:
+        raise ValueError("source must be a nonempty path")
+    if not raw_str.strip():
+        raise ValueError("source must be a nonempty path")
+    raw = Path(os.path.expanduser(raw_str))
+    if not raw.is_absolute():
+        raise ValueError("source must be an absolute path")
+    if ".." in raw.parts:
+        raise ValueError("source must not contain '..' components")
+    if raw.is_symlink():
+        raise ValueError("source must not be a symlink")
+    if not raw.exists() or not raw.is_dir():
+        raise ValueError("source must name an existing directory")
+    for parent in raw.parents:
+        if parent.is_symlink():
+            raise ValueError(f"source parent component is a symlink: {parent}")
+    return raw.resolve(strict=True)
+
+
+def resolve_workspace_source(
+    registered_root: Path,
+    requested_source: str | Path | None,
+    *,
+    allow_worktrees: bool = True,
+) -> Path:
+    """Resolve `requested_source` to either `registered_root` or a linked Git worktree."""
+    reg = Path(registered_root).resolve(strict=True)
+    if requested_source is None:
+        return reg
+    candidate = _canonical_source_directory(requested_source)
+    if candidate == reg:
+        return reg
+    if not allow_worktrees:
+        raise ValueError("linked git worktrees are disabled for this workspace")
+
+    top = git(candidate, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        raise ValueError("--source must name a Git worktree top-level directory")
+    try:
+        top_path = Path(os.fsdecode(top.stdout.rstrip(b"\n"))).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("--source must name a Git worktree top-level directory") from exc
+    if top_path != candidate:
+        raise ValueError("--source must name a Git worktree top-level directory")
+
+    reg_common = resolve_git_common_dir(reg)
+    cand_common = resolve_git_common_dir(candidate)
+    if reg_common is None or cand_common is None or cand_common != reg_common:
+        raise ValueError("source is not a linked git worktree of workspace source_root")
+    if candidate not in list_linked_worktrees(reg):
+        raise ValueError("source is not registered in git worktree list of workspace")
+
+    git_dir_proc = git(candidate, "rev-parse", "--path-format=absolute", "--git-dir")
+    if git_dir_proc.returncode != 0:
+        raise ValueError("source does not have a valid linked worktree gitdir")
+    git_dir_raw = os.fsdecode(git_dir_proc.stdout.rstrip(b"\n")).strip()
+    if not git_dir_raw:
+        raise ValueError("source does not have a valid linked worktree gitdir")
+    try:
+        cand_git_dir = Path(git_dir_raw).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("source does not have a valid linked worktree gitdir") from exc
+    worktrees_dir = (reg_common / "worktrees").resolve(strict=False)
+    if not (cand_git_dir.is_relative_to(worktrees_dir) and cand_git_dir != worktrees_dir):
+        raise ValueError("source does not have a valid linked worktree gitdir")
+
+    return candidate
+
+
 def exclusion_rules(root: Path) -> list[str]:
     """Every rule that could hide a source file from `ls-files --others`.
 
@@ -27,7 +136,9 @@ def exclusion_rules(root: Path) -> list[str]:
     from the hash while a recorded PASS keeps verifying. They are read here and
     bound into the digest, so changing them changes the source identity.
     """
-    paths = [root / ".git" / "info" / "exclude"]
+    common_dir = resolve_git_common_dir(root)
+    exclude_path = (common_dir / "info" / "exclude") if common_dir is not None else (root / ".git" / "info" / "exclude")
+    paths = [exclude_path]
     configured = git(root, "config", "--get", "core.excludesFile")
     if configured.returncode == 0:
         name = os.fsdecode(configured.stdout.rstrip(b"\n")).strip()

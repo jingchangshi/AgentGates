@@ -8,8 +8,9 @@ Design rules this module exists to satisfy:
 - It holds no build process. submit starts a systemd user worker and returns;
   the server may be restarted at any moment without affecting a running gate.
 - Tool inputs are bounded to ids and small scalars (C2). There is no parameter
-  for a shell command, a container, an interpreter, an env file or a source
-  directory, because there is nowhere for one to be accepted.
+  for a shell command, a container, an interpreter, or an env file; when
+  `source_root` is supplied, it may only name the registered root or a
+  bidirectionally verified linked git worktree of that workspace.
 - A failing tool raises; it never returns a success-shaped object that a model
   could mistake for a result.
 """
@@ -24,6 +25,7 @@ from .config import ConfigError, load
 from .docker_quarantine import QUARANTINED_GATES, is_quarantined_recipe
 from .evidence import EvidenceStore
 from .execution import MAX_WAIT_SECONDS, ExecutionManager
+from .source_identity import resolve_workspace_source
 from .verify_requirements import verify_requirements
 
 SERVER_NAME = "agentgates"
@@ -40,7 +42,7 @@ def _gate_info(gate_id, definition):
                         checks=dict(definition.get("observationChecks") or {}))
 
 
-def _allowed_manifest_gates(workspace, manifest):
+def _allowed_manifest_gates(workspace, manifest, source_root=None):
     blocked = QUARANTINED_GATES.get(manifest.id, ())
     allowed = []
     for gate_id, definition in manifest.gates.items():
@@ -48,7 +50,9 @@ def _allowed_manifest_gates(workspace, manifest):
             continue
         if workspace.allowed_gates is not None and gate_id not in workspace.allowed_gates:
             continue
-        recipe = manifest.resolve_recipe(definition["recipeId"], workspace.source_root)
+        recipe = manifest.resolve_recipe(
+            definition["recipeId"], source_root or workspace.source_root
+        )
         if is_quarantined_recipe(manifest.id, recipe.id, recipe.argv):
             continue
         allowed.append((gate_id, definition))
@@ -93,6 +97,8 @@ class DoctorInput(_Input):
         None, description="Typed workload target; requires a gate selection whose recipe accepts one.")
     candidate: str | None = Field(
         None, description="Source-relative candidate file for the target.")
+    source_root: str | None = Field(
+        None, description="Registered workspace root or linked git worktree root belonging to workspace; omit for the registered root.")
 
 
 class SubmitInput(_Input):
@@ -105,6 +111,8 @@ class SubmitInput(_Input):
         None, description="Typed workload target for a dynamic-target route.")
     candidate: str | None = Field(
         None, description="Source-relative candidate file for the target.")
+    source_root: str | None = Field(
+        None, description="Registered workspace root or linked git worktree root belonging to workspace; omit for the registered root.")
     device_id: str | None = Field(
         None, description="Explicit NPU card for this execution; must be in the "
                           "configured authorized set. Omit to use the default.")
@@ -134,6 +142,8 @@ class RequirementsInput(_Input):
         None, description="Require the receipt to have executed this typed target.")
     candidate: str | None = Field(
         None, description="Require the receipt to have executed this candidate path.")
+    source_root: str | None = Field(
+        None, description="Registered workspace root or linked git worktree root belonging to workspace; omit for the registered root.")
 
 
 # ---- output models --------------------------------------------------------
@@ -263,7 +273,8 @@ def build_server():
                 source_root=str(workspace.source_root),
                 adapters=adapters,
                 allowed_gates=(sorted(workspace.allowed_gates)
-                               if workspace.allowed_gates else None)))
+                               if workspace.allowed_gates else None),
+                allow_worktrees=workspace.allow_worktrees))
         return WorkspaceList(workspaces=infos)
 
     @server.tool(name="list_gates",
@@ -287,15 +298,27 @@ def build_server():
     async def doctor(workspace: str, adapter: str,
                      gates: list[str] | None = None,
                      target: str | None = None,
-                     candidate: str | None = None) -> api.DoctorReport:
+                     candidate: str | None = None,
+                     source_root: str | None = None) -> api.DoctorReport:
         payload = DoctorInput(workspace=workspace, adapter=adapter, gates=gates,
-                              target=target, candidate=candidate)
+                              target=target, candidate=candidate,
+                              source_root=source_root)
         from .engine import Engine, config_reason
         manager = _manager()
         workspace = manager.config.workspace(payload.workspace)
         if payload.adapter not in workspace.adapters:
             raise ValueError("adapter " + payload.adapter
                              + " is not registered for workspace " + payload.workspace)
+        try:
+            effective_source = resolve_workspace_source(
+                workspace.source_root,
+                payload.source_root,
+                allow_worktrees=workspace.allow_worktrees,
+            )
+        except (OSError, ValueError) as exc:
+            raise api.APIError(
+                api.ErrorCode.INVALID_REQUEST, str(exc), field="source_root"
+            ) from None
         engine = Engine(registry=manager.registry,
                         store=EvidenceStore(manager.config.evidence_root),
                         lock_root=manager.config.lock_root)
@@ -303,7 +326,9 @@ def build_server():
         manifest = manager.registry.get(payload.adapter)
         selected_gates = payload.gates
         if selected_gates is None:
-            allowed_pairs = _allowed_manifest_gates(workspace, manifest)
+            allowed_pairs = _allowed_manifest_gates(
+                workspace, manifest, source_root=effective_source
+            )
             if allowed_pairs and len(allowed_pairs) < len(manifest.gates):
                 selected_gates = [gid for gid, _ in allowed_pairs]
         elif workspace.allowed_gates is not None:
@@ -321,7 +346,7 @@ def build_server():
             os.environ["AGENT_GATES_SMI_COMMAND"] = manager.config.devices.smi_command
         try:
             result = engine.doctor(
-                payload.adapter, workspace.source_root,
+                payload.adapter, effective_source,
                 selected=selected_gates, env_file=adapter.env_file,
                 device_id=device_id,
                 require_exclusive_device=manager.config.devices.require_exclusive,
@@ -357,16 +382,19 @@ def build_server():
                      request_id: str | None = None,
                      target: str | None = None,
                      candidate: str | None = None,
+                     source_root: str | None = None,
                      device_id: str | None = None) -> api.ExecutionStatus:
         payload = SubmitInput(workspace=workspace, adapter=adapter,
                               gates=gates, request_id=request_id,
                               target=target, candidate=candidate,
+                              source_root=source_root,
                               device_id=device_id)
         manager = _manager()
         return manager.submit(api.ExecutionRequest(
             workspace=payload.workspace, adapter=payload.adapter,
             gates=payload.gates, request_id=payload.request_id,
             target=payload.target, candidate=payload.candidate,
+            source_root=payload.source_root,
             device_id=payload.device_id))
 
     @server.tool(name="status", description="Read one execution current state.")
@@ -418,15 +446,18 @@ def build_server():
                                         required_gates: list[str], run_id: str,
                                         target: str | None = None,
                                         candidate: str | None = None,
+                                        source_root: str | None = None,
                                         ) -> api.RequirementVerificationResult:
         payload = RequirementsInput(workspace=workspace, adapter=adapter,
                                     required_gates=required_gates, run_id=run_id,
-                                    target=target, candidate=candidate)
+                                    target=target, candidate=candidate,
+                                    source_root=source_root)
         manager = _manager()
         requirement = api.VerificationRequirement(
             workspace=payload.workspace, adapter=payload.adapter,
             required_gates=payload.required_gates, run_id=payload.run_id,
-            target=payload.target, candidate=payload.candidate)
+            target=payload.target, candidate=payload.candidate,
+            source_root=payload.source_root)
         return verify_requirements(requirement, config=manager.config,
                                    registry=manager.registry, store=manager.evidence)
 

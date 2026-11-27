@@ -387,10 +387,14 @@ def test_execution_request_carries_only_bounded_ids_and_request_data():
     own workload validation. `device_id` is likewise an id from the configured
     authorized set, not a machine setting: it can only choose among the cards the
     operator already allowed, and omitting it keeps the configured default.
+    `source_root` may only name the workspace's registered root or a
+    bidirectionally verified linked git worktree of that workspace when
+    `allow_worktrees` is enabled (omitting it uses the registered root), keeping
+    requests bounded to operator-registered repositories.
     """
     fields = set(api.ExecutionRequest.model_fields)
     assert fields == {"workspace", "adapter", "gates", "request_id",
-                      "target", "candidate", "device_id"}
+                      "target", "candidate", "device_id", "source_root"}
 
 
 def test_submit_cli_forwards_the_optional_device(monkeypatch, capsys, tmp_path):
@@ -619,3 +623,71 @@ def test_unknown_config_fields_report_exact_dotted_field(machine):
             load_text(machine, text)
         assert caught.value.field == expected_field
         assert "unknown" in caught.value.reason
+
+
+def test_allow_worktrees_config_and_digest_stability(machine):
+    """Omitting allow_worktrees or setting true keeps config_digest identical; false changes it."""
+    omitted = load_text(machine, minimal(machine))
+    explicit_true = load_text(
+        machine,
+        minimal(machine).replace('adapters = ["ascendnpu-ir"]', 'adapters = ["ascendnpu-ir"]\nallow_worktrees = true'),
+    )
+    explicit_false = load_text(
+        machine,
+        minimal(machine).replace('adapters = ["ascendnpu-ir"]', 'adapters = ["ascendnpu-ir"]\nallow_worktrees = false'),
+    )
+    assert omitted.workspaces["ascend"].allow_worktrees is True
+    assert explicit_true.workspaces["ascend"].allow_worktrees is True
+    assert explicit_false.workspaces["ascend"].allow_worktrees is False
+    assert omitted.config_digest == explicit_true.config_digest
+    assert omitted.config_digest != explicit_false.config_digest
+
+    with pytest.raises(cfg.ConfigError) as caught:
+        load_text(
+            machine,
+            minimal(machine).replace('adapters = ["ascendnpu-ir"]', 'adapters = ["ascendnpu-ir"]\nallow_worktrees = "yes"'),
+        )
+    assert caught.value.field == "workspaces.ascend.allow_worktrees"
+    assert "boolean" in caught.value.reason
+
+
+def test_resolve_workspace_source_and_exclusion_rules_for_linked_worktree(tmp_path):
+    """Linked git worktrees resolve bidirectionally and bind common info/exclude."""
+    import subprocess
+    from agent_gates import source_identity as si
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "a.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(wt), "-b", "wt-branch"], check=True)
+
+    assert si.resolve_workspace_source(repo, None) == repo.resolve()
+    assert si.resolve_workspace_source(repo, str(repo)) == repo.resolve()
+    assert si.resolve_workspace_source(repo, str(wt)) == wt.resolve()
+
+    with pytest.raises(ValueError, match="disabled"):
+        si.resolve_workspace_source(repo, str(wt), allow_worktrees=False)
+
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    with pytest.raises(ValueError, match="linked git worktree"):
+        si.resolve_workspace_source(repo, str(other))
+
+    sub = wt / "sub"
+    sub.mkdir()
+    with pytest.raises(ValueError, match="top-level"):
+        si.resolve_workspace_source(repo, str(sub))
+
+    # exclusion_rules binds <common_dir>/info/exclude for linked worktrees
+    exclude_file = repo / ".git" / "info" / "exclude"
+    exclude_file.write_text("ignored.tmp\n")
+    rules = si.exclusion_rules(wt)
+    assert any(rule.startswith(f"{exclude_file.resolve()}\0ignored.tmp") for rule in rules)

@@ -26,6 +26,7 @@ from .evidence import EvidenceStore
 from .execution_store import EXECUTION_ID, ExecutionStore
 from .locking import LockBusy
 from .registry import Registry
+from .source_identity import resolve_workspace_source
 
 
 class WorkerError(RuntimeError):
@@ -90,7 +91,18 @@ def run_execution(execution_id: str, *, store: ExecutionStore, config, engine=No
     gates = list(request["gates"])
 
     workspace_entry = config.workspace(workspace)
-    source = workspace_entry.source_root
+    try:
+        source = resolve_workspace_source(
+            workspace_entry.source_root,
+            request.get("source_root"),
+            allow_worktrees=workspace_entry.allow_worktrees,
+        )
+    except (OSError, ValueError) as exc:
+        store.transition(execution_id, api.ExecutionState.INTERRUPTED,
+                         event="source_invalid",
+                         **{"exitReason": "SOURCE_NOT_ALLOWED: " + str(exc)[:400],
+                            "finishedAt": time.time()})
+        return store.read_status(execution_id)
     adapter_entry = config.adapter(adapter)
     device_id = request.get("device_id")
 

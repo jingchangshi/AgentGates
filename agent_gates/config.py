@@ -143,13 +143,14 @@ def _canonical_file(value, field):
 class Workspace:
     """One registered source tree and the machine resources it may use."""
 
-    __slots__ = ("id", "source_root", "adapters", "allowed_gates")
+    __slots__ = ("id", "source_root", "adapters", "allowed_gates", "allow_worktrees")
 
-    def __init__(self, identifier, source_root, adapters, allowed_gates):
+    def __init__(self, identifier, source_root, adapters, allowed_gates, allow_worktrees=True):
         self.id = identifier
         self.source_root = source_root
         self.adapters = adapters
         self.allowed_gates = allowed_gates
+        self.allow_worktrees = allow_worktrees
 
     def __repr__(self):
         return f"Workspace({self.id!r}, {str(self.source_root)!r})"
@@ -323,9 +324,12 @@ def from_mapping(raw, *, path=None):
             raise ConfigError(field, "workspace id must match [a-z][a-z0-9-]{0,63}")
         if not isinstance(body, dict):
             raise ConfigError(field, "must be a table")
-        _check_unknown_keys(body, ("source_root", "adapters", "allowed_gates"), field)
+        _check_unknown_keys(body, ("source_root", "adapters", "allowed_gates", "allow_worktrees"), field)
         source_root = _canonical_directory(_require(body, "source_root", f"{field}.source_root"),
                                            f"{field}.source_root")
+        allow_worktrees = body.get("allow_worktrees", True)
+        if type(allow_worktrees) is not bool:
+            raise ConfigError(f"{field}.allow_worktrees", "must be a boolean")
         adapters_raw = _require(body, "adapters", f"{field}.adapters")
         if not isinstance(adapters_raw, list) or not adapters_raw:
             raise ConfigError(f"{field}.adapters", "must be a nonempty list of adapter ids")
@@ -354,7 +358,13 @@ def from_mapping(raw, *, path=None):
                 if gate_id in allowed_gates:
                     raise ConfigError(entry, "duplicate gate id")
                 allowed_gates.add(gate_id)
-        workspaces[workspace_id] = Workspace(workspace_id, source_root, tuple(adapters), allowed_gates)
+        workspaces[workspace_id] = Workspace(
+            workspace_id,
+            source_root,
+            tuple(adapters),
+            allowed_gates,
+            allow_worktrees=allow_worktrees,
+        )
 
     adapters_raw = _require(raw, "adapters", "adapters")
     if not isinstance(adapters_raw, dict) or not adapters_raw:
@@ -457,9 +467,15 @@ def from_mapping(raw, *, path=None):
 
     payload = {
         "schema_version": schema_version,
-        "workspaces": {key: {"source_root": str(ws.source_root), "adapters": list(ws.adapters),
-                             "allowed_gates": sorted(ws.allowed_gates) if ws.allowed_gates else None}
-                       for key, ws in workspaces.items()},
+        "workspaces": {
+            key: {
+                "source_root": str(ws.source_root),
+                "adapters": list(ws.adapters),
+                "allowed_gates": sorted(ws.allowed_gates) if ws.allowed_gates else None,
+                **({"allow_worktrees": False} if not ws.allow_worktrees else {}),
+            }
+            for key, ws in workspaces.items()
+        },
         "adapters": {key: {"env_file": str(ad.env_file) if ad.env_file else None}
                      for key, ad in adapters.items()},
         "worker": {"backend": worker.backend, "max_concurrent": worker.max_concurrent,
