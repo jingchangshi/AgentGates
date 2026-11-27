@@ -69,7 +69,7 @@ OPTIONAL_AGENT_LLM_KEYS = (
     "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
 )
 
-VALID_CANN_SERIES = ("cann_9_2", "cann_9_3")
+VALID_CANN_SERIES = ("cann_9_3",)
 
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
 OPTIONAL_PROXY_KEYS = tuple(f"TILEFOUNDRY_NPU_LLM_{key}" for key in PROXY_KEYS)
@@ -153,9 +153,8 @@ DEFAULT_CPU_TESTS = (
     "tests/ascend/operators",
 )
 # Collected when present so the V2 native CPU gate covers the agent, cost_model,
-# host L3, and legacy IR suites without breaking checkouts that omit or predate them.
+# and host L3 suites without breaking checkouts that omit or predate them.
 OPTIONAL_CPU_TESTS = (
-    "tests/ascend/ir",
     "tests/ascend/cost_model",
     "tests/ascend/agent",
     "tests/ascend/sil",
@@ -167,10 +166,6 @@ OPTIONAL_CPU_TESTS = (
 # torch_npu import still binds a device when a driver is present, so these
 # nodes are deselected by exact id and the device gate owns them.
 CPU_DEVICE_NODE_DESELECTS = (
-    "tests/ascend/agent/test_ablation_distiller_npu.py"
-    "::test_live_flywheel_micro_probe_verification_and_kb_admission",
-    "tests/ascend/agent/test_e2e_evolution_npu.py::test_live_e2e_agent_evolution_on_npu",
-    "tests/ascend/agent/test_funnel_smoke_npu.py::test_live_one_op_funnel_stage_a_b_c_on_npu",
     "tests/ascend/agent/test_surrogate_batch_npu.py::test_surrogate_anchor_batch_npu",
     "tests/ascend/target/test_micro_probes_npu.py::test_ascend950_calibration_micro_probes",
 )
@@ -4355,9 +4350,6 @@ def _forward_proxy_env(
 
 
 def _detect_cann_series_from_setup(cann_setup: str) -> str:
-    # cann_9_3 is the sole active mainline; cann_9_2 is an inert schema
-    # placeholder selectable ONLY when explicitly set via
-    # TILEFOUNDRY_NPU_CANN_SERIES=cann_9_2.
     _ = cann_setup
     return "cann_9_3"
 

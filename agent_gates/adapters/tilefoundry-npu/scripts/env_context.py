@@ -43,7 +43,7 @@ TF_ROOT = WORKSPACE / "TileFoundry"
 
 #: CANN must be sourced before torch_npu is imported, or it fails on libhccl.so.
 CANN_SET_ENV = os.environ.get(
-    "TFNU_CANN_SET_ENV", "/data/pri/cann-9.2.0/ascend-toolkit/set_env.sh"
+    "TFNU_CANN_SET_ENV", "/data/pri/Ascend/latest/cann-9.3.0/set_env.sh"
 )
 
 #: The tilelang source revision the wheel is built from. A wheel built from an
@@ -194,11 +194,11 @@ OPTIONAL_FORWARDED_KEYS = (
     "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
 )
 
-VALID_CANN_SERIES = ("cann_9_2", "cann_9_3")
+VALID_CANN_SERIES = ("cann_9_3",)
 
 
 def resolve_cann_series(source: dict | None = None) -> str:
-    """Resolve CANN surface series (default cann_9_3; explicit cann_9_2 / cann_9_3)."""
+    """Resolve CANN surface series (sole active mainline: cann_9_3)."""
     src = os.environ if source is None else source
     explicit = (src.get("TILEFOUNDRY_NPU_CANN_SERIES") or "").strip()
     if explicit:
@@ -207,9 +207,6 @@ def resolve_cann_series(source: dict | None = None) -> str:
                 f"TILEFOUNDRY_NPU_CANN_SERIES must be one of {VALID_CANN_SERIES}: {explicit!r}"
             )
         return explicit
-    # cann_9_3 is the sole active mainline; cann_9_2 is an inert schema
-    # placeholder selectable ONLY when explicitly set via
-    # TILEFOUNDRY_NPU_CANN_SERIES=cann_9_2.
     return "cann_9_3"
 
 

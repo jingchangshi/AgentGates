@@ -51,14 +51,15 @@ conflicting exports in the launching environment):
   and `z3`.
 - `TILEFOUNDRY_NPU_CPU_TESTS`: optional comma- or whitespace-separated **relative**
   pytest paths under `--source` (no leading `/`, no `..`). Leave empty for the
-  5 default CPU directories:
-  `tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators`.
-  The default also appends `tests/ascend/agent`, `tests/ascend/sil`, and
-  `tests/ascend/benchmarks/test_l3_contract_host.py` when those paths exist, so
-  checkouts without the newer suites keep collecting the original five. The
-  five device-only node ids under `tests/ascend/agent` and `tests/ascend/target`
-  are passed as exact `--deselect=` arguments when their files exist, so the
-  CPU gate keeps the host assertions in those files without opening a device.
+  4 default CPU directories:
+  `tests/tilefoundry,tests/ascend/target,tests/ascend/passes,tests/ascend/operators`.
+  The default also appends `tests/ascend/cost_model`, `tests/ascend/agent`,
+  `tests/ascend/sil`, and `tests/ascend/benchmarks/test_l3_contract_host.py`
+  when those paths exist, so checkouts without the newer suites keep
+  collecting the base four. The device-only node ids under `tests/ascend/agent`
+  and `tests/ascend/target` are passed as exact `--deselect=` arguments when
+  their files exist, so the CPU gate keeps the host assertions in those files
+  without opening a device.
 - `TILEFOUNDRY_NPU_CPU_WORKERS`: optional integer in `1..16` controlling how
   many parallel file-sharded `pytest` worker subprocesses `tilefoundry-npu-cpu`
   spawns (with single-threaded BLAS/OpenMP/PyTorch env per worker). Leave empty
@@ -142,8 +143,7 @@ conflicting exports in the launching environment):
   `TILEFOUNDRY_NPU_AGY_COMMON_ARGS`, and `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY`
   are supported by existing `agy_cli` deployments.
 - `TILEFOUNDRY_NPU_CANN_SERIES`: optional CANN surface series override
-  (empty auto-detects to `"cann_9_3"`, the sole active mainline; `"cann_9_2"` is
-  accepted ONLY as an explicit inert placeholder override). Forwarded to
+  (empty or `"cann_9_3"`, the sole active mainline). Forwarded to
   TileFoundry subprocesses as `TILEFOUNDRY_CANN_SERIES` and recorded with
   `bishengArch: "dav-3510"` in V2 receipt `observations.environment`.
 - `TILEFOUNDRY_NPU_TILELANG_REPO` / `TILEFOUNDRY_NPU_CANNBOT_DSL_REPO` /

@@ -39,7 +39,7 @@
 | `TILEFOUNDRY_NPU_PYTHON` | 可选 | 宿主机绝对路径 | 目标 Conda 环境的 `python3`；留空则由上述 Conda 路径自动拼接 |
 | `TILEFOUNDRY_NPU_TILELANG_SOURCE` | 可选 | 宿主机绝对路径 | 复用 `tilelang-npu` 编译管理的宿主 `tilelang` 源码仓；填后自动前置到 `PYTHONPATH`（`tilefoundry-npu` 只读复用、绝不自编译 `tilelang`） |
 | `TILEFOUNDRY_NPU_TILELANG_BUILD` | 可选 | 宿主机绝对路径 | 须等于 `<TILELANG_SOURCE>/build`（留空默认取 `<TILELANG_SOURCE>/build`）；自检与各门禁校验 `libtilelang.so`、全部 `*.abi3.so` 与 `.agent_gates_build_stamp.json`，若 `tilelang` C++/CMake/Cython 源码更新后未重编则返回 `BLOCKED_ENV` 提示先执行 `tilelang-npu-build` |
-| `TILEFOUNDRY_NPU_CPU_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的 `pytest` 测试文件或目录（禁止 `/` 开头和 `..`）。留空默认运行 5 个目录：`tests/tilefoundry,tests/ascend/target,tests/ascend/ir,tests/ascend/passes,tests/ascend/operators` |
+| `TILEFOUNDRY_NPU_CPU_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的 `pytest` 测试文件或目录（禁止 `/` 开头和 `..`）。留空默认运行 4 个基础目录：`tests/tilefoundry,tests/ascend/target,tests/ascend/passes,tests/ascend/operators` |
 | `TILEFOUNDRY_NPU_DEVICE_TESTS` | 可选 | 逗号或空白分隔的**相对**路径列表 | 相对于 `--source` 的额外 NPU `pytest` 路径（禁止 `/` 开头和 `..`）。**默认留空**：只跑内置窗口期 NPU 探针（`import tilefoundry`、FP32 向量加、BF16 Cube `matmul`、显存分配 > 0、`torch.npu.synchronize()`）；填写后会在同一设备窗口内追加执行 `pytest` 并要求至少通过 1 个用例且零失败 |
 | `TILEFOUNDRY_NPU_BUILD_SUBDIR` | 可选 | 单级目录名（默认 `build`） | 引擎加 `build:<dir>` 锁使用；模板默认填 `build`，请勿改为 `=` 空值 |
 | `TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS` | 可选 | 逗号分隔的物理卡号列表（如 `0,1,2`） | 仅供 TileFoundry campaign 读取的候选卡顺序，用于整次 L4 尝试间的换卡；Adapter 解析后忽略其值。**不授权任何卡**：`submit --device-id` 仍受 `devices.allowed_npu_devices` 约束，越权返回 `DEVICE_NOT_AUTHORIZED`。留空表示不声明运行池 |
@@ -64,7 +64,7 @@
 | `TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL` | Optional | Model ID | Legacy escalation model for `agy_cli` |
 | `TILEFOUNDRY_NPU_AGY_COMMON_ARGS` | 可选 | CLI 参数串 | 无状态沙盒 `agy` 子进程公共参数 |
 | `TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY` | 可选 | 正整数 | `agy` 并发子进程上限 |
-| `TILEFOUNDRY_NPU_CANN_SERIES` | 可选 | `cann_9_2` / `cann_9_3` / 留空 | 显式覆写 CANN 表面版本；留空自动探测为唯一现役主线 `cann_9_3`（`cann_9_2` 仅作为显式惰性占位覆写接受），并注入 `TILEFOUNDRY_CANN_SERIES` 与 Receipt `observations.environment.cannSeries` |
+| `TILEFOUNDRY_NPU_CANN_SERIES` | 可选 | `cann_9_3` / 留空 | 显式覆写 CANN 表面版本；留空默认唯一现役主线 `cann_9_3`，并注入 `TILEFOUNDRY_CANN_SERIES` 与 Receipt `observations.environment.cannSeries` |
 | `TILEFOUNDRY_NPU_{TILELANG,CANNBOT_DSL,OPS_TRANSFORMER}_REPO` | 可选 | 宿主机绝对路径 | 本地只读 Ascend 950 参考仓路径（非空时透传；运行时隔离沙盒严禁直接访问） |
 
 Store only the credential variable name in `env.sh`. The host adapter reads
