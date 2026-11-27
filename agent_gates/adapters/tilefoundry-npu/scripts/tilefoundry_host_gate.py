@@ -155,6 +155,7 @@ DEFAULT_CPU_TESTS = (
 # Collected when present so the V2 native CPU gate covers the agent, cost_model,
 # and host L3 suites without breaking checkouts that omit or predate them.
 OPTIONAL_CPU_TESTS = (
+    "tests/ascend/l0_foundation",
     "tests/ascend/cost_model",
     "tests/ascend/agent",
     "tests/ascend/sil",

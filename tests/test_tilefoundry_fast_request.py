@@ -550,7 +550,9 @@ class FastRequestCase(unittest.TestCase):
         ):
             self.assertIn(rel, tests)
         (self.src / "tests" / "ascend" / "ir").mkdir(parents=True)
-        self.assertIn("tests/ascend/ir", GATE.default_cpu_tests(self.src))
+        self.assertNotIn("tests/ascend/ir", GATE.default_cpu_tests(self.src))
+        (self.src / "tests" / "ascend" / "l0_foundation").mkdir(parents=True)
+        self.assertIn("tests/ascend/l0_foundation", GATE.default_cpu_tests(self.src))
         self.assertEqual(
             GATE.cpu_tests({"TILEFOUNDRY_NPU_CPU_TESTS": "tests/device"}, self.src),
             ("tests/device",),

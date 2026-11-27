@@ -1639,7 +1639,6 @@ class OptionalAgentKeysCase(unittest.TestCase):
 
             for legacy_dir_name, legacy_version in (
                 ("cann-8.5.0", "Version=8.5.0\n"),
-                ("cann-9.2.0", "Version=9.2.0\n"),
             ):
                 legacy_root = self.root / legacy_dir_name
                 (legacy_root / "compiler").mkdir(parents=True)
@@ -1691,17 +1690,18 @@ class OptionalAgentKeysCase(unittest.TestCase):
 
             self.write_env(
                 TILEFOUNDRY_NPU_CANN_SETUP=str(cann93_root / "set_env.sh"),
-                TILEFOUNDRY_NPU_CANN_SERIES="cann_9_2",
+                TILEFOUNDRY_NPU_CANN_SERIES="cann_9_3",
             )
             with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
                 self.assertEqual(GATE.main(["--check-config"]), 0)
-                self.assertEqual(GATE.resolve_cann_series(GATE.machine_values()), "cann_9_2")
+                self.assertEqual(GATE.resolve_cann_series(GATE.machine_values()), "cann_9_3")
 
-            self.write_env(TILEFOUNDRY_NPU_CANN_SERIES="cann_9_9")
-            with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
-                with self.assertRaises(SystemExit) as caught:
-                    GATE.main(["--check-config"])
-                self.assertEqual(caught.exception.code, 75)
+            for bad_series in ("cann_9_2", "cann_9_9"):
+                self.write_env(TILEFOUNDRY_NPU_CANN_SERIES=bad_series)
+                with patch.dict(os.environ, {"TILEFOUNDRY_NPU_ENV_FILE": str(self.env_file)}, clear=True):
+                    with self.assertRaises(SystemExit) as caught:
+                        GATE.main(["--check-config"])
+                    self.assertEqual(caught.exception.code, 75)
         finally:
             os.chdir(old_cwd)
 
@@ -1732,7 +1732,7 @@ class OptionalAgentKeysCase(unittest.TestCase):
         )
         shutil.rmtree(v49_src / "tests" / "ascend" / "cost_model")
         (v49_src / "tests" / "ascend" / "ir").mkdir(parents=True)
-        self.assertIn("tests/ascend/ir", GATE.default_cpu_tests(v49_src))
+        self.assertNotIn("tests/ascend/ir", GATE.default_cpu_tests(v49_src))
         self.assertNotIn("tests/ascend/cost_model", GATE.default_cpu_tests(v49_src))
 
         cache_dir = v49_src / "tests" / "ascend" / "ir" / "__pycache__"
@@ -1746,6 +1746,56 @@ class OptionalAgentKeysCase(unittest.TestCase):
         self.assertNotIn("tests/ascend/ir", filtered_tests)
         shards = GATE._expand_cpu_test_shards(v49_src, filtered_tests, 4)
         self.assertGreater(len(shards), 1)
+
+    def test_rejects_stale_cann_9_2_and_deleted_ir_and_npu_deselects(self) -> None:
+        self.assertNotIn("cann_9_2", GATE.VALID_CANN_SERIES)
+        self.assertNotIn("cann_9_2", ENV_CONTEXT.VALID_CANN_SERIES)
+        with self.assertRaises(GATE.BridgeError):
+            GATE.resolve_cann_series({"TILEFOUNDRY_NPU_CANN_SERIES": "cann_9_2"})
+        with self.assertRaises(ValueError):
+            ENV_CONTEXT.resolve_cann_series({"TILEFOUNDRY_NPU_CANN_SERIES": "cann_9_2"})
+
+        self.assertNotIn("tests/ascend/ir", GATE.OPTIONAL_CPU_TESTS)
+        stale_src = self.root / "tf-stale-ir"
+        (stale_src / "tests" / "ascend" / "ir").mkdir(parents=True)
+        self.assertNotIn("tests/ascend/ir", GATE.default_cpu_tests(stale_src))
+
+        deselect_joined = "\n".join(GATE.CPU_DEVICE_NODE_DESELECTS)
+        for deleted_file in (
+            "test_ablation_distiller_npu.py",
+            "test_e2e_evolution_npu.py",
+            "test_funnel_smoke_npu.py",
+        ):
+            self.assertNotIn(deleted_file, deselect_joined)
+
+    def test_accepts_l0_foundation_cann_9_3_and_manifest_sha256(self) -> None:
+        self.assertIn("tests/ascend/l0_foundation", GATE.OPTIONAL_CPU_TESTS)
+        l0_src = self.root / "tf-l0-foundation"
+        for sub in (
+            "tests/tilefoundry",
+            "tests/ascend/target",
+            "tests/ascend/passes",
+            "tests/ascend/operators",
+            "tests/ascend/l0_foundation",
+        ):
+            (l0_src / sub).mkdir(parents=True)
+        self.assertIn("tests/ascend/l0_foundation", GATE.default_cpu_tests(l0_src))
+
+        self.assertEqual(GATE.VALID_CANN_SERIES, ("cann_9_3",))
+        self.assertEqual(ENV_CONTEXT.VALID_CANN_SERIES, ("cann_9_3",))
+        self.assertEqual(GATE.resolve_cann_series({}), "cann_9_3")
+        self.assertEqual(ENV_CONTEXT.resolve_cann_series({}), "cann_9_3")
+        self.assertIn("cann-9.3.0", ENV_CONTEXT.CANN_SET_ENV)
+
+        deselect_joined = "\n".join(GATE.CPU_DEVICE_NODE_DESELECTS)
+        self.assertIn("test_surrogate_batch_npu.py", deselect_joined)
+        self.assertIn("test_micro_probes_npu.py", deselect_joined)
+
+        manifest_raw = json.loads((ADAPTER / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest_raw["files"]["scripts/tilefoundry_host_gate.py"],
+            hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+        )
 
 
 
